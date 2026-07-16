@@ -1,0 +1,70 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dabsn"
+dynamic = ["version"]
+description = "DABSN recurrent modeling framework with native CPU and CUDA runtimes"
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+requires-python = ">=3.10"
+authors = [
+    {name = "Nicholas Rosdahl"},
+]
+keywords = [
+    "deep-learning",
+    "neural-network",
+    "recurrent-neural-network",
+    "sequence-modeling",
+    "pytorch",
+    "triton",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = ["torch>=2.6", "numpy>=1.24", "ninja>=1.11", "safetensors>=0.4.5"]
+
+[project.urls]
+Homepage = "https://github.com/BleedingXiko/dabsn"
+Documentation = "https://github.com/BleedingXiko/dabsn#readme"
+Paper = "https://github.com/BleedingXiko/dabsn/blob/main/paper1/main.pdf"
+Source = "https://github.com/BleedingXiko/dabsn"
+Issues = "https://github.com/BleedingXiko/dabsn/issues"
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
+cuda-turing = [
+    "torch==2.6.0; platform_system == 'Linux'",
+    "triton==3.2.0; platform_system == 'Linux'",
+]
+paper = ["matplotlib>=3.8"]
+
+[project.scripts]
+dabsn = "dabsn.cli:main"
+dabsn-reproduce-copy = "dabsn.reproductions.copy:main"
+dabsn-reproduce-mqar = "dabsn.reproductions.mqar:main"
+dabsn-reproduce-keyvalue = "dabsn.reproductions.keyvalue:main"
+dabsn-reproduce-a5 = "dabsn.reproductions.a5:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+packages = ["dabsn", "dabsn.kernels", "dabsn.reproductions", "dabsn.runtime"]
+
+[tool.setuptools.dynamic]
+version = {attr = "dabsn.__version__"}
+
+[tool.setuptools.package-data]
+dabsn = ["kernels/*.cpp"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"

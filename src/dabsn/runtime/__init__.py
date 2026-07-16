@@ -1,0 +1,58 @@
+"""Framework train, evaluate, infer, export, and gradient-verification APIs."""
+
+from ..distributed import (
+    DABSNSequenceModule,
+    DistributedState,
+    autocast_context,
+    cleanup_distributed,
+    clip_grad_norm,
+    load_distributed_optimizer,
+    load_sharded_model_checkpoint,
+    load_sharded_training_checkpoint,
+    make_grad_scaler,
+    no_sync_context,
+    prepare_distributed_model,
+    resolve_precision,
+    save_distributed_dabsn,
+    save_sharded_training_checkpoint,
+    setup_distributed,
+    shard_batch,
+    unwrap_dabsn_model,
+    wrap_distributed,
+)
+
+from .api import (
+    evaluate,
+    export_dabsn,
+    infer,
+    train,
+    train_step,
+    verify_gradients,
+)
+
+__all__ = [
+    "DABSNSequenceModule",
+    "DistributedState",
+    "autocast_context",
+    "cleanup_distributed",
+    "clip_grad_norm",
+    "evaluate",
+    "export_dabsn",
+    "infer",
+    "load_distributed_optimizer",
+    "load_sharded_model_checkpoint",
+    "load_sharded_training_checkpoint",
+    "make_grad_scaler",
+    "no_sync_context",
+    "prepare_distributed_model",
+    "resolve_precision",
+    "save_distributed_dabsn",
+    "save_sharded_training_checkpoint",
+    "setup_distributed",
+    "shard_batch",
+    "train",
+    "train_step",
+    "unwrap_dabsn_model",
+    "verify_gradients",
+    "wrap_distributed",
+]

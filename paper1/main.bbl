@@ -1,0 +1,119 @@
+\begin{thebibliography}{16}
+\providecommand{\natexlab}[1]{#1}
+\providecommand{\url}[1]{\texttt{#1}}
+\expandafter\ifx\csname urlstyle\endcsname\relax
+  \providecommand{\doi}[1]{doi: #1}\else
+  \providecommand{\doi}{doi: \begingroup \urlstyle{rm}\Url}\fi
+
+\bibitem[Jelassi et~al.(2024)Jelassi, Brandfonbrener, Kakade, and
+  Malach]{jelassi2024repeat}
+Samy Jelassi, David Brandfonbrener, Sham~M. Kakade, and Eran Malach.
+\newblock Repeat after me: Transformers are better than state space models at
+  copying.
+\newblock In \emph{International Conference on Machine Learning (ICML)}, 2024.
+
+\bibitem[Barrington(1989)]{barrington1989bounded}
+David~A. Barrington.
+\newblock Bounded-width polynomial-size branching programs recognize exactly
+  those languages in {NC}$^1$.
+\newblock \emph{Journal of Computer and System Sciences}, 38\penalty0
+  (1):\penalty0 150--164, 1989.
+
+\bibitem[Liu et~al.(2023)Liu, Ash, Goel, Krishnamurthy, and
+  Zhang]{liu2023transformers}
+Bingbin Liu, Jordan~T. Ash, Surbhi Goel, Akshay Krishnamurthy, and Cyril Zhang.
+\newblock Transformers learn shortcuts to automata.
+\newblock In \emph{International Conference on Learning Representations
+  (ICLR)}, 2023.
+
+\bibitem[Merrill et~al.(2024)Merrill, Petty, and
+  Sabharwal]{merrill2024illusion}
+William Merrill, Jackson Petty, and Ashish Sabharwal.
+\newblock The illusion of state in state-space models.
+\newblock In \emph{International Conference on Machine Learning (ICML)}, 2024.
+
+\bibitem[Gu and Dao(2023)]{gu2023mamba}
+Albert Gu and Tri Dao.
+\newblock Mamba: Linear-time sequence modeling with selective state spaces.
+\newblock \emph{arXiv preprint arXiv:2312.00752}, 2023.
+
+\bibitem[Grazzi et~al.(2025)Grazzi, Siems, Franke, Zela, Hutter, and
+  Pontil]{grazzi2024unlocking}
+Riccardo Grazzi, Julien Siems, J{\"o}rg K.~H. Franke, Arber Zela, Frank Hutter,
+  and Massimiliano Pontil.
+\newblock Unlocking state-tracking in linear {RNNs} through negative
+  eigenvalues.
+\newblock In \emph{International Conference on Learning Representations
+  (ICLR)}, 2025.
+
+\bibitem[De et~al.(2024)De, Smith, Fernando, Botev, Cristian-Muraru, Gu,
+  Haroun, Berrada, Chen, Srinivasan, et~al.]{de2024griffin}
+Soham De, Samuel~L. Smith, Anushan Fernando, Aleksandar Botev, George
+  Cristian-Muraru, Albert Gu, Ruba Haroun, Leonard Berrada, Yutian Chen,
+  Srivatsan Srinivasan, et~al.
+\newblock Griffin: Mixing gated linear recurrences with local attention for
+  efficient language models.
+\newblock \emph{arXiv preprint arXiv:2402.19427}, 2024.
+
+\bibitem[Lieber et~al.(2024)Lieber, Lenz, Bata, Cohen, Osin, Dalmedigos,
+  et~al.]{lieber2024jamba}
+Opher Lieber, Barak Lenz, Hofit Bata, Gal Cohen, Jhonathan Osin, Itay
+  Dalmedigos, et~al.
+\newblock Jamba: A hybrid transformer-mamba language model.
+\newblock \emph{arXiv preprint arXiv:2403.19887}, 2024.
+
+\bibitem[Beck et~al.(2024)Beck, P{\"o}ppel, Spanring, Auer, Prudnikova, Kopp,
+  Klambauer, Brandstetter, and Hochreiter]{beck2024xlstm}
+Maximilian Beck, Korbinian P{\"o}ppel, Markus Spanring, Andreas Auer,
+  Oleksandra Prudnikova, Michael Kopp, G{\"u}nter Klambauer, Johannes
+  Brandstetter, and Sepp Hochreiter.
+\newblock x{LSTM}: Extended long short-term memory.
+\newblock In \emph{Advances in Neural Information Processing Systems
+  (NeurIPS)}, 2024.
+
+\bibitem[Schlag et~al.(2021)Schlag, Irie, and Schmidhuber]{schlag2021linear}
+Imanol Schlag, Kazuki Irie, and J{\"u}rgen Schmidhuber.
+\newblock Linear transformers are secretly fast weight programmers.
+\newblock In \emph{International Conference on Machine Learning (ICML)}, 2021.
+
+\bibitem[Yang et~al.(2025)Yang, Kautz, and Hatamizadeh]{yang2024gated}
+Songlin Yang, Jan Kautz, and Ali Hatamizadeh.
+\newblock Gated delta networks: Improving mamba2 with delta rule.
+\newblock In \emph{International Conference on Learning Representations
+  (ICLR)}, 2025.
+
+\bibitem[Peng et~al.(2023)Peng, Alcaide, Anthony, Albalak, Arcadinho, Biderman,
+  et~al.]{peng2023rwkv}
+Bo~Peng, Eric Alcaide, Quentin Anthony, Alon Albalak, Samuel Arcadinho, Stella
+  Biderman, et~al.
+\newblock {RWKV}: Reinventing {RNNs} for the transformer era.
+\newblock In \emph{Findings of the Association for Computational Linguistics:
+  EMNLP}, 2023.
+
+\bibitem[Arora et~al.(2023)Arora, Eyuboglu, Timalsina, Johnson, Poli, Zou,
+  Rudra, and R{\'e}]{arora2023zoology}
+Simran Arora, Sabri Eyuboglu, Aman Timalsina, Isys Johnson, Michael Poli, James
+  Zou, Atri Rudra, and Christopher R{\'e}.
+\newblock Zoology: Measuring and improving recall in efficient language models.
+\newblock \emph{arXiv preprint arXiv:2312.04927}, 2023.
+
+\bibitem[Olsson et~al.(2022)Olsson, Elhage, Nanda, Joseph, DasSarma, Henighan,
+  et~al.]{olsson2022context}
+Catherine Olsson, Nelson Elhage, Neel Nanda, Nicholas Joseph, Nova DasSarma,
+  Tom Henighan, et~al.
+\newblock In-context learning and induction heads.
+\newblock \emph{Transformer Circuits Thread}, 2022.
+
+\bibitem[Schmidhuber(1992)]{schmidhuber1992learning}
+J{\"u}rgen Schmidhuber.
+\newblock Learning to control fast-weight memories: An alternative to dynamic
+  recurrent networks.
+\newblock \emph{Neural Computation}, 4\penalty0 (1):\penalty0 131--139, 1992.
+
+\bibitem[Ba et~al.(2016)Ba, Hinton, Mnih, Leibo, and Ionescu]{ba2016using}
+Jimmy Ba, Geoffrey Hinton, Volodymyr Mnih, Joel~Z. Leibo, and Catalin Ionescu.
+\newblock Using fast weights to attend to the recent past.
+\newblock In \emph{Advances in Neural Information Processing Systems
+  (NeurIPS)}, 2016.
+
+\end{thebibliography}

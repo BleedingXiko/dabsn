@@ -1,0 +1,29 @@
+{
+  "title": "One Layer, Both Gaps: A Persistent-Modulation Recurrence that Generalizes Copy and Tracks Non-Solvable Group State",
+  "upload_type": "publication",
+  "publication_type": "preprint",
+  "license": "cc-by-4.0",
+  "creators": [
+    {
+      "name": "Rosdahl, Nicholas",
+      "affiliation": "Independent Researcher"
+    }
+  ],
+  "description": "We present DABSN, a single recurrent block design that closes both the copy memory-bandwidth gap and the non-solvable group state-tracking gap. Separately trained instances generalize copy to 50 times training length and track the A5/60 word problem to 64 times training length. Causal ablations isolate the nonlinear recurrent state and learned retrieval primitives responsible for the two capabilities.",
+  "keywords": [
+    "sequence modeling",
+    "recurrent neural networks",
+    "length generalization",
+    "associative recall",
+    "non-solvable groups",
+    "persistent modulation",
+    "DABSN"
+  ],
+  "related_identifiers": [
+    {
+      "identifier": "https://github.com/BleedingXiko/dabsn",
+      "relation": "isSupplementedBy",
+      "resource_type": "software"
+    }
+  ]
+}

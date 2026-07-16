@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+build/
+dist/
+*.egg-info/
+.release-check/
+paper1/main.aux
+paper1/main.blg
+paper1/main.log
+paper1/main.out
+.DS_Store

@@ -1,0 +1,20 @@
+cff-version: 1.2.0
+message: "If you use DABSN or its native runtime, please cite this software and the accompanying paper."
+title: "DABSN: Persistent-Modulation Sequence and Field Modeling"
+type: software
+version: 0.1.0
+date-released: 2026-07-16
+license: Apache-2.0
+url: "https://github.com/BleedingXiko/dabsn"
+repository-code: "https://github.com/BleedingXiko/dabsn"
+authors:
+  - family-names: Rosdahl
+    given-names: Nicholas
+preferred-citation:
+  type: article
+  title: "One Layer, Both Gaps: A Persistent-Modulation Recurrence that Generalizes Copy and Tracks Non-Solvable Group State"
+  authors:
+    - family-names: Rosdahl
+      given-names: Nicholas
+  year: 2026
+  doi: "10.5281/zenodo.21391204"

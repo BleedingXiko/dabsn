@@ -1,0 +1,10 @@
+include ARCHITECTURE.md
+include LICENSE
+include CITATION.cff
+include release.py
+recursive-include examples *.py
+recursive-include tests *.py
+recursive-include tools *.py *.sh
+recursive-include paper1 *.tex *.bib *.bbl *.md *.txt *.csv *.json *.py Makefile
+include paper1/main.pdf
+recursive-include paper1/figs *.pdf *.png
