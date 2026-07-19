@@ -102,12 +102,13 @@ if _HAS_TRITON:
 
     @triton.jit
     def _linrec_fwd_kernel(
-        A, G, YINIT, OUT,
+        A, G, YINIT, OUT, FINAL,
         B, T, H,
         stride_ab, stride_at, stride_ah,
         stride_gb, stride_gt, stride_gh,
         stride_ob, stride_ot, stride_oh,
         stride_ib, stride_ih,
+        stride_fb, stride_fh,
         BH: tl.constexpr,
     ):
         # program owns one batch and a BH-block of hidden dims; carries y in registers
@@ -128,6 +129,7 @@ if _HAS_TRITON:
             g = tl.load(G + g_off, mask=h_mask, other=0.0).to(tl.float32)
             y = a * y + g
             tl.store(OUT + o_off, y, mask=h_mask)
+        tl.store(FINAL + pid_b * stride_fb + h_off * stride_fh, y, mask=h_mask)
 
     @triton.jit
     def _linrec_bwd_kernel(
@@ -234,21 +236,27 @@ def _triton_linrec_backward(a: Tensor, g: Tensor, y_init: Tensor, gy: Tensor):
     return da, dg, carry_grad
 
 
-def _triton_linrec_once(a: Tensor, g: Tensor, y_init: Tensor) -> Tensor:
+def _triton_linrec_once_with_final(a: Tensor, g: Tensor, y_init: Tensor) -> tuple[Tensor, Tensor]:
     b, t, h = a.shape
     out = torch.empty((b, t, h), device=a.device, dtype=a.dtype)
+    final = torch.empty((b, h), device=a.device, dtype=torch.float32)
     BH = triton.next_power_of_2(h)
     grid = (b, triton.cdiv(h, BH))
     _linrec_fwd_kernel[grid](
-        a, g, y_init, out,
+        a, g, y_init, out, final,
         b, t, h,
         a.stride(0), a.stride(1), a.stride(2),
         g.stride(0), g.stride(1), g.stride(2),
         out.stride(0), out.stride(1), out.stride(2),
         y_init.stride(0), y_init.stride(1),
+        final.stride(0), final.stride(1),
         BH=BH,
     )
-    return out
+    return out, final
+
+
+def _triton_linrec_once(a: Tensor, g: Tensor, y_init: Tensor) -> Tensor:
+    return _triton_linrec_once_with_final(a, g, y_init)[0]
 
 
 def _triton_linrec(a: Tensor, g: Tensor, y_init: Tensor) -> Tensor:
@@ -267,10 +275,28 @@ def _triton_linrec(a: Tensor, g: Tensor, y_init: Tensor) -> Tensor:
     carry = y_init
     for start in range(0, t, chunk):
         end = min(start + chunk, t)
-        out = _triton_linrec_once(a[:, start:end, :], g[:, start:end, :], carry)
+        out, carry = _triton_linrec_once_with_final(
+            a[:, start:end, :], g[:, start:end, :], carry
+        )
         outs.append(out)
-        carry = out[:, -1, :].contiguous()
     return torch.cat(outs, dim=1)
+
+
+def _triton_linrec_with_final(a: Tensor, g: Tensor, y_init: Tensor) -> tuple[Tensor, Tensor]:
+    """Inference scan that preserves its FP32 carried state across API chunks."""
+    t = int(a.shape[1])
+    chunk = int(_os.environ.get("DABSN_LONG_SCAN_CHUNK", "8192"))
+    if chunk <= 0 or t <= chunk:
+        return _triton_linrec_once_with_final(a, g, y_init)
+    outs: List[Tensor] = []
+    carry = y_init
+    for start in range(0, t, chunk):
+        end = min(start + chunk, t)
+        out, carry = _triton_linrec_once_with_final(
+            a[:, start:end, :], g[:, start:end, :], carry
+        )
+        outs.append(out)
+    return torch.cat(outs, dim=1), carry
 
 
 # ---------------------------------------------------------------------------
@@ -308,6 +334,20 @@ class LinearRecurrence(torch.autograd.Function):
 def linear_recurrence(a: Tensor, g: Tensor, y_init: Tensor) -> Tensor:
     return LinearRecurrence.apply(a, g, y_init)
 
+
+def _linear_recurrence_with_final(a: Tensor, g: Tensor, y_init: Tensor) -> tuple[Tensor, Tensor]:
+    """No-grad recurrence plus an unrounded final state for streaming inference."""
+    if torch.is_grad_enabled():
+        output = linear_recurrence(a, g, y_init)
+        return output, output[:, -1, :]
+    if a.is_cuda:
+        output, final = _triton_linrec_with_final(
+            a.contiguous(), g.contiguous(), y_init.to(torch.float32).contiguous()
+        )
+        return output, final
+    output = _linrec_forward(a, g, y_init)
+    return output, output[:, -1, :]
+
 def fused_long_scan(
     read,
     write: Tensor,
@@ -339,13 +379,18 @@ def fused_long_scan_from_state(
             "Triton/CUDA long-memory recurrence was required, but received a CPU tensor"
         )
     batch, _seq_len, hidden = write.shape
-    zeros = torch.zeros(batch, hidden, device=write.device, dtype=write.dtype)
-    ones = torch.ones(batch, hidden, device=write.device, dtype=write.dtype)
+    state_dtype = (
+        torch.float32
+        if return_final_state and write.is_cuda and not torch.is_grad_enabled()
+        else write.dtype
+    )
+    zeros = torch.zeros(batch, hidden, device=write.device, dtype=state_dtype)
+    ones = torch.ones(batch, hidden, device=write.device, dtype=state_dtype)
     if initial_state is None:
         long_initial, expected_initial, retention_initial = zeros, zeros, ones
     else:
         long_initial, expected_initial, retention_initial = (
-            state.to(device=write.device, dtype=write.dtype) for state in initial_state
+            state.to(device=write.device, dtype=state_dtype) for state in initial_state
         )
         expected_shape = (batch, hidden)
         if any(state.shape != expected_shape for state in (
@@ -357,13 +402,22 @@ def fused_long_scan_from_state(
     retain = torch.sigmoid(read.logit_retain)
 
     expectation_retain = torch.sigmoid(read.logit_expect_retain)
-    expected = linear_recurrence(
-        expectation_retain.expand_as(write),
-        (1.0 - expectation_retain) * write,
-        expected_initial,
-    )
+    recurrence = _linear_recurrence_with_final if return_final_state else None
+    if recurrence is None:
+        expected = linear_recurrence(
+            expectation_retain.expand_as(write),
+            (1.0 - expectation_retain) * write,
+            expected_initial,
+        )
+        expected_final = expected[:, -1, :]
+    else:
+        expected, expected_final = recurrence(
+            expectation_retain.expand_as(write),
+            (1.0 - expectation_retain) * write,
+            expected_initial,
+        )
     expected_previous = torch.cat(
-        [expected_initial.unsqueeze(1), expected[:, :-1, :]],
+        [expected_initial.to(write.dtype).unsqueeze(1), expected[:, :-1, :]],
         dim=1,
     )
     prediction_error = torch.tanh((write - expected_previous).abs())
@@ -371,24 +425,38 @@ def fused_long_scan_from_state(
 
     retention_decay = torch.sigmoid(read.logit_retention_decay)
     retention_strength = torch.sigmoid(read.logit_retention_strength)
-    retention = linear_recurrence(
-        retention_decay.expand_as(write),
-        (1.0 - retention_decay) * (1.0 - prediction_error),
-        retention_initial,
-    )
+    if recurrence is None:
+        retention = linear_recurrence(
+            retention_decay.expand_as(write),
+            (1.0 - retention_decay) * (1.0 - prediction_error),
+            retention_initial,
+        )
+        retention_final = retention[:, -1, :]
+    else:
+        retention, retention_final = recurrence(
+            retention_decay.expand_as(write),
+            (1.0 - retention_decay) * (1.0 - prediction_error),
+            retention_initial,
+        )
     effective_retain = (
         retain + (1.0 - retain) * retention_strength * retention
     )
     long_update = (1.0 - effective_retain) * (plastic_salience * write)
-    long_sequence = linear_recurrence(effective_retain, long_update, long_initial)
+    if recurrence is None:
+        long_sequence = linear_recurrence(effective_retain, long_update, long_initial)
+        long_final = long_sequence[:, -1, :]
+    else:
+        long_sequence, long_final = recurrence(
+            effective_retain, long_update, long_initial
+        )
     read._last_long_backend = (
         "cuda_triton" if write.is_cuda else "cpu_native_cpp"
     )
     if return_final_state:
         return long_sequence, (
-            long_sequence[:, -1, :],
-            expected[:, -1, :],
-            retention[:, -1, :],
+            long_final,
+            expected_final,
+            retention_final,
         )
     return long_sequence
 

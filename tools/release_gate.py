@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import copy
 import json
+import os
 import platform
 import tempfile
 import time
@@ -189,6 +190,7 @@ def _core_state_reference(device: torch.device) -> dict[str, object]:
     reference = DABSNCore(5, 8).to(device)
     full_native = copy.deepcopy(reference)
     chunk_native = copy.deepcopy(reference)
+    batched_native = copy.deepcopy(reference)
     base = torch.randn(2, 7, 5, device=device)
     initial = (
         torch.randn(2, 8, device=device) * 0.1,
@@ -198,6 +200,7 @@ def _core_state_reference(device: torch.device) -> dict[str, object]:
     return {
         "full_native": full_native,
         "chunk_native": chunk_native,
+        "batched_native": batched_native,
         "base": base,
         "initial": initial,
         "reference": _run_core_state(reference, base, initial, chunked=False),
@@ -240,6 +243,43 @@ def _core_state_native_parity(backend: str, captured: dict[str, object]) -> dict
             raise AssertionError(f"{label} coverage differs")
         for name in actual:
             _assert_close(actual[name], expected[name], backend=backend, label=f"{label} {name}")
+    batched_max_abs = None
+    if backend == "cuda":
+        previous = os.environ.get("DABSN_CORE_BACKEND")
+        os.environ["DABSN_CORE_BACKEND"] = "batched"
+        try:
+            batched = _run_core_state(
+                captured["batched_native"], captured["base"], captured["initial"], chunked=False
+            )
+        finally:
+            if previous is None:
+                os.environ.pop("DABSN_CORE_BACKEND", None)
+            else:
+                os.environ["DABSN_CORE_BACKEND"] = previous
+        if batched["backend"] != "cuda_batched_gemm":
+            raise AssertionError(f"batched core route was {batched['backend']}")
+        for index, (actual_tensor, expected_tensor) in enumerate(
+            zip(batched["outputs"], reference["outputs"])
+        ):
+            _assert_close(
+                actual_tensor,
+                expected_tensor,
+                backend=backend,
+                label=f"batched outputs {index}",
+            )
+        _assert_close(
+            batched["input_grad"], reference["input_grad"],
+            backend=backend, label="batched input gradient",
+        )
+        for name, actual in batched["parameter_grads"].items():
+            _assert_close(
+                actual, reference["parameter_grads"][name],
+                backend=backend, label=f"batched parameter gradient {name}",
+            )
+        batched_max_abs = max(
+            _max_abs(actual, expected)
+            for actual, expected in zip(batched["outputs"], reference["outputs"])
+        )
     return {
         "full_reference_max_abs": max(
             _max_abs(actual, expected)
@@ -249,6 +289,7 @@ def _core_state_native_parity(backend: str, captured: dict[str, object]) -> dict
             _max_abs(actual, expected)
             for actual, expected in zip(chunk["outputs"], full["outputs"])
         ),
+        "batched_reference_max_abs": batched_max_abs,
     }
 
 
@@ -316,7 +357,9 @@ def _model_native_parity(
         if getattr(block.read, "_last_long_backend", None) != expected:
             raise AssertionError(f"block {index} long read did not route through {expected}")
         read_backend = traces[index]["read_contract"]["kernel_backend"]
-        if backend == "cuda" and "triton" not in str(read_backend) and "flash" not in str(read_backend):
+        if backend == "cuda" and read_backend not in {
+            "dense_bmm_trainable", "compact_flash_trainable", "dense_mask_triton_trainable"
+        }:
             raise AssertionError(f"block {index} admitted read backend: {read_backend}")
         if backend == "cpu" and read_backend != "cpu_native_cpp":
             raise AssertionError(f"block {index} admitted read backend: {read_backend}")

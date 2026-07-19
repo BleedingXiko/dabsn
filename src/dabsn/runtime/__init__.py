@@ -29,6 +29,8 @@ from .api import (
     train_step,
     verify_gradients,
 )
+from .graph import make_graphed_train_callable
+from .grad_accum import ManualGradientAccumulator
 
 __all__ = [
     "DABSNSequenceModule",
@@ -43,6 +45,8 @@ __all__ = [
     "load_sharded_model_checkpoint",
     "load_sharded_training_checkpoint",
     "make_grad_scaler",
+    "make_graphed_train_callable",
+    "ManualGradientAccumulator",
     "no_sync_context",
     "prepare_distributed_model",
     "resolve_precision",

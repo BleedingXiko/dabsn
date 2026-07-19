@@ -230,7 +230,7 @@ demonstrates native neighborhood gather/scatter for spatial models.
 ```python
 from dabsn.kernels import enable, status
 
-enable("cuda", required=True)   # Triton forward and backward
+enable("cuda", required=True)   # CUDA/Triton + batched-GEMM forward/backward
 # enable("cpu", required=True)  # C++/OpenMP forward and backward
 # enable("reference")           # explicit PyTorch reference runtime
 
@@ -241,6 +241,25 @@ Backend activation is process-wide because it installs model dispatch hooks.
 Requested native execution never silently falls back. The status report names
 the active implementation for the core scan, admitted read, permanent memory,
 long-memory recurrence, and local-field gather.
+
+CUDA training dispatch is execution-shape aware. Small batches use the
+persistent Triton scan. Batches of 64 or more use the batched recurrent runtime,
+which shares each recurrent-matrix read across the device batch through GEMM;
+this changes neither the DABSN equations nor model depth. For modest training
+score tensors (up to 8,388,608 `[B,T,N]` entries by default), admitted-read
+forward and backward use native BMM instead of pairing a tiled forward with the
+older serial-query backward. The controls are explicit when a benchmark needs
+to pin them:
+
+```bash
+export DABSN_CORE_BACKEND=batched       # auto | batched | persistent
+export DABSN_BATCHED_STEP_COMPILE=1     # compile only the pure pointwise step
+export DABSN_TRAIN_DENSE_MAX_SCORES=8388608
+```
+
+The complete DABSN model or backbone is never compiled by this dispatch. The
+batched custom-autograd recurrence has a separately tested explicit backward,
+including every parameter and carried-state gradient.
 
 The release gates cover:
 

@@ -168,14 +168,27 @@ class DABSNRead(nn.Module):
         self.last_admit_gate_mean = None
 
         counts = member.sum(dim=1)
-        n_max = max(int(counts.max().item()), 1)
-        self.last_n_max = n_max
         order = torch.argsort(
             member.to(query.dtype),
             dim=1,
             descending=True,
             stable=True,
         )
+        # A data-dependent bank width (``counts.max().item()``) forces a host
+        # sync that makes CUDA-graph capture impossible. The compact/flash
+        # kernels bound their work by an on-device per-row count, so a full
+        # front-packed bank stays O(T * admitted) sparse while removing the
+        # sync. Keep the width full whenever a capture-safe read is in play
+        # (native CUDA kernels active, or explicitly requested); only the pure
+        # eager CPU reference compacts the width on the host.
+        capture_safe_bank = bool(getattr(self, "_capture_safe_bank", False)) or (
+            expression.is_cuda and bool(getattr(type(self), "_cuda_native_enabled", False))
+        )
+        if capture_safe_bank:
+            n_max = seq_len
+        else:
+            n_max = max(int(counts.max().item()), 1)
+        self.last_n_max = n_max
         seq_idx = order[:, :n_max]
         seq_valid = (
             torch.arange(n_max, device=expression.device).unsqueeze(0)

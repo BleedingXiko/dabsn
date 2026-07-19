@@ -137,7 +137,7 @@ def main() -> int:
                 raise AssertionError(
                     f"block {index} training long read used {training_long_backends[index]}"
                 )
-            if training_read_backends[index] != "compact_flash_trainable":
+            if training_read_backends[index] != "dense_bmm_trainable":
                 raise AssertionError(
                     f"block {index} training admitted read used {training_read_backends[index]}"
                 )

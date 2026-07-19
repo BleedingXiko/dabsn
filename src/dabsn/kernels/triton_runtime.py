@@ -551,8 +551,12 @@ def dabsn_core_scan_triton(
             torch.ones((B, H), device=Wx.device, dtype=Wx.dtype),
             torch.zeros((B, H), device=Wx.device, dtype=Wx.dtype),
         )
+    # The recurrence itself accumulates these three carried values in FP32.
+    # Preserve that precision when a caller splits one logical sequence into
+    # chunks; casting the boundary state back to BF16 makes chunk boundaries
+    # change the result even though the recurrence is otherwise identical.
     initial_b, initial_e, initial_c = (
-        value.to(device=Wx.device, dtype=Wx.dtype).contiguous() for value in initial_state
+        value.to(device=Wx.device, dtype=torch.float32).contiguous() for value in initial_state
     )
     if any(value.shape != (B, H) for value in (initial_b, initial_e, initial_c)):
         raise ValueError(f"initial_state tensors must have shape {(B, H)}")
@@ -561,7 +565,7 @@ def dabsn_core_scan_triton(
     p = torch.empty_like(Wx)
     ay = torch.empty_like(Wx)
     write = torch.empty_like(Wx)
-    final_b = torch.empty((B, H), device=Wx.device, dtype=Wx.dtype)
+    final_b = torch.empty((B, H), device=Wx.device, dtype=torch.float32)
     final_e = torch.empty_like(final_b)
     final_c = torch.empty_like(final_b)
     dummy_tape = U
@@ -2832,12 +2836,18 @@ def dense_bmm_three_way_read(
     B, T, H = read_state.shape
     N = memory_key.shape[1]
     scale_f = scale.to(torch.float32)
-    q = read_state.to(torch.float32)
-    kb = memory_key.to(torch.float32)
-    compat = torch.bmm(q, kb.transpose(1, 2)) * scale_f                       # [B,T,N]
+    # Keep contractions in the caller's compute dtype so BF16/FP16 tensor
+    # cores are actually used. Scores/nonlinearities and recurrent state still
+    # accumulate in FP32. Float32 callers retain the reference path unchanged.
+    q = read_state
+    kb = memory_key.to(read_state.dtype)
+    compat = torch.bmm(q, kb.transpose(1, 2)).float() * scale_f               # [B,T,N]
     key_adm = (key_bias.to(torch.float32) + admission_gate.to(torch.float32)).unsqueeze(1)  # [B,1,N]
     short_scores = compat + key_adm
-    cc = torch.bmm(read_cocktail.to(torch.float32), memory_cocktail.to(torch.float32).transpose(1, 2))
+    cc = torch.bmm(
+        read_cocktail.to(read_state.dtype),
+        memory_cocktail.to(read_state.dtype).transpose(1, 2),
+    ).float()
     perm_scores = short_scores + cc * cocktail_gain.to(torch.float32)
     valid = bank_valid.unsqueeze(1)                                           # [B,1,N]
     bank_pos = bank_idx.unsqueeze(1)                                          # [B,1,N]
@@ -2853,7 +2863,7 @@ def dense_bmm_three_way_read(
         elig = mask.any(dim=-1, keepdim=True)                                # [B,T,1]
         w = torch.softmax(scores.masked_fill(~mask, float("-inf")), dim=-1)
         w = torch.where(elig, torch.nan_to_num(w), torch.zeros_like(w))
-        return torch.bmm(w, values.to(torch.float32))
+        return torch.bmm(w.to(values.dtype), values).float()
 
     short = rd(short_scores, write_memory, allow)
     perm = rd(perm_scores, write_memory, allow)

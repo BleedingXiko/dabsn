@@ -10,3 +10,9 @@ paper1/main.blg
 paper1/main.log
 paper1/main.out
 .DS_Store
+
+# local development virtualenv
+.venv/
+
+# temporary kaggle gate bundle (delete after T4)
+dabsn_kaggle_t4_gate.zip

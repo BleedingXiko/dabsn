@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import os
 
 import torch
 from torch import Tensor
@@ -52,35 +53,87 @@ def cuda_core_forward(
     runtime = _runtime()
     hidden = int(core.hidden_dim)
     logit_saturation_decay = core.logit_saturation_decay.expand(hidden).contiguous()
-    outputs = runtime.dabsn_core_scan_trainable_fused(
-        core.W(inputs).contiguous(),
-        core.Wg(inputs).contiguous(),
-        core.Ug.weight.contiguous(),
-        core.A.weight.contiguous(),
-        core.beta.contiguous(),
-        core.log_kappa.contiguous(),
-        core.logit_recover.contiguous(),
-        core.k_s.contiguous(),
-        core.k_y.contiguous(),
-        core.k_b.contiguous(),
-        core.k_n.contiguous(),
-        core.k_bias.contiguous(),
-        core.r_s.contiguous(),
-        core.r_y.contiguous(),
-        core.r_b.contiguous(),
-        core.r_n.contiguous(),
-        core.r_bias.contiguous(),
-        logit_saturation_decay,
-        core.k_saturation.contiguous(),
-        core.r_saturation.contiguous(),
-        core.logit_alpha.reshape(()),
-        core.log_lambda.reshape(()),
-        core.logit_saturation_suppress.reshape(()),
-        return_tape=return_cocktail,
-        initial_state=initial_state,
-        return_final_state=return_final_state,
+    projected = core.W(inputs).contiguous()
+    gate_projected = core.Wg(inputs).contiguous()
+    requested_backend = os.environ.get("DABSN_CORE_BACKEND", "auto").lower()
+    if requested_backend not in {"auto", "batched", "persistent"}:
+        raise ValueError(
+            "DABSN_CORE_BACKEND must be auto, batched, or persistent; "
+            f"got {requested_backend!r}"
+        )
+    # The persistent scan minimizes launch overhead for latency/small batches.
+    # Large-batch training must instead share each recurrent matrix load across
+    # the batch through GEMM. Width/depth are not used as architecture guesses;
+    # this dispatch is based only on the actual execution shape.
+    batched = torch.is_grad_enabled() and (
+        requested_backend == "batched"
+        or (
+            requested_backend == "auto"
+            and inputs.shape[0] >= int(os.environ.get("DABSN_BATCHED_CORE_MIN_BATCH", "64"))
+        )
     )
-    core._last_core_backend = "cuda_triton"
+    if batched:
+        from .batched_runtime import dabsn_core_scan_batched
+
+        outputs = dabsn_core_scan_batched(
+            projected,
+            gate_projected,
+            core.Ug.weight.contiguous(),
+            core.A.weight.contiguous(),
+            core.beta.contiguous(),
+            core.log_kappa.contiguous(),
+            core.logit_recover.contiguous(),
+            core.k_s.contiguous(),
+            core.k_y.contiguous(),
+            core.k_b.contiguous(),
+            core.k_n.contiguous(),
+            core.k_bias.contiguous(),
+            core.r_s.contiguous(),
+            core.r_y.contiguous(),
+            core.r_b.contiguous(),
+            core.r_n.contiguous(),
+            core.r_bias.contiguous(),
+            logit_saturation_decay,
+            core.k_saturation.contiguous(),
+            core.r_saturation.contiguous(),
+            core.logit_alpha.reshape(()),
+            core.log_lambda.reshape(()),
+            core.logit_saturation_suppress.reshape(()),
+            return_tape=return_cocktail,
+            initial_state=initial_state,
+            return_final_state=return_final_state,
+        )
+        core._last_core_backend = "cuda_batched_gemm"
+    else:
+        outputs = runtime.dabsn_core_scan_trainable_fused(
+            projected,
+            gate_projected,
+            core.Ug.weight.contiguous(),
+            core.A.weight.contiguous(),
+            core.beta.contiguous(),
+            core.log_kappa.contiguous(),
+            core.logit_recover.contiguous(),
+            core.k_s.contiguous(),
+            core.k_y.contiguous(),
+            core.k_b.contiguous(),
+            core.k_n.contiguous(),
+            core.k_bias.contiguous(),
+            core.r_s.contiguous(),
+            core.r_y.contiguous(),
+            core.r_b.contiguous(),
+            core.r_n.contiguous(),
+            core.r_bias.contiguous(),
+            logit_saturation_decay,
+            core.k_saturation.contiguous(),
+            core.r_saturation.contiguous(),
+            core.logit_alpha.reshape(()),
+            core.log_lambda.reshape(()),
+            core.logit_saturation_suppress.reshape(()),
+            return_tape=return_cocktail,
+            initial_state=initial_state,
+            return_final_state=return_final_state,
+        )
+        core._last_core_backend = "cuda_triton"
     trajectory, novelty, plasticity, expression, write = outputs[:5]
     if return_cocktail:
         energy, saturation = outputs[5], outputs[6]
@@ -146,22 +199,47 @@ def cuda_three_way_read(
         if bank_idx is None or bank_valid is None or mode not in {"seq", "field"}:
             raise RuntimeError("compact DABSN read is missing bank index/valid metadata")
         if torch.is_grad_enabled():
-            output = runtime.admitted_three_way_read_compact_flash_trainable(
-                query,
-                bank_keys,
-                bank_writes,
-                next_writes,
-                cocktail,
-                bank_cocktail,
-                bank_key_bias,
-                bank_admission,
-                scale,
-                bank_idx,
-                bank_valid,
-                mode=mode,
-                **gains,
-            )
-            read._last_three_way_backend = "compact_flash_trainable"
+            # At language-model training sizes the admitted bank is normally
+            # dense and [B,T,N] is modest. Native BMM gives both forward and
+            # backward tensor-core contractions; the compact flash forward's
+            # legacy backward is one serial program per query. Large score
+            # tensors retain the memory-bounded compact path.
+            score_entries = query.shape[0] * query.shape[1] * bank_keys.shape[1]
+            dense_limit = int(os.environ.get("DABSN_TRAIN_DENSE_MAX_SCORES", "8388608"))
+            if score_entries <= dense_limit:
+                output = runtime.dense_bmm_three_way_read(
+                    query,
+                    bank_keys,
+                    bank_writes,
+                    next_writes,
+                    cocktail,
+                    bank_cocktail,
+                    bank_key_bias,
+                    bank_admission,
+                    scale,
+                    bank_idx,
+                    bank_valid,
+                    mode=mode,
+                    **gains,
+                )
+                read._last_three_way_backend = "dense_bmm_trainable"
+            else:
+                output = runtime.admitted_three_way_read_compact_flash_trainable(
+                    query,
+                    bank_keys,
+                    bank_writes,
+                    next_writes,
+                    cocktail,
+                    bank_cocktail,
+                    bank_key_bias,
+                    bank_admission,
+                    scale,
+                    bank_idx,
+                    bank_valid,
+                    mode=mode,
+                    **gains,
+                )
+                read._last_three_way_backend = "compact_flash_trainable"
             return output
         output, backend = runtime.admitted_three_way_read_dispatch(
             query,
@@ -234,6 +312,10 @@ def triton_status() -> dict[str, object]:
     return {
         "cuda_available": torch.cuda.is_available(),
         "triton_available": triton_available(),
+        "core_backend_policy": os.environ.get("DABSN_CORE_BACKEND", "auto"),
+        "batched_core_min_batch": int(os.environ.get("DABSN_BATCHED_CORE_MIN_BATCH", "64")),
+        "batched_step_compile": os.environ.get("DABSN_BATCHED_STEP_COMPILE", "1") == "1",
+        "train_dense_max_scores": int(os.environ.get("DABSN_TRAIN_DENSE_MAX_SCORES", "8388608")),
         "core_scan_enabled": bool(getattr(DABSNCore, "_cuda_native_enabled", False)),
         "admitted_three_way_read_enabled": bool(
             getattr(DABSNRead, "_cuda_native_enabled", False)
