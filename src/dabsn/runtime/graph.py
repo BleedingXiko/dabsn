@@ -41,6 +41,69 @@ def _default_reduce(output: object) -> Tensor:
     return sum(tensor.float().square().mean() for tensor in tensors)
 
 
+def _read_submodules(module: nn.Module) -> list[nn.Module]:
+    """DABSN admitted-read submodules (duck-typed to keep this file neutral)."""
+
+    return [m for m in module.modules() if hasattr(m, "read_geometry")]
+
+
+def _pin_capture_safe_reads(module: nn.Module, sample_args: Sequence[Tensor]):
+    """Make the admitted read shape-stable for graph capture, and sub-quadratic.
+
+    The read sizes its bank to the data-dependent admitted count by default --
+    not capturable, and it *differs between warmup and capture*, which corrupts
+    the recorded graph (misaligned addresses). CUDA-graph capture requires one
+    static width. Forcing the full ``seq_len`` width is capturable but turns the
+    sparse read into an O(T^2) attention, which at long context dominates the
+    core cost. Instead: run a short eager pre-warmup to observe the natural
+    admitted width, then pin a padded static cap (``_capture_bank_width``) so the
+    captured read is fixed-shape AND O(T * admitted). Returns a restore closure.
+    """
+
+    reads = _read_submodules(module)
+    saved = [
+        (m, getattr(m, "_capture_safe_bank", None), getattr(m, "_capture_bank_width", None))
+        for m in reads
+    ]
+
+    observed = 0
+    if reads:
+        try:
+            with torch.no_grad():
+                for _ in range(2):
+                    module(*sample_args)
+            for m in reads:
+                width = getattr(m, "last_n_max", None)
+                if isinstance(width, int):
+                    observed = max(observed, width)
+        except Exception:  # pragma: no cover - measurement is best-effort
+            observed = 0
+
+    # Generous pad so a captured batch that admits a bit more than the warmup
+    # batches is still covered exactly; the read clamps the cap to seq_len, so
+    # observed==0 (measurement failed) safely falls back to the full width.
+    cap = observed * 2 + 64 if observed > 0 else None
+    for m in reads:
+        m._capture_safe_bank = True
+        if cap is not None:
+            m._capture_bank_width = cap
+
+    def restore() -> None:
+        for m, prev_flag, prev_width in saved:
+            if prev_flag is None:
+                if hasattr(m, "_capture_safe_bank"):
+                    delattr(m, "_capture_safe_bank")
+            else:
+                m._capture_safe_bank = prev_flag
+            if prev_width is None:
+                if hasattr(m, "_capture_bank_width"):
+                    delattr(m, "_capture_bank_width")
+            else:
+                m._capture_bank_width = prev_width
+
+    return restore
+
+
 def _find_backbone(module: nn.Module):
     """Locate a DABSN backbone if the graphed module exposes one."""
 
@@ -159,41 +222,49 @@ def make_graphed_train_callable(
 
     module.train()
     module.zero_grad(set_to_none=True)
-    eager_loss = None
-    eager_signature = None
-    if verify:
-        eager_loss = float(reduce(module(*sample_args)).detach())
-        reduce(module(*sample_args)).backward()
-        eager_signature = _block_grad_signature(module)
-        module.zero_grad(set_to_none=True)
 
-    # make_graphed_callables records the eager forward/backward as CUDA work.
-    # It does NOT invoke Dynamo/AOTAutograd, so DABSN custom-autograd Functions
-    # are captured intact rather than traced or rewritten.
-    graphed = torch.cuda.make_graphed_callables(
-        module,
-        sample_args=sample_args,
-        num_warmup_iters=int(warmup_iters),
-        allow_unused_input=True,
-    )
+    # Pin the admitted read to a fixed, sub-quadratic width for the whole build
+    # (warmup + capture must agree, or the recorded graph misaligns). Restored
+    # afterward so eager/non-graph steps keep their data-dependent sparse width.
+    restore_reads = _pin_capture_safe_reads(module, sample_args)
+    try:
+        eager_loss = None
+        eager_signature = None
+        if verify:
+            eager_loss = float(reduce(module(*sample_args)).detach())
+            reduce(module(*sample_args)).backward()
+            eager_signature = _block_grad_signature(module)
+            module.zero_grad(set_to_none=True)
 
-    # Flush capture's transient so the first independent single backward begins
-    # from the same state as every later replay. Cross-replay accumulation is
-    # intentionally delegated to ManualGradientAccumulator.
-    reduce(graphed(*sample_args)).backward()
-    torch.cuda.synchronize()
-    module.zero_grad(set_to_none=True)
+        # make_graphed_callables records the eager forward/backward as CUDA work.
+        # It does NOT invoke Dynamo/AOTAutograd, so DABSN custom-autograd Functions
+        # are captured intact rather than traced or rewritten.
+        graphed = torch.cuda.make_graphed_callables(
+            module,
+            sample_args=sample_args,
+            num_warmup_iters=int(warmup_iters),
+            allow_unused_input=True,
+        )
 
-    if verify:
-        graph_loss = float(reduce(graphed(*sample_args)).detach())
+        # Flush capture's transient so the first independent single backward
+        # begins from the same state as every later replay. Cross-replay
+        # accumulation is intentionally delegated to ManualGradientAccumulator.
         reduce(graphed(*sample_args)).backward()
-        graph_signature = _block_grad_signature(module)
+        torch.cuda.synchronize()
         module.zero_grad(set_to_none=True)
-        _assert_close("loss", eager_loss, graph_loss, rtol=loss_rtol, atol=loss_atol)
-        if eager_signature is not None and graph_signature is not None:
-            _assert_signatures_close(
-                eager_signature, graph_signature, rtol=grad_rtol, atol=grad_atol
-            )
+
+        if verify:
+            graph_loss = float(reduce(graphed(*sample_args)).detach())
+            reduce(graphed(*sample_args)).backward()
+            graph_signature = _block_grad_signature(module)
+            module.zero_grad(set_to_none=True)
+            _assert_close("loss", eager_loss, graph_loss, rtol=loss_rtol, atol=loss_atol)
+            if eager_signature is not None and graph_signature is not None:
+                _assert_signatures_close(
+                    eager_signature, graph_signature, rtol=grad_rtol, atol=grad_atol
+                )
+    finally:
+        restore_reads()
 
     return graphed
 

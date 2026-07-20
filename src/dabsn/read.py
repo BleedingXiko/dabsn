@@ -14,6 +14,21 @@ def _parameter(value: float) -> nn.Parameter:
     return nn.Parameter(torch.full((1,), float(value)))
 
 
+def _stream_is_capturing() -> bool:
+    """True only while a CUDA graph is actively being captured on the current
+    stream. Unlike ``_cuda_native_enabled`` (set for the whole GPU session),
+    this is the narrow window in which a host sync such as ``.item()`` is
+    illegal -- so it is the correct gate for forcing a static, sync-free bank
+    width. Returns False on CPU or when CUDA graphs are unavailable.
+    """
+    if not torch.cuda.is_available():
+        return False
+    try:
+        return bool(torch.cuda.is_current_stream_capturing())
+    except Exception:  # pragma: no cover - very old / exotic CUDA builds
+        return False
+
+
 class _AdmittedReadParameters(nn.Module):
     """Parameters shared by the canonical three-way admitted read."""
 
@@ -174,18 +189,31 @@ class DABSNRead(nn.Module):
             descending=True,
             stable=True,
         )
-        # A data-dependent bank width (``counts.max().item()``) forces a host
-        # sync that makes CUDA-graph capture impossible. The compact/flash
-        # kernels bound their work by an on-device per-row count, so a full
-        # front-packed bank stays O(T * admitted) sparse while removing the
-        # sync. Keep the width full whenever a capture-safe read is in play
-        # (native CUDA kernels active, or explicitly requested); only the pure
-        # eager CPU reference compacts the width on the host.
-        capture_safe_bank = bool(getattr(self, "_capture_safe_bank", False)) or (
-            expression.is_cuda and bool(getattr(type(self), "_cuda_native_enabled", False))
-        )
+        # Bank-width policy. The read scores every query position against every
+        # admitted bank entry, so the dense tensor-core path costs O(T * n_max).
+        # Sizing the bank to the data-dependent admitted count
+        # (``counts.max().item()``) keeps that sub-quadratic -- O(T * admitted)
+        # -- which is the entire point of the sparse admitted read. The only
+        # catch is that ``.item()`` is a host sync, which is illegal *while a
+        # CUDA graph is being captured*.
+        #
+        # This used to be gated on ``_cuda_native_enabled``, which is set for
+        # the whole GPU session: that forced the full-width (n_max == seq_len)
+        # bank on EVERY CUDA step, silently turning the sparse read into a full
+        # O(T^2) attention on all GPU training -- not just under capture. That
+        # is the context-length blow-up. Gate strictly on *actual* stream
+        # capture instead: ordinary GPU training (and the eager warmup steps of
+        # a graphed run) sizes the bank to the admitted count and stays sparse;
+        # only the narrow capture window takes a static width, and even there an
+        # explicit measured cap (``_capture_bank_width``) keeps it sub-quadratic
+        # when the harness provides one. ``_capture_safe_bank`` remains an
+        # explicit manual override for callers that need the static path.
+        capturing = expression.is_cuda and _stream_is_capturing()
+        capture_safe_bank = bool(getattr(self, "_capture_safe_bank", False)) or capturing
         if capture_safe_bank:
-            n_max = seq_len
+            cap = getattr(self, "_capture_bank_width", None)
+            n_max = int(cap) if cap else seq_len
+            n_max = max(1, min(n_max, seq_len))
         else:
             n_max = max(int(counts.max().item()), 1)
         self.last_n_max = n_max

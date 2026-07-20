@@ -90,6 +90,61 @@ def test_finetune_means_weights_in_new_optimizer_run(tmp_path):
     assert (tmp_path / "finetuned.safetensors.optimizer.pt").is_file()
 
 
+def test_pretrain_cuda_graph_flag_falls_back_cleanly_on_cpu(tmp_path):
+    # cuda_graph is a CUDA-only capture; on CPU it must transparently fall back
+    # to the eager path and produce bit-identical weights, so the flag is safe
+    # to leave on in configs that also run CPU smoke tests.
+    corpus = tmp_path / "tokens.bin"
+    np.asarray(list(range(16)) * 32, dtype=np.uint8).tofile(corpus)
+    common = dict(
+        corpus_bin=str(corpus),
+        corpus_dtype="uint8",
+        vocab=16,
+        hidden_dim=6,
+        depth=1,
+        layer_geometries="seq",
+        state_dim=5,
+        tie_embeddings=True,
+        train_context=4,
+        steps=4,
+        batch_size=2,
+        eval_batch_size=2,
+        val_batches=0,
+        val_fraction=0.0,
+        learning_rate=1e-3,
+        warmup_steps=10,
+        seed=321,
+        precision="fp32",
+        distributed="none",
+        grad_checkpoint=False,
+        grad_accum_steps=2,
+        checkpoint_every=0,
+        log_every=0,
+        val_every=0,
+    )
+    eager = tmp_path / "eager.safetensors"
+    graph = tmp_path / "graph.safetensors"
+    report_eager = pretrain_next_token(
+        DABSNPretrainConfig(**{**common, "cuda_graph": False}),
+        eager,
+        device="cpu",
+        backend="cpu",
+    )
+    report_graph = pretrain_next_token(
+        DABSNPretrainConfig(**{**common, "cuda_graph": True}),
+        graph,
+        device="cpu",
+        backend="cpu",
+    )
+    assert report_eager["cuda_graph"] is None
+    assert report_graph["cuda_graph"] == "skipped: cuda_graph requires a CUDA device"
+    expected = load_file(str(eager))
+    actual = load_file(str(graph))
+    assert set(actual) == set(expected)
+    for name in expected:
+        torch.testing.assert_close(actual[name], expected[name], atol=0, rtol=0)
+
+
 def test_pretrain_portable_resume_matches_uninterrupted(tmp_path):
     corpus = tmp_path / "tokens.bin"
     np.asarray(list(range(16)) * 32, dtype=np.uint8).tofile(corpus)

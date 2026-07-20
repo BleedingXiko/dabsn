@@ -16,3 +16,12 @@ paper1/main.out
 
 # temporary kaggle gate bundle (delete after T4)
 dabsn_kaggle_t4_gate.zip
+
+# internal scale-proving / benchmarking harness: kept locally for our own
+# measurement, not part of the published framework.
+tools/colab_prove.py
+tools/scale_bench.py
+tools/train_scale_gate.py
+tools/build_scale_gate_bundle.py
+tests/test_scale_bench.py
+dabsn_train_scale_gate.zip

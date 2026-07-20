@@ -324,6 +324,85 @@ def _run_backward_step(*args):
     return _COMPILED_BACKWARD_STEP(*args)
 
 
+def _batched_forward_tapes(
+    Wx, Wgx, Ug, A,
+    beta, log_kappa, logit_recover,
+    k_s, k_y, k_b, k_n, k_bias,
+    r_s, r_y, r_b, r_n, r_bias,
+    logit_c_decay, k_c, r_c,
+    logit_alpha, log_lambda, logit_c_suppress,
+    initial_b, initial_e, initial_c,
+) -> tuple[Tensor, ...]:
+    """Advance the whole batch through T with per-step tensor-core GEMMs.
+
+    Returns exactly the tapes the reverse recurrence consumes, in the order
+    ``(U, novelty, plasticity, expression, write, e_tape, c_tape, s_tape,
+    final_b, final_e, final_c)``. This is the single source of truth for the
+    forward math shared by the eager batched Function and the fused-kernel
+    Function's CPU/large-H fallback, so both save an identical backward context.
+    """
+
+    B, T, H = Wx.shape
+    # Parameters remain FP32 master weights for AdamW.  The recurrent GEMM must
+    # use the live activation compute dtype (BF16 on Ampere/Hopper, FP16 on
+    # Turing when selected) or this tensor-core backend silently degenerates
+    # into TF32/FP32.  Pointwise state remains FP32.
+    recurrent = torch.cat((Ug, A), dim=0).to(Wx.dtype).contiguous()
+    budget = initial_b.float()
+    energy = initial_e.float()
+    saturation = initial_c.float()
+    u_rows, novelty_rows, plasticity_rows = [], [], []
+    expression_rows, write_rows, energy_rows = [], [], []
+    saturation_rows, gate_rows = [], []
+    for step in range(T):
+        (
+            y,
+            budget,
+            next_energy,
+            saturation,
+            novelty,
+            plasticity,
+            expression,
+            write,
+            energy_before,
+            gate,
+        ) = _run_forward_step(
+            Wx[:, step], Wgx[:, step], recurrent,
+            budget, energy, saturation,
+            beta, log_kappa, logit_recover,
+            k_s, k_y, k_b, k_n, k_bias,
+            r_s, r_y, r_b, r_n, r_bias,
+            logit_c_decay, k_c, r_c,
+            logit_alpha, log_lambda, logit_c_suppress,
+        )
+        energy = next_energy
+        u_rows.append(torch.cat((y, budget), dim=-1))
+        novelty_rows.append(novelty)
+        plasticity_rows.append(plasticity)
+        expression_rows.append(expression)
+        write_rows.append(write)
+        energy_rows.append(energy_before)
+        saturation_rows.append(saturation)
+        gate_rows.append(gate)
+
+    def stack(rows):
+        return torch.stack(rows, dim=1).to(Wx.dtype)
+
+    return (
+        stack(u_rows),
+        stack(novelty_rows),
+        stack(plasticity_rows),
+        stack(expression_rows),
+        stack(write_rows),
+        stack(energy_rows),
+        stack(saturation_rows),
+        stack(gate_rows),
+        budget.to(Wx.dtype),
+        energy.to(Wx.dtype),
+        saturation.to(Wx.dtype),
+    )
+
+
 class DABSNCoreScanBatched(torch.autograd.Function):
     """Memory-bounded batched-GEMM scan with an explicit reverse recurrence."""
 
@@ -364,62 +443,18 @@ class DABSNCoreScanBatched(torch.autograd.Function):
             raise ValueError("batched DABSN core received incompatible tensor shapes")
         ctx.return_tape = bool(return_tape)
         ctx.return_final_state = bool(return_final_state)
-        # Parameters remain FP32 master weights for AdamW.  The recurrent GEMM
-        # must use the live activation compute dtype (BF16 on Ampere/Hopper,
-        # FP16 on Turing when selected) or this alleged tensor-core backend
-        # silently degenerates into TF32/FP32.  Pointwise state remains FP32.
-        recurrent = torch.cat((Ug, A), dim=0).to(Wx.dtype).contiguous()
-        budget = initial_b.float()
-        energy = initial_e.float()
-        saturation = initial_c.float()
-        u_rows, novelty_rows, plasticity_rows = [], [], []
-        expression_rows, write_rows, energy_rows = [], [], []
-        saturation_rows, gate_rows = [], []
-        for step in range(T):
-            (
-                y,
-                budget,
-                next_energy,
-                saturation,
-                novelty,
-                plasticity,
-                expression,
-                write,
-                energy_before,
-                gate,
-            ) = _run_forward_step(
-                Wx[:, step], Wgx[:, step], recurrent,
-                budget, energy, saturation,
-                beta, log_kappa, logit_recover,
-                k_s, k_y, k_b, k_n, k_bias,
-                r_s, r_y, r_b, r_n, r_bias,
-                logit_c_decay, k_c, r_c,
-                logit_alpha, log_lambda, logit_c_suppress,
-            )
-            energy = next_energy
-            u_rows.append(torch.cat((y, budget), dim=-1))
-            novelty_rows.append(novelty)
-            plasticity_rows.append(plasticity)
-            expression_rows.append(expression)
-            write_rows.append(write)
-            energy_rows.append(energy_before)
-            saturation_rows.append(saturation)
-            gate_rows.append(gate)
-
-        def stack(rows):
-            return torch.stack(rows, dim=1).to(Wx.dtype)
-
-        U = stack(u_rows)
-        novelty = stack(novelty_rows)
-        plasticity = stack(plasticity_rows)
-        expression = stack(expression_rows)
-        write = stack(write_rows)
-        e_tape = stack(energy_rows)
-        c_tape = stack(saturation_rows)
-        s_tape = stack(gate_rows)
-        final_b = budget.to(Wx.dtype)
-        final_e = energy.to(Wx.dtype)
-        final_c = saturation.to(Wx.dtype)
+        (
+            U, novelty, plasticity, expression, write,
+            e_tape, c_tape, s_tape, final_b, final_e, final_c,
+        ) = _batched_forward_tapes(
+            Wx, Wgx, Ug, A,
+            beta, log_kappa, logit_recover,
+            k_s, k_y, k_b, k_n, k_bias,
+            r_s, r_y, r_b, r_n, r_bias,
+            logit_c_decay, k_c, r_c,
+            logit_alpha, log_lambda, logit_c_suppress,
+            initial_b, initial_e, initial_c,
+        )
         ctx.save_for_backward(
             Wx, Wgx, Ug, A,
             beta, log_kappa, logit_recover,
@@ -596,6 +631,283 @@ def dabsn_core_scan_batched(
         value.to(device=Wx.device, dtype=Wx.dtype).contiguous() for value in initial_state
     )
     return DABSNCoreScanBatched.apply(
+        Wx, Wgx, Ug, A,
+        beta, log_kappa, logit_recover,
+        k_s, k_y, k_b, k_n, k_bias,
+        r_s, r_y, r_b, r_n, r_bias,
+        logit_c_decay, k_c, r_c,
+        logit_alpha, log_lambda, logit_c_suppress,
+        initial_b, initial_e, initial_c,
+        bool(return_tape), bool(return_final_state),
+    )
+
+
+# ---------------------------------------------------------------------------
+# batched_fused: single-launch tiled tensor-core scan (Phase B)
+# ---------------------------------------------------------------------------
+# The batched scan above issues one tensor-core GEMM per recurrent step but
+# advances the T loop in Python: every step round-trips the carried
+# budget/energy/saturation state through HBM. `batched_fused` replaces the
+# forward scan with a SINGLE Triton launch whose programs each own a BLOCK_B
+# tile of sequences, loop T on-chip carrying state in registers, and contract
+# [Ug;A] with `tl.dot` (tensor cores) -- no Python loop, no per-step HBM state
+# round-trip. It writes exactly the tapes the reverse recurrence needs, so the
+# backward reuses the already-certified batched reverse unchanged. The Triton
+# forward is GPU-only; on CPU / when Triton is unavailable / for widths past one
+# tile it falls back to the identical `_batched_forward_tapes` math, so results
+# are always exact and the Function's tape/backward wiring is CPU-provable.
+#
+# `select_core_backend` never returns `batched_fused` from `auto`: per the plan
+# it is reachable only by explicit request until `tools/train_scale_gate.py`
+# certifies the Triton forward bit-parity on real hardware (the gate already
+# includes it in its parity matrix).
+
+
+# The fused forward K-tiles the recurrent contraction, so shared memory is
+# bounded by BLOCK_K and there is no matrix-width SMEM limit. The real ceiling is
+# the register file: a program carries the full [BLOCK_B, H] budget/energy/
+# saturation state across T, so H is capped where those tiles stop fitting in
+# registers (~256 for BLOCK_B=16 on A100/H100). Wider cores -- a 1B model is
+# H~2048 -- run the batched tensor-core GEMM scan, which is cuBLAS-optimal at
+# that width and, under CUDA graphs, is the transformer-competitive scale path;
+# the fused single-tile kernel is the small/medium-H win, not the scale path.
+_FUSED_MAX_H = int(os.environ.get("DABSN_FUSED_CORE_MAX_H", "256"))
+
+
+def _fused_forward_available(Wx: Tensor) -> bool:
+    if not Wx.is_cuda or os.environ.get("DABSN_FUSED_CORE_DISABLE", "0") == "1":
+        return False
+    try:
+        import triton  # noqa: F401
+    except Exception:
+        return False
+    return int(Wx.shape[-1]) <= _FUSED_MAX_H
+
+
+class DABSNCoreScanBatchedFused(torch.autograd.Function):
+    """Single-launch fused-forward scan; shares the batched reverse recurrence."""
+
+    @staticmethod
+    def forward(  # type: ignore[override]
+        ctx,
+        Wx, Wgx, Ug, A,
+        beta, log_kappa, logit_recover,
+        k_s, k_y, k_b, k_n, k_bias,
+        r_s, r_y, r_b, r_n, r_bias,
+        logit_c_decay, k_c, r_c,
+        logit_alpha, log_lambda, logit_c_suppress,
+        initial_b, initial_e, initial_c,
+        return_tape, return_final_state,
+    ) -> tuple[Tensor, ...]:
+        B, T, H = Wx.shape
+        if Wgx.shape != Wx.shape or Ug.shape != (H, H) or A.shape != (H, H):
+            raise ValueError("fused DABSN core received incompatible tensor shapes")
+        ctx.return_tape = bool(return_tape)
+        ctx.return_final_state = bool(return_final_state)
+        # Whether the Triton fused forward ran (vs the eager tape fallback)
+        # decides which reverse the backward uses: the single-launch Triton
+        # backward when on GPU+Triton, else the certified eager reverse. The
+        # forward writes an identical tape contract either way, so both reverses
+        # consume the same saved context.
+        used_triton = _fused_forward_available(Wx)
+        ctx.used_triton = bool(used_triton)
+        if used_triton:
+            from .triton_runtime import dabsn_core_scan_batched_fused_forward
+
+            tapes = dabsn_core_scan_batched_fused_forward(
+                Wx, Wgx, Ug, A,
+                beta, log_kappa, logit_recover,
+                k_s, k_y, k_b, k_n, k_bias,
+                r_s, r_y, r_b, r_n, r_bias,
+                logit_c_decay, k_c, r_c,
+                logit_alpha, log_lambda, logit_c_suppress,
+                initial_b, initial_e, initial_c,
+            )
+        else:
+            tapes = _batched_forward_tapes(
+                Wx, Wgx, Ug, A,
+                beta, log_kappa, logit_recover,
+                k_s, k_y, k_b, k_n, k_bias,
+                r_s, r_y, r_b, r_n, r_bias,
+                logit_c_decay, k_c, r_c,
+                logit_alpha, log_lambda, logit_c_suppress,
+                initial_b, initial_e, initial_c,
+            )
+        (U, novelty, plasticity, expression, write,
+         e_tape, c_tape, s_tape, final_b, final_e, final_c) = tapes
+        ctx.save_for_backward(
+            Wx, Wgx, Ug, A,
+            beta, log_kappa, logit_recover,
+            k_s, k_y, k_b, k_n, k_bias,
+            r_s, r_y, r_b, r_n, r_bias,
+            logit_c_decay, k_c, r_c,
+            logit_alpha, log_lambda, logit_c_suppress,
+            initial_b, initial_e, initial_c,
+            U, novelty, plasticity, expression, write,
+            e_tape, c_tape, s_tape,
+            final_b, final_e, final_c,
+        )
+        public = [U, novelty, plasticity, expression, write]
+        if ctx.return_tape:
+            public.extend((e_tape, c_tape))
+        if ctx.return_final_state:
+            public.extend((final_b, final_e, final_c))
+        return tuple(public)
+
+    @staticmethod
+    def backward(ctx, *grad_outputs):  # type: ignore[override]
+        # Off the GPU/Triton path (CPU, large H, or Triton disabled) the tapes
+        # came from the eager forward, so use the certified eager reverse. This
+        # is also the escape hatch: DABSN_FUSED_CORE_TRITON_BWD=0 forces it.
+        use_triton_bwd = (
+            getattr(ctx, "used_triton", False)
+            and os.environ.get("DABSN_FUSED_CORE_TRITON_BWD", "1") == "1"
+        )
+        if not use_triton_bwd:
+            return DABSNCoreScanBatched.backward(ctx, *grad_outputs)
+
+        # Single-launch reverse: reuse the already-certified fused backward
+        # (one-tile / K-tiled chunked) that the persistent Triton path uses.
+        # The fused forward writes exactly the tape set it consumes, so this is
+        # bit-parity with the eager reverse (the GPU parity test asserts it),
+        # with no Python T-loop -- the graph-free / consumer-GPU throughput win.
+        from .triton_runtime import _dabsn_core_fused_backward
+
+        (
+            Wx, Wgx, Ug, A,
+            beta, log_kappa, logit_recover,
+            k_s, k_y, k_b, k_n, k_bias,
+            r_s, r_y, r_b, r_n, r_bias,
+            logit_c_decay, k_c, r_c,
+            logit_alpha, log_lambda, logit_c_suppress,
+            initial_b, initial_e, initial_c,
+            U, novelty, plasticity, expression, write,
+            e_tape, c_tape, s_tape,
+            final_b, final_e, final_c,
+        ) = ctx.saved_tensors
+
+        gU, gnov_out, gp_out, gay_out, gwrite_out = (
+            torch.zeros_like(out) if grad is None else grad.contiguous()
+            for out, grad in zip((U, novelty, plasticity, expression, write), grad_outputs)
+        )
+        ge_out = (
+            torch.zeros_like(e_tape)
+            if not ctx.return_tape or grad_outputs[5] is None
+            else grad_outputs[5].contiguous()
+        )
+        gc_out = (
+            torch.zeros_like(c_tape)
+            if not ctx.return_tape or grad_outputs[6] is None
+            else grad_outputs[6].contiguous()
+        )
+        final_offset = 7 if ctx.return_tape else 5
+        if ctx.return_final_state:
+            gfinal_b = (
+                torch.zeros_like(final_b)
+                if grad_outputs[final_offset] is None
+                else grad_outputs[final_offset].contiguous()
+            )
+            gfinal_e = (
+                torch.zeros_like(final_e)
+                if grad_outputs[final_offset + 1] is None
+                else grad_outputs[final_offset + 1].contiguous()
+            )
+            gfinal_c = (
+                torch.zeros_like(final_c)
+                if grad_outputs[final_offset + 2] is None
+                else grad_outputs[final_offset + 2].contiguous()
+            )
+        else:
+            gfinal_b = torch.zeros_like(final_b)
+            gfinal_e = torch.zeros_like(final_e)
+            gfinal_c = torch.zeros_like(final_c)
+
+        (
+            gWx, gWgx, grad_A, grad_Ug, gparam, gscal,
+            ginitial_b, ginitial_e, ginitial_c,
+        ) = _dabsn_core_fused_backward(
+            U, novelty, plasticity, expression, e_tape, c_tape, s_tape,
+            initial_b, initial_c,
+            A, Ug,
+            beta, log_kappa, logit_recover,
+            k_s, k_y, k_b, k_n, k_bias,
+            r_s, r_y, r_b, r_n, r_bias,
+            logit_c_decay, k_c, r_c,
+            logit_alpha, log_lambda, logit_c_suppress,
+            gU, gnov_out, gp_out, gay_out, gwrite_out, ge_out, gc_out,
+            gfinal_b, gfinal_e, gfinal_c,
+        )
+        return (
+            gWx.to(Wx.dtype), gWgx.to(Wgx.dtype),
+            grad_Ug.to(Ug.dtype), grad_A.to(A.dtype),
+            gparam[0].to(beta.dtype),
+            gparam[1].to(log_kappa.dtype),
+            gparam[2].to(logit_recover.dtype),
+            gparam[3].to(k_s.dtype),
+            gparam[4].to(k_y.dtype),
+            gparam[5].to(k_b.dtype),
+            gparam[6].to(k_n.dtype),
+            gparam[7].to(k_bias.dtype),
+            gparam[8].to(r_s.dtype),
+            gparam[9].to(r_y.dtype),
+            gparam[10].to(r_b.dtype),
+            gparam[11].to(r_n.dtype),
+            gparam[12].to(r_bias.dtype),
+            gparam[13].to(logit_c_decay.dtype),
+            gparam[14].to(k_c.dtype),
+            gparam[15].to(r_c.dtype),
+            gscal[0].reshape_as(logit_alpha).to(logit_alpha.dtype),
+            gscal[1].reshape_as(log_lambda).to(log_lambda.dtype),
+            gscal[2].reshape_as(logit_c_suppress).to(logit_c_suppress.dtype),
+            ginitial_b.to(initial_b.dtype),
+            ginitial_e.to(initial_e.dtype),
+            ginitial_c.to(initial_c.dtype),
+            None, None,
+        )
+
+
+def dabsn_core_scan_batched_fused(
+    Wx: Tensor,
+    Wgx: Tensor,
+    Ug: Tensor,
+    A: Tensor,
+    beta: Tensor,
+    log_kappa: Tensor,
+    logit_recover: Tensor,
+    k_s: Tensor,
+    k_y: Tensor,
+    k_b: Tensor,
+    k_n: Tensor,
+    k_bias: Tensor,
+    r_s: Tensor,
+    r_y: Tensor,
+    r_b: Tensor,
+    r_n: Tensor,
+    r_bias: Tensor,
+    logit_c_decay: Tensor,
+    k_c: Tensor,
+    r_c: Tensor,
+    logit_alpha: Tensor,
+    log_lambda: Tensor,
+    logit_c_suppress: Tensor,
+    *,
+    return_tape: bool = False,
+    initial_state: tuple[Tensor, Tensor, Tensor] | None = None,
+    return_final_state: bool = False,
+) -> tuple[Tensor, ...]:
+    """Single-launch fused-forward core scan (see module note on `batched_fused`)."""
+
+    B, _, H = Wx.shape
+    if initial_state is None:
+        initial_state = (
+            torch.zeros((B, H), device=Wx.device, dtype=Wx.dtype),
+            torch.ones((B, H), device=Wx.device, dtype=Wx.dtype),
+            torch.zeros((B, H), device=Wx.device, dtype=Wx.dtype),
+        )
+    initial_b, initial_e, initial_c = (
+        value.to(device=Wx.device, dtype=Wx.dtype).contiguous() for value in initial_state
+    )
+    return DABSNCoreScanBatchedFused.apply(
         Wx, Wgx, Ug, A,
         beta, log_kappa, logit_recover,
         k_s, k_y, k_b, k_n, k_bias,

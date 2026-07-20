@@ -71,3 +71,44 @@ def test_capture_safe_bank_removes_host_item_dependency():
     inputs = _inputs(2, 12, 8, seed=1)
     read(**inputs)
     assert read.last_n_max == 12
+
+
+@pytest.mark.parametrize("geometry", ["seq", "field", "hybrid"])
+def test_default_read_bank_is_subquadratic(geometry):
+    # Regression: the DEFAULT read (no capture flag) must size the bank to the
+    # admitted count, not seq_len. A previous gate forced n_max == seq_len on
+    # every CUDA step, silently turning the sparse read into an O(T^2) dense
+    # attention -- the context-length blow-up. This is CORE behavior: DABSN is a
+    # general-purpose cell, so the sub-quadratic sizing must hold for every read
+    # geometry, not just the LM's seq geometry.
+    hidden, steps = 8, 24
+    read = DABSNRead(hidden, geometry)
+    with torch.no_grad():
+        read.admit_window.fill_(-6.0)  # genuinely sparse admission
+    read(**_inputs(2, steps, hidden, seed=3))
+    assert read.last_n_max < steps, f"{geometry}: default bank must be sub-quadratic"
+
+    # The explicit capture-safe override is the ONLY thing that widens it to the
+    # static full width (for CUDA-graph capture, where .item() is illegal).
+    read_full = DABSNRead(hidden, geometry)
+    with torch.no_grad():
+        read_full.admit_window.fill_(-6.0)
+    read_full._capture_safe_bank = True
+    read_full(**_inputs(2, steps, hidden, seed=3))
+    assert read_full.last_n_max == steps
+
+
+def test_capture_bank_width_caps_static_width():
+    # When capture forces the static path, an explicit measured cap keeps the
+    # captured read sub-quadratic instead of paying full seq_len width.
+    hidden, steps = 8, 20
+    read = DABSNRead(hidden, "seq")
+    read._capture_safe_bank = True
+    read._capture_bank_width = 6
+    read(**_inputs(2, steps, hidden, seed=1))
+    assert read.last_n_max == 6
+
+    # A cap wider than the sequence is clamped to seq_len (never over-allocate).
+    read._capture_bank_width = 999
+    read(**_inputs(2, steps, hidden, seed=1))
+    assert read.last_n_max == steps

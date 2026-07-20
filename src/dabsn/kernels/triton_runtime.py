@@ -700,6 +700,226 @@ def _fused_num_warps(block: int) -> int:
     return 16
 
 
+# ---------------------------------------------------------------------------
+# batched_fused: single-launch tiled tensor-core forward scan
+# ---------------------------------------------------------------------------
+@triton.jit
+def _dabsn_core_scan_batched_fused_fwd(
+    Wx, Wgx, Ug, A,
+    beta, log_kappa, logit_recover,
+    k_s, k_y, k_b, k_n, k_bias,
+    r_s, r_y, r_b, r_n, r_bias,
+    logit_c_decay, k_c, r_c,
+    initial_b, initial_e, initial_c,
+    final_b, final_e, final_c,
+    U, novelty_o, p_o, ay_o, write_o,
+    e_o, c_o, s_o,
+    y_scratch,
+    logit_alpha, log_lambda, logit_c_suppress,
+    B, T,
+    H: tl.constexpr,
+    BLOCK_B: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    """One program owns a BLOCK_B tile of sequences and loops T on-chip.
+
+    Mirrors ``_dabsn_core_scan_fwd`` exactly, but the per-sequence ``tl.sum``
+    mat-vec becomes a batch ``tl.dot`` GEMM (tensor cores) shared across the
+    tile, and budget/energy/saturation are carried in registers across T -- no
+    Python loop, no per-step HBM state round-trip. It always writes the full
+    tape set the reverse recurrence consumes.
+
+    The ``[Ug;A] @ y`` contraction is evaluated as a loop over ``BLOCK_K``
+    column chunks rather than staging the whole ``[H, H]`` recurrent matrix in
+    shared memory: at H=256 the two full tiles need ~288 KB, past the ~164 KB
+    an SM can give. K-tiling keeps only a ``[BLOCK_B,BLOCK_K] x [BLOCK_K,H]``
+    pair resident per step (tensor cores still used), so the kernel runs at any
+    one-tile width. ``y`` is stashed to a per-row global scratch each step so
+    the column slices a ``tl.dot`` chunk needs are visible across the block,
+    fenced by barriers exactly like ``_dabsn_core_scan_fwd_chunked``.
+    """
+
+    bt = tl.program_id(0)
+    rows = bt * BLOCK_B + tl.arange(0, BLOCK_B)          # [BLOCK_B]
+    row_mask = rows < B
+    h = tl.arange(0, BLOCK_H)                            # [BLOCK_H]
+    hmask = h < H
+    tile_mask = row_mask[:, None] & hmask[None, :]       # [BLOCK_B, BLOCK_H]
+
+    sb = rows[:, None] * H + h[None, :]                  # offset into [B, H]
+    b_state = tl.load(initial_b + sb, mask=tile_mask, other=0.0).to(tl.float32)
+    e_state = tl.load(initial_e + sb, mask=tile_mask, other=1.0).to(tl.float32)
+    c_state = tl.load(initial_c + sb, mask=tile_mask, other=0.0).to(tl.float32)
+
+    gate_alpha = tl.sigmoid(tl.load(logit_alpha).to(tl.float32))
+    lam = tl.log(1.0 + tl.exp(tl.load(log_lambda).to(tl.float32)))
+    c_suppress = tl.sigmoid(tl.load(logit_c_suppress).to(tl.float32))
+
+    beta_v = tl.load(beta + h, mask=hmask, other=0.0).to(tl.float32)[None, :]
+    kappa = tl.log(1.0 + tl.exp(tl.load(log_kappa + h, mask=hmask, other=-80.0).to(tl.float32)))[None, :]
+    recover = tl.sigmoid(tl.load(logit_recover + h, mask=hmask, other=-80.0).to(tl.float32))[None, :]
+    ks = tl.load(k_s + h, mask=hmask, other=0.0).to(tl.float32)[None, :]
+    ky = tl.load(k_y + h, mask=hmask, other=0.0).to(tl.float32)[None, :]
+    kb = tl.load(k_b + h, mask=hmask, other=0.0).to(tl.float32)[None, :]
+    kn = tl.load(k_n + h, mask=hmask, other=0.0).to(tl.float32)[None, :]
+    kbias = tl.load(k_bias + h, mask=hmask, other=0.0).to(tl.float32)[None, :]
+    rs = tl.load(r_s + h, mask=hmask, other=0.0).to(tl.float32)[None, :]
+    ry = tl.load(r_y + h, mask=hmask, other=0.0).to(tl.float32)[None, :]
+    rb = tl.load(r_b + h, mask=hmask, other=0.0).to(tl.float32)[None, :]
+    rn = tl.load(r_n + h, mask=hmask, other=0.0).to(tl.float32)[None, :]
+    rbias = tl.load(r_bias + h, mask=hmask, other=0.0).to(tl.float32)[None, :]
+    c_decay = tl.sigmoid(tl.load(logit_c_decay + h, mask=hmask, other=-80.0).to(tl.float32))[None, :]
+    kc = tl.load(k_c + h, mask=hmask, other=0.0).to(tl.float32)[None, :]
+    rc = tl.load(r_c + h, mask=hmask, other=0.0).to(tl.float32)[None, :]
+
+    for t in range(0, T):
+        base = (rows[:, None] * T + t) * H + h[None, :]
+        wx = tl.load(Wx + base, mask=tile_mask, other=0.0).to(tl.float32)
+        wgx = tl.load(Wgx + base, mask=tile_mask, other=0.0).to(tl.float32)
+
+        y = _tl_tanh(wx + b_state)                             # [BLOCK_B, BLOCK_H] fp32
+
+        # Stash y so a K-chunk tl.dot can read column slices owned block-wide.
+        # Barrier BEFORE the store guards the previous step's chunk reads from
+        # the overwrite; barrier AFTER makes this step's y visible block-wide.
+        tl.debug_barrier()
+        tl.store(y_scratch + sb, y, mask=tile_mask)
+        tl.debug_barrier()
+
+        # (Ug @ y)[b, i] = sum_j y[b, j] * Ug[i, j], tiled over j in BLOCK_K
+        # chunks: ug += tl.dot(y[:, kcol], ugT_k[kcol, i]) with ugT_k[j,i]=Ug[i,j].
+        ug = tl.zeros((BLOCK_B, BLOCK_H), tl.float32)
+        ay = tl.zeros((BLOCK_B, BLOCK_H), tl.float32)
+        for k0 in range(0, H, BLOCK_K):
+            kcol = k0 + tl.arange(0, BLOCK_K)
+            kmask = kcol < H
+            y_k = tl.load(
+                y_scratch + rows[:, None] * H + kcol[None, :],
+                mask=row_mask[:, None] & kmask[None, :],
+                other=0.0,
+            )                                                  # [BLOCK_B, BLOCK_K] fp32
+            mat_off = h[None, :] * H + kcol[:, None]           # [BLOCK_K, BLOCK_H]
+            mat_mask = kmask[:, None] & hmask[None, :]
+            ugT_k = tl.load(Ug + mat_off, mask=mat_mask, other=0.0)
+            aT_k = tl.load(A + mat_off, mask=mat_mask, other=0.0)
+            y_k_c = y_k.to(ugT_k.dtype)
+            ug += tl.dot(y_k_c, ugT_k, out_dtype=tl.float32)   # [BLOCK_B, BLOCK_H]
+            ay += tl.dot(y_k_c, aT_k, out_dtype=tl.float32)
+
+        s = tl.minimum(1.0, tl.maximum(0.0, (wgx + ug) / 6.0 + 0.5))
+        novelty = _tl_tanh(_tl_abs(ay - b_state))
+        stress = novelty * (1.0 - e_state)
+        c_state = c_decay * c_state + (1.0 - c_decay) * stress
+        novelty_eff = novelty * (1.0 - c_suppress * c_state)
+
+        tanh_b = _tl_tanh(b_state)
+        k_signal = ks * s + ky * y + kb * tanh_b + kn * novelty_eff + kbias + kc * c_state
+        r_signal = rs * s + ry * y + rb * tanh_b + rn * novelty_eff + rbias + rc * c_state
+        k_t = kappa * tl.exp(0.5 * _tl_tanh(k_signal))
+        r_t = tl.minimum(1.0, tl.maximum(0.0, recover * tl.exp(0.5 * _tl_tanh(r_signal))))
+        p = s * e_state
+        new_b = (1.0 - gate_alpha) * b_state + beta_v + lam * (p * ay)
+        new_e = tl.minimum(1.0, tl.maximum(0.0, e_state + r_t * (1.0 - e_state) - k_t * p))
+
+        u_base = (rows[:, None] * T + t) * (2 * H) + h[None, :]
+        tl.store(U + u_base, y, mask=tile_mask)
+        tl.store(U + u_base + H, new_b, mask=tile_mask)
+        tl.store(novelty_o + base, novelty, mask=tile_mask)
+        tl.store(p_o + base, p, mask=tile_mask)
+        tl.store(ay_o + base, ay, mask=tile_mask)
+        tl.store(write_o + base, p * ay, mask=tile_mask)
+        tl.store(e_o + base, e_state, mask=tile_mask)
+        tl.store(c_o + base, c_state, mask=tile_mask)
+        tl.store(s_o + base, s, mask=tile_mask)
+
+        b_state = new_b
+        e_state = new_e
+
+    tl.store(final_b + sb, b_state, mask=tile_mask)
+    tl.store(final_e + sb, e_state, mask=tile_mask)
+    tl.store(final_c + sb, c_state, mask=tile_mask)
+
+
+def _fused_batch_tile(batch: int) -> int:
+    # tl.dot needs the M (batch) tile >= 16; pick the smallest power-of-two tile
+    # >= 16 that covers small batches without excess masked rows.
+    if batch <= 16:
+        return 16
+    if batch <= 32:
+        return 32
+    return 64
+
+
+def dabsn_core_scan_batched_fused_forward(
+    Wx, Wgx, Ug, A,
+    beta, log_kappa, logit_recover,
+    k_s, k_y, k_b, k_n, k_bias,
+    r_s, r_y, r_b, r_n, r_bias,
+    logit_c_decay, k_c, r_c,
+    logit_alpha, log_lambda, logit_c_suppress,
+    initial_b, initial_e, initial_c,
+) -> Tuple[Tensor, ...]:
+    """Launch the fused forward scan; return tapes in ``(U, novelty, p, ay,
+    write, e_tape, c_tape, s_tape, final_b, final_e, final_c)`` order, cast to
+    ``Wx.dtype`` -- byte-for-byte the layout ``_batched_forward_tapes`` returns.
+    """
+
+    _check_supported_dtype(Wx.dtype, "Wx")
+    B, T, H = Wx.shape
+    block_h = max(16, _block_h(H))
+    if block_h > _ONE_TILE_MAX:
+        # The K-tiled matmul removed the [H,H] shared-memory ceiling, but a
+        # single-launch scan still carries the full [BLOCK_B, BLOCK_H] state
+        # tiles in registers across all T. Past one tile that no longer fits, so
+        # wide models use the per-step GEMM backend (which has no such bound).
+        raise ValueError(
+            f"fused core forward supports one-tile widths (H<= {_ONE_TILE_MAX}); "
+            f"got H={H}. Use DABSN_CORE_BACKEND=batched for larger widths."
+        )
+    block_b = _fused_batch_tile(B)
+    block_k = _block_k(H)
+    dev = Wx.device
+    f32 = torch.float32
+    U = torch.empty((B, T, 2 * H), device=dev, dtype=f32)
+    novelty = torch.empty((B, T, H), device=dev, dtype=f32)
+    p = torch.empty((B, T, H), device=dev, dtype=f32)
+    ay = torch.empty((B, T, H), device=dev, dtype=f32)
+    write = torch.empty((B, T, H), device=dev, dtype=f32)
+    e_tape = torch.empty((B, T, H), device=dev, dtype=f32)
+    c_tape = torch.empty((B, T, H), device=dev, dtype=f32)
+    s_tape = torch.empty((B, T, H), device=dev, dtype=f32)
+    final_b = torch.empty((B, H), device=dev, dtype=f32)
+    final_e = torch.empty((B, H), device=dev, dtype=f32)
+    final_c = torch.empty((B, H), device=dev, dtype=f32)
+    y_scratch = torch.empty((B, H), device=dev, dtype=f32)
+
+    ug_c = Ug.to(Wx.dtype).contiguous()
+    a_c = A.to(Wx.dtype).contiguous()
+    grid = (triton.cdiv(B, block_b),)
+    _dabsn_core_scan_batched_fused_fwd[grid](
+        Wx.contiguous(), Wgx.contiguous(), ug_c, a_c,
+        beta.contiguous(), log_kappa.contiguous(), logit_recover.contiguous(),
+        k_s.contiguous(), k_y.contiguous(), k_b.contiguous(), k_n.contiguous(), k_bias.contiguous(),
+        r_s.contiguous(), r_y.contiguous(), r_b.contiguous(), r_n.contiguous(), r_bias.contiguous(),
+        logit_c_decay.contiguous(), k_c.contiguous(), r_c.contiguous(),
+        initial_b.float().contiguous(), initial_e.float().contiguous(), initial_c.float().contiguous(),
+        final_b, final_e, final_c,
+        U, novelty, p, ay, write, e_tape, c_tape, s_tape,
+        y_scratch,
+        logit_alpha.reshape(()), log_lambda.reshape(()), logit_c_suppress.reshape(()),
+        B, T,
+        H=H, BLOCK_B=block_b, BLOCK_H=block_h, BLOCK_K=block_k,
+        num_warps=_fused_num_warps(block_h),
+    )
+    cast = Wx.dtype
+    return (
+        U.to(cast), novelty.to(cast), p.to(cast), ay.to(cast), write.to(cast),
+        e_tape.to(cast), c_tape.to(cast), s_tape.to(cast),
+        final_b.to(cast), final_e.to(cast), final_c.to(cast),
+    )
+
+
 @triton.jit
 def _dabsn_core_scan_bwd(
     U, Novelty, P, Ay, Etape, Ctape, Stape,
@@ -2826,15 +3046,25 @@ def dense_bmm_three_way_read(
     pad_gain: Tensor,
     induct_gain: Tensor,
     cocktail_gain: Tensor,
+    query_offset: int = 0,
+    total_T: int | None = None,
 ) -> Tensor:
     """Dense tensor-core implementation of the three-way admitted read.
 
     It uses the same equations as the compact flash kernel for sequence and field
     geometry. Near-full banks route here because native ``torch.bmm`` is more
     efficient than a count-bounded member loop at high density.
+
+    ``query_offset`` / ``total_T`` make the read tileable along the query-time
+    axis: a tile that holds global query positions ``[query_offset, query_offset
+    + T)`` builds the identical causal mask it would inside the full-length call,
+    so long-context reads can be chunked to stay on tensor cores at any T without
+    changing the math. ``total_T`` is the full sequence length (defaults to this
+    tile's ``T``) and only matters for the field-geometry induction horizon.
     """
     B, T, H = read_state.shape
     N = memory_key.shape[1]
+    full_T = int(total_T) if total_T is not None else T
     scale_f = scale.to(torch.float32)
     # Keep contractions in the caller's compute dtype so BF16/FP16 tensor
     # cores are actually used. Scores/nonlinearities and recurrent state still
@@ -2852,12 +3082,12 @@ def dense_bmm_three_way_read(
     valid = bank_valid.unsqueeze(1)                                           # [B,1,N]
     bank_pos = bank_idx.unsqueeze(1)                                          # [B,1,N]
     if mode == "seq":
-        qpos = torch.arange(T, device=read_state.device).view(1, T, 1)
+        qpos = (torch.arange(T, device=read_state.device) + query_offset).view(1, T, 1)
         allow = valid & (bank_pos <= qpos)
         induct_allow = valid & (bank_pos < qpos)
     else:
         allow = valid.expand(B, T, N)
-        induct_allow = valid & (bank_pos < (T - 1))
+        induct_allow = valid & (bank_pos < (full_T - 1))
 
     def rd(scores: Tensor, values: Tensor, mask: Tensor) -> Tensor:
         elig = mask.any(dim=-1, keepdim=True)                                # [B,T,1]

@@ -215,7 +215,11 @@ def wrap_distributed(
             device_ids=device_ids,
             find_unused_parameters=True,
         )
-    from torch.distributed.fsdp import FullyShardedDataParallel, ShardingStrategy
+    from torch.distributed.fsdp import (
+        BackwardPrefetch,
+        FullyShardedDataParallel,
+        ShardingStrategy,
+    )
     from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 
     return FullyShardedDataParallel(
@@ -229,6 +233,12 @@ def wrap_distributed(
         ),
         limit_all_gathers=True,
         forward_prefetch=True,
+        # Prefetch the next block's all-gather while the current block's
+        # gradients reduce, so at seq 2048 the recurrent backward overlaps
+        # communication instead of stalling on it. BACKWARD_PRE issues the
+        # gather earliest (more overlap, slightly higher peak memory) which is
+        # the right trade with FULL_SHARD + block-level grad checkpointing.
+        backward_prefetch=BackwardPrefetch.BACKWARD_PRE,
         use_orig_params=True,
         sync_module_states=True,
     )

@@ -252,7 +252,7 @@ older serial-query backward. The controls are explicit when a benchmark needs
 to pin them:
 
 ```bash
-export DABSN_CORE_BACKEND=batched       # auto | batched | persistent
+export DABSN_CORE_BACKEND=batched       # auto | batched | persistent | batched_fused
 export DABSN_BATCHED_STEP_COMPILE=1     # compile only the pure pointwise step
 export DABSN_TRAIN_DENSE_MAX_SCORES=8388608
 ```
@@ -273,6 +273,59 @@ The release gates cover:
 The repository does not claim that its fused kernels outperform every existing
 sequence runtime. Their contract is native DABSN execution with explicit
 forward/backward parity and no hidden backend switch.
+
+## Performance and scaling
+
+Most of the throughput-relevant behavior is automatic once a native runtime is
+enabled; nothing below changes the DABSN equations. All of it is geometry
+agnostic (`seq`, `field`, `hybrid`) because it lives at the core-scan and
+admitted-read level, not in any task head.
+
+**Automatic (no configuration):**
+
+- **Sub-quadratic admitted read.** The read scores each query position against
+  the *admitted* bank, whose width is the data-dependent admitted count, so the
+  cost is `O(T * admitted)` — not `O(T^2)`. The width is sized dynamically from
+  the learned admission; it only approaches `seq_len` (quadratic) if the model
+  genuinely learns to admit almost every position, which is the correct cost for
+  a task that needs it. Inference and ordinary GPU training both use this
+  dynamic width. A static width is used only while a CUDA graph is actively being
+  captured (where a host sync is illegal), and even then the capture path pins a
+  measured, padded, still-sub-quadratic cap.
+- **Work-aware core dispatch.** `select_core_backend` picks the persistent Triton
+  scan for small work and the batched tensor-core GEMM scan once the batch is
+  large enough to fill the device (`B >= 64` or `B*H >=
+  DABSN_BATCHED_CORE_MIN_WORK`, default 4096), so wide/large-batch training uses
+  tensor cores automatically.
+- **Tensor-core compute dtype.** With a BF16/FP16 model the recurrent GEMMs run
+  on tensor cores; pointwise state stays FP32.
+
+**Opt-in:**
+
+- **Fused single-launch core scan** (`DABSN_CORE_BACKEND=batched_fused`, hidden
+  width `<= 256`). Runs the whole `T`-step scan in one Triton launch with state
+  carried in registers, removing the per-step launch overhead. Wider cores use
+  the batched per-step GEMM, which has no such width bound. `auto` never selects
+  the fused backend on its own — request it explicitly.
+- **CUDA-graph training** (`make_graphed_train_callable`, or `cuda_graph=True` in
+  `DABSNPretrainConfig`). Captures the forward+backward once and replays it,
+  removing kernel-launch overhead — the dominant cost of the sequential scan at
+  small microbatches. Single-process CUDA only; pair each replay with
+  `ManualGradientAccumulator` for exact microbatch accumulation. Capture failure
+  raises rather than silently degrading.
+
+```python
+from dabsn.runtime import make_graphed_train_callable, ManualGradientAccumulator
+```
+
+**Batch vs. context.** The core is a *sequential* recurrence: it advances one
+position at a time and cannot parallelize across context the way attention does.
+Its device parallelism therefore comes from the **batch**, not the sequence
+length — a tiny microbatch leaves the GPU idle on every step regardless of
+context. Raise the microbatch as high as memory allows and use gradient
+accumulation for the effective batch. Because the read is sub-quadratic in `T`,
+context length scales close to linearly, so long-context training is bounded by
+the (linear) number of scan steps rather than a quadratic read.
 
 ## Gradient preflight
 

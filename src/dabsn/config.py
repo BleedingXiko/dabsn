@@ -233,6 +233,7 @@ class DABSNPretrainConfig:
     distributed: str = "fsdp"
     grad_checkpoint: bool = True
     grad_accum_steps: int = 4
+    cuda_graph: bool = False
     checkpoint_every: int = 1000
     log_every: int = 50
     val_every: int = 0

@@ -33,6 +33,8 @@ from .distributed import (
 from .kernels import enable as enable_kernels
 from .model import DABSNSequenceLM
 from .runtime.api import verify_gradients
+from .runtime.grad_accum import ManualGradientAccumulator
+from .runtime.graph import make_graphed_train_callable
 
 
 def _load_corpus(config: DABSNPretrainConfig) -> np.ndarray:
@@ -341,6 +343,50 @@ def pretrain_next_token(
                 )
             _restore_rng_state(rng, resume_extra.get("corpus_rng_states"), state)
 
+        # Optional CUDA-graph capture of the fwd+bwd. Graphs remove the tens of
+        # thousands of eager kernel launches the recurrent T-loop issues per
+        # microbatch, but capture is a single-process CUDA optimization: sharded
+        # collectives cannot be recorded here, so distributed runs stay eager and
+        # rely on comm-overlap instead. Each replay is an independent single
+        # backward accumulated by ManualGradientAccumulator, so correctness never
+        # depends on autograd summing across graph replays.
+        graph_call = train_model
+        accumulator: ManualGradientAccumulator | None = None
+        graph_note = None
+        if config.cuda_graph:
+            if state.device.type != "cuda":
+                graph_note = "skipped: cuda_graph requires a CUDA device"
+            elif state.enabled:
+                graph_note = (
+                    "skipped: cuda_graph capture is single-process only; "
+                    f"distributed={state.kind} runs eager with comm-overlap"
+                )
+            else:
+                sample_inputs, _ = _next_token_batch(
+                    training,
+                    batch_size=config.batch_size,
+                    context=config.train_context,
+                    device=state.device,
+                    rng=np.random.default_rng(config.seed + 777),
+                )
+                # On CUDA a capture failure is a real defect, not a reason to
+                # silently fall back to the eager Python T-loop (which is the slow
+                # path this whole feature exists to remove). Let it raise.
+                graph_call = make_graphed_train_callable(
+                    train_model, (sample_inputs,), verify=True
+                )
+                if graph_call is train_model:
+                    raise RuntimeError(
+                        "cuda_graph was requested but make_graphed_train_callable "
+                        "returned the module uncaptured; refusing to run the eager "
+                        "fallback. Investigate capture support on this device."
+                    )
+                accumulator = ManualGradientAccumulator(train_model)
+                graph_note = "captured"
+                model.zero_grad(set_to_none=True)
+            if state.is_main and graph_note:
+                print(f"[pretrain] cuda_graph {graph_note}", flush=True)
+
         last_loss = math.nan
         last_validation: dict[int, float] = {}
         interval_started = time.perf_counter()
@@ -366,10 +412,12 @@ def pretrain_next_token(
                 rng=rng,
             )
             update_boundary = step % config.grad_accum_steps == 0 or step == total_steps
+            if accumulator is not None:
+                accumulator.begin_microbatch()
             with no_sync_context(train_model, synchronize=update_boundary):
                 with autocast_context(state.device, precision):
                     loss = F.cross_entropy(
-                        train_model(inputs).reshape(-1, config.vocab),
+                        graph_call(inputs).reshape(-1, config.vocab),
                         targets.reshape(-1),
                     )
                 local_loss = loss.detach()
@@ -378,7 +426,14 @@ def pretrain_next_token(
                     scaled.backward()
                 else:
                     scaler.scale(scaled).backward()
+            if accumulator is not None:
+                # Each graph replay is an independent single backward; move its
+                # gradients into persistent buffers before the next replay clears
+                # them. The /grad_accum_steps scale already lives in the loss.
+                accumulator.add_microbatch(scale=1.0)
             if update_boundary:
+                if accumulator is not None:
+                    accumulator.install()
                 if scaler is not None:
                     scaler.unscale_(optimizer)
                 if config.clip_grad_norm > 0:
@@ -389,6 +444,8 @@ def pretrain_next_token(
                     scaler.step(optimizer)
                     scaler.update()
                 optimizer.zero_grad(set_to_none=True)
+                if accumulator is not None:
+                    accumulator.reset()
 
             interval_tokens += global_tokens_per_step
             should_log = bool(
@@ -520,6 +577,7 @@ def pretrain_next_token(
             "step": final_step,
             "tokens_seen": final_step * global_tokens_per_step,
             "final_export": None if final_export is None else str(final_export),
+            "cuda_graph": graph_note if config.cuda_graph else None,
         }
     finally:
         cleanup_distributed(state)
