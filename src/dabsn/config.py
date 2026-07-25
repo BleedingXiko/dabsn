@@ -238,6 +238,14 @@ class DABSNPretrainConfig:
     log_every: int = 50
     val_every: int = 0
     long_scan_chunk: int = 8192
+    # Element budget (rows*V) for one logit chunk in the fused linear+CE loss.
+    # 0 keeps the default (2**24); the loss auto-engages chunking only above it,
+    # so small models keep the exact single-shot path. Mirrors env
+    # DABSN_LOSS_CHUNK_SCORES; block-time chunking (Phase 6) uses block_chunk_t.
+    loss_chunk_scores: int = 0
+    # Block-time activation chunking: 0 = auto (engage under memory pressure),
+    # -1 = force off, >0 = explicit chunk width. Mirrors env DABSN_BLOCK_CHUNK_T.
+    block_chunk_t: int = 0
 
     def __post_init__(self) -> None:
         if bool(self.corpus_bin) == bool(self.corpus_text):

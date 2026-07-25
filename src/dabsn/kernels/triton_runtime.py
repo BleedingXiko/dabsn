@@ -14,11 +14,32 @@ import triton
 import triton.language as tl
 
 
+def _device_default_chunk_config() -> dict:
+    """Per-architecture pinned defaults for the chunked K-tiled kernels.
+
+    These are deterministic per device (no per-shape recompile) and are refined
+    by ``DABSN_AUTOTUNE_FULL=1`` sweeps on the target GPU (Phase 7/8), whose
+    winners get baked here. Turing (T4, sm75) has a smaller register file and no
+    bf16 tensor cores, so it prefers fewer warps and a shallow pipeline; Ampere+
+    (A100 sm80, Hopper) affords more warps and a deeper pipeline. Every value is
+    still overridable via the DABSN_AUTOTUNE_* env vars.
+    """
+    block_k, num_warps, num_stages = 64, 8, 2
+    try:
+        major, _minor = torch.cuda.get_device_capability()
+    except Exception:
+        major = None
+    if major == 7:            # Turing / Volta (T4, V100)
+        block_k, num_warps, num_stages = 64, 4, 2
+    elif major is not None and major >= 8:  # Ampere+ (A100, L4, Hopper)
+        block_k, num_warps, num_stages = 64, 8, 3
+    return {"BLOCK_K": block_k, "num_warps": num_warps, "num_stages": num_stages}
+
+
 def _chunk_autotune_configs():
     # Full tuning compiles and benchmarks 18 configurations for each live shape.
-    # The default keeps first-call compilation bounded with one balanced config.
-    # Set DABSN_AUTOTUNE_FULL=1 for exhaustive tuning on a target GPU, or override
-    # the default block, warp, and stage values through the environment.
+    # The default is one balanced config pinned per device capability, refined by
+    # DABSN_AUTOTUNE_FULL sweeps on the target GPU. All values env-overridable.
     if _os.environ.get("DABSN_AUTOTUNE_FULL", "0") == "1":
         cfgs = []
         for block_k in (32, 64, 128):
@@ -27,10 +48,11 @@ def _chunk_autotune_configs():
                     cfgs.append(triton.Config({"BLOCK_K": block_k},
                                               num_warps=num_warps, num_stages=num_stages))
         return cfgs
+    default = _device_default_chunk_config()
     return [triton.Config(
-        {"BLOCK_K": int(_os.environ.get("DABSN_AUTOTUNE_BLOCK_K", 64))},
-        num_warps=int(_os.environ.get("DABSN_AUTOTUNE_WARPS", 8)),
-        num_stages=int(_os.environ.get("DABSN_AUTOTUNE_STAGES", 2)))]
+        {"BLOCK_K": int(_os.environ.get("DABSN_AUTOTUNE_BLOCK_K", default["BLOCK_K"]))},
+        num_warps=int(_os.environ.get("DABSN_AUTOTUNE_WARPS", default["num_warps"])),
+        num_stages=int(_os.environ.get("DABSN_AUTOTUNE_STAGES", default["num_stages"])))]
 
 
 _FWD_CHUNK_AUTOTUNE = _chunk_autotune_configs()
@@ -682,22 +704,52 @@ def dabsn_core_scan_triton_tape(
 _FUSED_NUM_PARAM_VECS = 16  # beta, log_kappa, logit_recover, k_*, r_*, logit_c_decay, k_c, r_c
 
 
-def _fused_block_h(hidden_dim: int) -> int:
-    """Tile width for the fused reverse-scan backward (split-H ceiling 1024)."""
-    if hidden_dim <= 0:
-        raise ValueError("hidden_dim must be positive")
-    block = 1 << (hidden_dim - 1).bit_length()
-    if block > 1024:
-        raise ValueError("fused backward supports hidden_dim <= 1024")
-    return block
-
-
 def _fused_num_warps(block: int) -> int:
     if block <= 64:
         return 4
     if block <= 256:
         return 8
     return 16
+
+
+# Registers per thread we allow the carried state to occupy. The fused scan holds
+# [BLOCK_B, H] budget/energy/saturation tiles live for the WHOLE T loop, so this
+# budget is what actually bounds the width -- the rest of the register file has
+# to serve the per-step matmul accumulators and pointwise temporaries.
+_STATE_REG_BUDGET = 64
+
+
+def _fused_max_hidden(device=None, batch_tile: int = 16) -> int:
+    """Largest H the single-launch fused scan can carry -- derived, not declared.
+
+    Three fp32 state tiles of ``[batch_tile, H]`` stay live across all T, spread
+    over ``num_warps * 32`` threads. So the ceiling is a register-file question:
+    solve ``3 * batch_tile * H / threads <= _STATE_REG_BUDGET`` for H and round
+    down to a power of two. A device with a bigger register file per thread gets
+    a wider fused path automatically; nothing here assumes a model size.
+
+    ``DABSN_FUSED_CORE_MAX_H`` still overrides for experiments.
+    """
+    env = _os.environ.get("DABSN_FUSED_CORE_MAX_H")
+    if env not in (None, ""):
+        return int(env)
+    threads = _fused_num_warps(1 << 30) * 32  # widest tiling => most threads
+    max_regs = 255
+    try:
+        if device is not None and torch.cuda.is_available():
+            props = torch.cuda.get_device_properties(device)
+            # regs_per_multiprocessor / (threads per CTA) bounds per-thread regs
+            # more tightly than the 255 architectural cap on small SMs.
+            per_sm = getattr(props, "regs_per_multiprocessor", 0)
+            if per_sm:
+                max_regs = min(max_regs, per_sm // threads)
+    except Exception:  # pragma: no cover - exotic builds
+        pass
+    budget = min(_STATE_REG_BUDGET, max_regs)
+    raw = budget * threads // (3 * max(1, batch_tile))
+    if raw < 16:
+        return 16
+    return 1 << (raw.bit_length() - 1)  # round DOWN to a power of two
 
 
 # ---------------------------------------------------------------------------
@@ -881,14 +933,24 @@ def dabsn_core_scan_batched_fused_forward(
     block_k = _block_k(H)
     dev = Wx.device
     f32 = torch.float32
-    U = torch.empty((B, T, 2 * H), device=dev, dtype=f32)
-    novelty = torch.empty((B, T, H), device=dev, dtype=f32)
-    p = torch.empty((B, T, H), device=dev, dtype=f32)
-    ay = torch.empty((B, T, H), device=dev, dtype=f32)
-    write = torch.empty((B, T, H), device=dev, dtype=f32)
-    e_tape = torch.empty((B, T, H), device=dev, dtype=f32)
-    c_tape = torch.empty((B, T, H), device=dev, dtype=f32)
-    s_tape = torch.empty((B, T, H), device=dev, dtype=f32)
+    # Store the activation tapes directly in the activation dtype. The kernel's
+    # tl.store casts each fp32 step result to the tape dtype (RTNE) -- exactly
+    # what a post-launch `.to()` would do, element for element -- so this is
+    # bit-identical to fp32 staging while halving tape HBM store traffic and
+    # removing eight full-tape cast copies per forward. There is no staging
+    # fallback: the two are the same numbers, so a switch could only select
+    # between "correct" and "correct but slower".
+    tape_dtype = Wx.dtype
+    U = torch.empty((B, T, 2 * H), device=dev, dtype=tape_dtype)
+    novelty = torch.empty((B, T, H), device=dev, dtype=tape_dtype)
+    p = torch.empty((B, T, H), device=dev, dtype=tape_dtype)
+    ay = torch.empty((B, T, H), device=dev, dtype=tape_dtype)
+    write = torch.empty((B, T, H), device=dev, dtype=tape_dtype)
+    e_tape = torch.empty((B, T, H), device=dev, dtype=tape_dtype)
+    c_tape = torch.empty((B, T, H), device=dev, dtype=tape_dtype)
+    s_tape = torch.empty((B, T, H), device=dev, dtype=tape_dtype)
+    # Carried state stays fp32 for the kernel; the return casts it to Wx.dtype
+    # (below) to keep byte-for-byte parity with _batched_forward_tapes.
     final_b = torch.empty((B, H), device=dev, dtype=f32)
     final_e = torch.empty((B, H), device=dev, dtype=f32)
     final_c = torch.empty((B, H), device=dev, dtype=f32)
@@ -912,10 +974,12 @@ def dabsn_core_scan_batched_fused_forward(
         H=H, BLOCK_B=block_b, BLOCK_H=block_h, BLOCK_K=block_k,
         num_warps=_fused_num_warps(block_h),
     )
+    # Tapes are already in Wx.dtype (written by the kernel); only the fp32
+    # carried state is cast, to keep byte-for-byte parity with
+    # `_batched_forward_tapes`.
     cast = Wx.dtype
     return (
-        U.to(cast), novelty.to(cast), p.to(cast), ay.to(cast), write.to(cast),
-        e_tape.to(cast), c_tape.to(cast), s_tape.to(cast),
+        U, novelty, p, ay, write, e_tape, c_tape, s_tape,
         final_b.to(cast), final_e.to(cast), final_c.to(cast),
     )
 
@@ -1035,9 +1099,12 @@ def _dabsn_core_scan_bwd(
         )
 
         s = tl.load(Stape + base + h, mask=mask, other=0.0).to(tl.float32)
-        nov = tl.load(Novelty + base + h, mask=mask, other=0.0).to(tl.float32)
         p = tl.load(P + base + h, mask=mask, other=0.0).to(tl.float32)
         ay = tl.load(Ay + base + h, mask=mask, other=0.0).to(tl.float32)
+        # Recompute novelty (Phase 5) from the saved expression and previous
+        # budget rather than loading a Novelty tape: tanh(|expression - budget|),
+        # bit-identical in FP32. The Novelty pointer arg is now unused.
+        nov = _tl_tanh(_tl_abs(ay - b_prev))
         c_t = tl.load(Ctape + base + h, mask=mask, other=0.0).to(tl.float32)
 
         gy0 = tl.load(gU + ubase + h, mask=mask, other=0.0).to(tl.float32)
@@ -1292,9 +1359,12 @@ def _dabsn_core_scan_bwd_chunked(
         )
 
         s = tl.load(Stape + base + h, mask=mask, other=0.0).to(tl.float32)
-        nov = tl.load(Novelty + base + h, mask=mask, other=0.0).to(tl.float32)
         p = tl.load(P + base + h, mask=mask, other=0.0).to(tl.float32)
         ay = tl.load(Ay + base + h, mask=mask, other=0.0).to(tl.float32)
+        # Recompute novelty (Phase 5) from the saved expression and previous
+        # budget rather than loading a Novelty tape: tanh(|expression - budget|),
+        # bit-identical in FP32. The Novelty pointer arg is now unused.
+        nov = _tl_tanh(_tl_abs(ay - b_prev))
         c_t = tl.load(Ctape + base + h, mask=mask, other=0.0).to(tl.float32)
 
         gy0 = tl.load(gU + ubase + h, mask=mask, other=0.0).to(tl.float32)
@@ -1458,7 +1528,7 @@ def _dabsn_core_scan_bwd_chunked(
 
 
 def _dabsn_core_fused_backward(
-    U, novelty, p, ay, e_tape, c_tape, s_tape,
+    U, p, ay, e_tape, c_tape, s_tape,
     initial_b, initial_c,
     A, Ug,
     beta, log_kappa, logit_recover,
@@ -1468,10 +1538,15 @@ def _dabsn_core_fused_backward(
     logit_alpha, log_lambda, logit_c_suppress,
     gU, gnov, gp, gay, gwrite, ge_out, gc_out, gfinal_b, gfinal_e, gfinal_c,
 ):
-    """Launch the fused reverse-scan kernel and finish grad_A / grad_Ug via GEMM."""
-    B, T, _ = novelty.shape
-    H = int(novelty.shape[2])
-    device = novelty.device
+    """Launch the fused reverse-scan kernel and finish grad_A / grad_Ug via GEMM.
+
+    Novelty is recomputed inside the kernel (Phase 5), so no novelty tape is
+    passed; the kernel's (now unused) Novelty pointer slot is fed the expression
+    tape ``ay`` as a harmless valid pointer.
+    """
+    B, T, _ = p.shape
+    H = int(p.shape[2])
+    device = p.device
     block = _block_h(H)  # uncapped; one-tile <= 256, chunked above
     NP = _FUSED_NUM_PARAM_VECS
 
@@ -1486,7 +1561,9 @@ def _dabsn_core_fused_backward(
     ginitial_c = torch.empty_like(ginitial_b)
 
     common_args = (
-        U.contiguous(), novelty.contiguous(), p.contiguous(), ay.contiguous(),
+        # 2nd slot is the kernel's (unused) Novelty pointer -- feed ay as a
+        # valid dummy; novelty is recomputed inside the kernel.
+        U.contiguous(), ay.contiguous(), p.contiguous(), ay.contiguous(),
         e_tape.contiguous(), c_tape.contiguous(), s_tape.contiguous(),
         initial_b.contiguous(), initial_c.contiguous(),
         A.contiguous(), Ug.contiguous(),
@@ -1646,7 +1723,7 @@ class DABSNCoreScanTritonFusedBackward(torch.autograd.Function):
             gfinal_c = torch.zeros_like(final_c)
 
         gWx, gWgx, grad_A, grad_Ug, gparam, gscal, ginitial_b, ginitial_e, ginitial_c = _dabsn_core_fused_backward(
-            U, novelty, p, ay, e_tape, c_tape, s_tape,
+            U, p, ay, e_tape, c_tape, s_tape,
             initial_b, initial_c,
             A, Ug,
             beta, log_kappa, logit_recover,
@@ -2490,11 +2567,14 @@ def _admitted_three_way_eager(
     perm_scores = content + cocktail_compat + admission_gate.unsqueeze(1)
 
     def read(scores: Tensor, values: Tensor, mask: Tensor, elig: Tensor) -> Tensor:
-        scores = scores.masked_fill(~mask, float("-inf"))
-        scores = scores.masked_fill(~elig.unsqueeze(-1), 0.0)
+        # Same [B,T,N] economy as dense_bmm_three_way_read, and the same rule:
+        # never write the softmax output in place (SoftmaxBackward0 saves it).
+        # Masking with the dtype's finite minimum keeps ineligible rows finite
+        # without a second pass, and the eligibility zeroing lands on the
+        # [B,T,H] read vector, which bmm does not save.
+        scores = scores.masked_fill(~mask, torch.finfo(scores.dtype).min)
         weights = F.softmax(scores, dim=-1)
-        weights = torch.where(elig.unsqueeze(-1), weights, torch.zeros_like(weights))
-        return torch.bmm(weights, values)
+        return torch.bmm(weights, values).mul_(elig.unsqueeze(-1))
 
     out = (
         short_gain * read(short_scores, write_memory, allow, has_elig)
@@ -3090,10 +3170,29 @@ def dense_bmm_three_way_read(
         induct_allow = valid & (bank_pos < (full_T - 1))
 
     def rd(scores: Tensor, values: Tensor, mask: Tensor) -> Tensor:
+        # The weight tensor is [B,T,N] -- the largest thing in the read. Building
+        # it as `where(elig, nan_to_num(w), zeros_like(w))` allocated three more
+        # of them on top of the masked-fill copy and the softmax output: five
+        # live [B,T,N] buffers for one read, three reads per call.
+        #
+        # The economy is kept without touching the softmax output, which must
+        # never be written in place: SoftmaxBackward0 saves it, so mutating it
+        # bumps its version counter and backward dies with "a variable needed
+        # for gradient computation has been modified by an inplace operation".
+        # Two changes buy the same buffer count and stay differentiable:
+        #
+        #   * mask with the dtype's finite minimum instead of -inf, so a row
+        #     with no eligible key softmaxes to a harmless uniform rather than
+        #     NaN. exp(finfo.min - row_max) underflows to exactly zero, so every
+        #     eligible row is bit-identical to the -inf form and no repair pass
+        #     is needed at all.
+        #   * zero the ineligible rows on the read vector ([B,T,H]) instead of
+        #     the weights ([B,T,N]). It is the smaller tensor, and bmm saves its
+        #     inputs rather than its output, so this multiply is legal in place.
         elig = mask.any(dim=-1, keepdim=True)                                # [B,T,1]
-        w = torch.softmax(scores.masked_fill(~mask, float("-inf")), dim=-1)
-        w = torch.where(elig, torch.nan_to_num(w), torch.zeros_like(w))
-        return torch.bmm(w.to(values.dtype), values).float()
+        neg = torch.finfo(scores.dtype).min
+        w = torch.softmax(scores.masked_fill(~mask, neg), dim=-1)
+        return torch.bmm(w.to(values.dtype), values).float().mul_(elig)
 
     short = rd(short_scores, write_memory, allow)
     perm = rd(perm_scores, write_memory, allow)

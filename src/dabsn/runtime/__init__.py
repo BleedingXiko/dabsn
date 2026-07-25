@@ -31,12 +31,24 @@ from .api import (
 )
 from .graph import make_graphed_train_callable
 from .grad_accum import ManualGradientAccumulator
+from .dispatch import log_routing_once, reset_routing_log, warn_routing_once
+from .loss import (
+    ChunkedLinearCrossEntropy,
+    chunked_cross_entropy_from_logits,
+    chunked_linear_cross_entropy,
+)
 
 __all__ = [
     "DABSNSequenceModule",
     "DistributedState",
     "autocast_context",
     "cleanup_distributed",
+    "ChunkedLinearCrossEntropy",
+    "chunked_cross_entropy_from_logits",
+    "chunked_linear_cross_entropy",
+    "log_routing_once",
+    "reset_routing_log",
+    "warn_routing_once",
     "clip_grad_norm",
     "evaluate",
     "export_dabsn",

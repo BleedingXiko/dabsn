@@ -661,3 +661,197 @@ def barrier(state: DistributedState) -> None:
 def cleanup_distributed(state: DistributedState) -> None:
     if state.enabled and torch_dist.is_initialized():
         torch_dist.destroy_process_group()
+
+
+# ---------------------------------------------------------------------------
+# Tensor parallelism over the hidden dimension
+#
+# Data parallelism replicates the model on every rank, so the largest model that
+# can be trained is the largest that fits on ONE device. Above roughly 10B
+# parameters no device holds a replica and the model itself has to be split.
+#
+# For this recurrence the natural axis is the hidden dimension. Every per-unit
+# parameter (beta, k_*, r_*, log_kappa, ...) is [H] and shards cleanly; the input
+# projections W/Wg are output-sharded; the recurrent matrices Ug/A are ROW
+# sharded, so rank p holds the rows that produce its own units.
+#
+# The one thing that does not shard is the recurrent product's input: rank p's
+# rows need every unit of y, not just the H/P it owns. So each step all-gathers
+# y ([B,H/P] -> [B,H]) and that is the only collective in the step. The
+# alternative -- column-sharding the recurrent matrices and all-reducing the
+# [B,2H] product -- moves 2P times more bytes per step, which is why the gather
+# is on y rather than on the product.
+#
+# State (budget, energy, saturation) stays sharded end to end, so activation
+# memory divides by P as well as parameter memory.
+
+_PER_UNIT_CORE_PARAMS = (
+    "beta", "log_kappa", "logit_recover",
+    "k_s", "k_y", "k_b", "k_n", "k_bias", "k_saturation",
+    "r_s", "r_y", "r_b", "r_n", "r_bias", "r_saturation",
+)
+# Scalars describe the whole core rather than a unit, so every rank keeps them
+# whole; sharding them would change the math, not just its placement.
+_REPLICATED_CORE_PARAMS = ("logit_alpha", "log_lambda", "logit_saturation_decay",
+                           "logit_saturation_suppress")
+
+
+def hidden_shard(hidden_dim: int, rank: int, world_size: int) -> slice:
+    """This rank's contiguous slice of the hidden dimension.
+
+    The remainder is spread one unit at a time over the low ranks rather than
+    piled onto the last one, so no rank carries a disproportionate tail when
+    H is not a multiple of P -- which it frequently is not once H is chosen for
+    the model rather than for the cluster.
+    """
+    if world_size < 1 or not 0 <= rank < world_size:
+        raise ValueError(f"rank {rank} outside world size {world_size}")
+    base, extra = divmod(int(hidden_dim), int(world_size))
+    start = rank * base + min(rank, extra)
+    return slice(start, start + base + (1 if rank < extra else 0))
+
+
+def shard_core_tensor_parallel(core: nn.Module, rank: int, world_size: int) -> dict[str, Tensor]:
+    """Materialise one rank's shard of a core's parameters.
+
+    Returns plain tensors rather than a module: the shard is what a rank feeds
+    to the scan, and keeping it as data makes the sharded and replicated paths
+    comparable in a test without constructing a second module type.
+    """
+    cut = hidden_shard(core.hidden_dim, rank, world_size)
+    shard: dict[str, Tensor] = {}
+    for name in _PER_UNIT_CORE_PARAMS:
+        shard[name] = getattr(core, name).detach()[cut].clone()
+    for name in _REPLICATED_CORE_PARAMS:
+        shard[name] = getattr(core, name).detach().clone()
+    shard["W"] = core.W.weight.detach()[cut].clone()          # output-sharded
+    shard["Wg"] = core.Wg.weight.detach()[cut].clone()
+    shard["Wg_bias"] = core.Wg.bias.detach()[cut].clone()
+    # Row-sharded: rank p produces only its own units, from all of y.
+    shard["Ug"] = core.Ug.weight.detach()[cut].clone()
+    shard["A"] = core.A.weight.detach()[cut].clone()
+    shard["slice"] = cut
+    return shard
+
+
+class _AllGatherHidden(torch.autograd.Function):
+    """All-gather the hidden dimension, and route the gradient back home.
+
+    ``dist.all_gather`` writes into fresh buffers that autograd knows nothing
+    about, so the naive version is silently wrong in the backward pass: rank p's
+    units influence every OTHER rank's recurrence through the gathered ``y``,
+    and that cross-rank term simply vanishes. The forward matches the unsharded
+    model, every shape checks out, and the gradients are quietly incomplete --
+    the model trains, just not the model you think.
+
+    The backward of an all-gather is a reduce-scatter: sum each rank's slice of
+    the incoming gradient across all ranks, and hand each rank its own slice.
+    Implemented as all-reduce plus a slice, which is the same arithmetic and
+    tolerates uneven shards.
+
+    Shards are padded to a common width before the gather because collectives
+    require equal-sized buffers, and H is routinely not a multiple of the world
+    size. The padding is trimmed on the way out, so an uneven split is exact
+    rather than merely supported.
+    """
+
+    @staticmethod
+    def forward(ctx, y_local: Tensor, group):  # type: ignore[override]
+        world = torch_dist.get_world_size(group)
+        rank = torch_dist.get_rank(group)
+        widths = [torch.zeros(1, dtype=torch.long, device=y_local.device) for _ in range(world)]
+        torch_dist.all_gather(
+            widths,
+            torch.tensor([y_local.shape[-1]], dtype=torch.long, device=y_local.device),
+            group=group,
+        )
+        sizes = [int(w.item()) for w in widths]
+        pad = max(sizes)
+
+        padded = y_local
+        if y_local.shape[-1] < pad:
+            padded = torch.nn.functional.pad(y_local, (0, pad - y_local.shape[-1]))
+        buffers = [torch.empty_like(padded) for _ in range(world)]
+        torch_dist.all_gather(buffers, padded.contiguous(), group=group)
+
+        ctx.sizes, ctx.rank, ctx.group = sizes, rank, group
+        return torch.cat([buf[..., :size] for buf, size in zip(buffers, sizes)], dim=-1)
+
+    @staticmethod
+    def backward(ctx, grad_output: Tensor):  # type: ignore[override]
+        # Every rank computed with the full gathered y, so every rank holds a
+        # partial gradient for every unit. Summing them and taking this rank's
+        # slice is the reduce-scatter that closes the loop.
+        grad = grad_output.contiguous()
+        torch_dist.all_reduce(grad, op=torch_dist.ReduceOp.SUM, group=ctx.group)
+        start = sum(ctx.sizes[: ctx.rank])
+        return grad[..., start : start + ctx.sizes[ctx.rank]], None
+
+
+def tensor_parallel_core_scan(
+    shard: dict[str, Tensor],
+    inputs: Tensor,
+    *,
+    group=None,
+) -> Tensor:
+    """Run the recurrence with the hidden dimension split across ranks.
+
+    ``inputs`` is the full [B,T,in] batch (replicated); the return is this
+    rank's slice of the core's own trajectory, ``cat([y, budget])`` at
+    [B,T,2*(H/P)], matching what an unsharded core emits. Reassembly is
+    per-field -- concatenate every rank's ``y`` half, then every rank's
+    ``budget`` half -- because the shards partition units, and a rank's two
+    halves are not adjacent in the unsharded layout.
+    """
+    from .kernels.batched_runtime import _forward_step
+
+    world = torch_dist.get_world_size(group) if torch_dist.is_initialized() else 1
+    local_h = shard["W"].shape[0]
+    batch, steps, _ = inputs.shape
+    device, dtype = inputs.device, torch.float32
+
+    wx = torch.nn.functional.linear(inputs, shard["W"])
+    wgx = torch.nn.functional.linear(inputs, shard["Wg"], shard["Wg_bias"])
+    recurrent = torch.cat([shard["Ug"], shard["A"]], dim=0)
+
+    budget = torch.zeros(batch, local_h, device=device, dtype=dtype)
+    energy = torch.ones(batch, local_h, device=device, dtype=dtype)
+    saturation = torch.zeros(batch, local_h, device=device, dtype=dtype)
+
+    outputs = []
+    for t in range(steps):
+        y_local = torch.tanh(wx[:, t].float() + budget)
+        y_full = _AllGatherHidden.apply(y_local, group) if world > 1 else y_local
+        step = _forward_step(
+            wx[:, t], wgx[:, t], recurrent, budget, energy, saturation,
+            shard["beta"], shard["log_kappa"], shard["logit_recover"],
+            shard["k_s"], shard["k_y"], shard["k_b"], shard["k_n"], shard["k_bias"],
+            shard["r_s"], shard["r_y"], shard["r_b"], shard["r_n"], shard["r_bias"],
+            shard["logit_saturation_decay"].expand(local_h),
+            shard["k_saturation"], shard["r_saturation"],
+            shard["logit_alpha"].reshape(()), shard["log_lambda"].reshape(()),
+            shard["logit_saturation_suppress"].reshape(()),
+            y_full=y_full,
+        )
+        y, budget, energy, saturation = step[0], step[1], step[2], step[3]
+        # Same trajectory element the unsharded core emits: y and the UPDATED
+        # budget, in that order.
+        outputs.append(torch.cat([y, budget], dim=-1))
+    return torch.stack(outputs, dim=1)
+
+
+def reassemble_tensor_parallel_trajectory(pieces: list[Tensor]) -> Tensor:
+    """Rebuild an unsharded trajectory from per-rank slices, in rank order.
+
+    A rank's output is ``cat([y_local, budget_local])``, so the halves have to
+    be regrouped rather than simply concatenated: all ranks' ``y`` first, then
+    all ranks' ``budget``. Getting this wrong produces a tensor of the right
+    shape holding interleaved fields, which is exactly the sort of error that
+    survives a shape assertion.
+    """
+    ys, budgets = [], []
+    for piece in pieces:
+        half = piece.shape[-1] // 2
+        ys.append(piece[..., :half])
+        budgets.append(piece[..., half:])
+    return torch.cat(ys + budgets, dim=-1)

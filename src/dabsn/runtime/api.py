@@ -18,7 +18,12 @@ LossFunction = Callable[[Tensor, Tensor], Tensor]
 
 def _default_loss(output: Tensor, target: Tensor) -> Tensor:
     if target.dtype in {torch.int8, torch.int16, torch.int32, torch.int64}:
-        return F.cross_entropy(output.reshape(-1, output.shape[-1]), target.reshape(-1))
+        # Chunk the FP32 upcast so a large [B*T, V] logits tensor never spawns a
+        # second full-size FP32 copy; auto-engages only above the element budget
+        # and is numerically equivalent to F.cross_entropy otherwise.
+        from .loss import chunked_cross_entropy_from_logits
+
+        return chunked_cross_entropy_from_logits(output, target)
     return F.mse_loss(output, target)
 
 

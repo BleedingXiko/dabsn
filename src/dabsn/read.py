@@ -146,7 +146,11 @@ class DABSNRead(nn.Module):
         read_parameters = self.short_read
         batch, seq_len, hidden = expression.shape
         query = F.normalize(expression, dim=-1)
-        keys = F.normalize(write, dim=-1)
+        # Keys are normalized AFTER the admitted-bank gather (see gather_bank):
+        # F.normalize is row-wise and the gather selects whole rows, so
+        # normalize(gather(write)) == gather(normalize(write)) exactly, but the
+        # backward now only pins the [B, n_max, H] gathered keys instead of a
+        # full [B, T, H] normalized-write tape.
         scale = (F.softplus(read_parameters.log_temp) + 1.0) * (hidden ** 0.5)
         key_bias = (
             read_parameters.p_gain * torch.log1p(plasticity.mean(dim=-1) * hidden)
@@ -225,8 +229,10 @@ class DABSNRead(nn.Module):
 
         def gather_bank(index: Tensor):
             gather_hidden = index.unsqueeze(-1).expand(-1, -1, hidden)
-            bank_keys = torch.gather(keys, 1, gather_hidden)
             bank_writes = torch.gather(write, 1, gather_hidden)
+            # Normalize the gathered writes (bit-identical to gathering a full
+            # normalized-key tape, but O(n_max) not O(T) in the saved graph).
+            bank_keys = F.normalize(bank_writes, dim=-1)
             bank_cocktail = torch.gather(
                 cocktail,
                 1,
@@ -596,7 +602,8 @@ class DABSNRead(nn.Module):
         query_start = int(query_start)
 
         query = F.normalize(expression, dim=-1)
-        keys = F.normalize(bank_write, dim=-1)
+        # Keys normalized after the gather (Phase 2c) -- see the short read: the
+        # row-wise normalize commutes with the row gather bit-for-bit.
         scale = (F.softplus(read_parameters.log_temp) + 1.0) * (hidden ** 0.5)
         key_bias = (
             read_parameters.p_gain * torch.log1p(bank_p.mean(dim=-1) * hidden)
@@ -652,8 +659,8 @@ class DABSNRead(nn.Module):
         )
 
         gather_hidden = bank_idx.unsqueeze(-1).expand(-1, -1, hidden)
-        bank_keys = torch.gather(keys, 1, gather_hidden)
         bank_writes = torch.gather(bank_write, 1, gather_hidden)
+        bank_keys = F.normalize(bank_writes, dim=-1)
         selected_cocktail = torch.gather(
             bank_cocktail,
             1,

@@ -41,7 +41,7 @@ Source = "https://github.com/BleedingXiko/dabsn"
 Issues = "https://github.com/BleedingXiko/dabsn/issues"
 
 [project.optional-dependencies]
-test = ["pytest>=8"]
+test = ["pytest>=8", "pyflakes>=3"]
 cuda-turing = [
     "torch==2.6.0; platform_system == 'Linux'",
     "triton==3.2.0; platform_system == 'Linux'",

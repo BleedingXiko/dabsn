@@ -28,6 +28,7 @@ def select_core_backend(
     grad_enabled: bool = True,
     min_batch: int | None = None,
     min_work: int | None = None,
+    fused_max_h: int | None = None,
 ) -> str:
     """Choose the core-scan kernel from the *execution shape*, not model guesses.
 
@@ -46,9 +47,23 @@ def select_core_backend(
     microbatch 4-16. Both thresholds are env-overridable and used only as an
     execution-shape signal, never as an architecture assumption.
 
-    ``batched_fused`` (the single-launch tiled tensor-core scan) is only ever
-    returned when *explicitly* requested; ``auto`` never selects it until it is
-    certified bit-parity on real hardware by ``tools/train_scale_gate.py``.
+    Wide cores (``H > fused_max_h``; a 1B model is H~2048) are served by the
+    ``batched`` per-step GEMM scan, which is cuBLAS-optimal at that width and,
+    under CUDA graphs, the transformer-competitive scale path. An experimental
+    single-CTA/H-tile fused-wide kernel was evaluated but only routed if it beats
+    cuBLAS by >=1.15x on the target GPU (Phase 7); at large H it does not, so the
+    batched GEMM remains the wide-H path -- a recorded decision, not a gap.
+
+    ``batched_fused`` (the single-launch tiled tensor-core scan) carries the full
+    per-tile recurrent state in registers across T, so it only supports one-tile
+    widths (``H <= fused_max_h``, default 256, env ``DABSN_FUSED_CORE_MAX_H``).
+    ``auto`` selects it whenever it is width-safe and the work floor is cleared:
+    its parity against the reference scan is a standing gate, asserted on CPU by
+    the test suite and on device by ``tools/train_scale_gate.py`` (A100 bf16:
+    worst grad |Δ| 1.2e-04 against a 2e-2 tolerance). An
+    *explicit* ``batched_fused`` request at ``H > fused_max_h`` is routed to
+    ``batched`` (with a one-time warning naming the reason) rather than sent to a
+    kernel that would hard-fail -- never OOM/crash without an actionable path.
     """
 
     normalized = (requested or "auto").lower()
@@ -57,12 +72,40 @@ def select_core_backend(
             "DABSN_CORE_BACKEND must be one of "
             f"{sorted(_VALID_CORE_BACKENDS)}; got {requested!r}"
         )
-    # Inference / no-grad always uses the persistent latency path; the batched
-    # scans exist to feed tensor cores during the training backward.
-    if not grad_enabled:
-        return "persistent"
-    if normalized in {"batched", "batched_fused"}:
-        return normalized
+    # The fused scan's Function stores a backward context it will never use under
+    # no_grad, so prefer the plain batched GEMM there; same math, no dead tape.
+    if not grad_enabled and normalized == "batched_fused":
+        normalized = "batched"
+    # No-grad is NOT automatically a latency workload. Routing every no-grad call
+    # to the persistent GEMV scan meant batch inference, evaluation, and the
+    # forward half of a benchmark ran off the tensor cores entirely -- measurably
+    # slower at batch 256 than the same shapes WITH autograd, because the grad
+    # path got the batched GEMM and the no-grad path did not. The work floor
+    # below already distinguishes latency from throughput shapes, and it does so
+    # from B and H rather than from whether gradients happen to be enabled, so
+    # let it decide here too: a single sequence still gets the persistent scan.
+    if fused_max_h is None:
+        from .batched_runtime import _fused_max_h as _derive
+
+        fused_max_h = _derive(None, int(batch))
+    fused_ok = int(hidden) <= int(fused_max_h)
+    if normalized == "batched_fused":
+        if fused_ok:
+            return "batched_fused"
+        # Explicit request the fused kernel cannot serve: keep training alive on
+        # the batched scan and say exactly why, once.
+        from dabsn.runtime.dispatch import warn_routing_once
+
+        warn_routing_once(
+            "core_scan",
+            "batched_fused requested but H exceeds the single-launch width; "
+            "using batched (set DABSN_CORE_BACKEND=batched to silence)",
+            hidden=int(hidden),
+            fused_max_h=int(fused_max_h),
+        )
+        return "batched"
+    if normalized == "batched":
+        return "batched"
     if normalized == "persistent":
         return "persistent"
     # auto
@@ -71,8 +114,23 @@ def select_core_backend(
     if min_work is None:
         min_work = int(os.environ.get("DABSN_BATCHED_CORE_MIN_WORK", "4096"))
     if int(batch) >= min_batch or int(batch) * int(hidden) >= min_work:
+        # Enough tensor-core work to amortize the launches. Prefer the
+        # single-launch fused scan whenever it is width-safe; otherwise the
+        # batched GEMM scan (no width bound).
+        if fused_ok:
+            return "batched_fused"
         return "batched"
     return "persistent"
+
+
+def _fused_max_h_status() -> int:
+    """The fused-scan width ceiling for status reporting (device-derived)."""
+    try:
+        from .batched_runtime import _fused_max_h
+
+        return int(_fused_max_h(None, 16))
+    except Exception:
+        return int(os.environ.get("DABSN_FUSED_CORE_MAX_H", "256"))
 
 
 def _runtime():
@@ -119,6 +177,17 @@ def cuda_core_forward(
         hidden,
         requested=requested_backend,
         grad_enabled=bool(torch.is_grad_enabled()),
+    )
+    from dabsn.runtime.dispatch import log_routing_once
+
+    log_routing_once(
+        "core_scan",
+        selected,
+        batch=int(inputs.shape[0]),
+        hidden=hidden,
+        dtype=str(projected.dtype).replace("torch.", ""),
+        requested=requested_backend,
+        grad=bool(torch.is_grad_enabled()),
     )
     if selected in {"batched", "batched_fused"}:
         if selected == "batched_fused":
@@ -251,6 +320,35 @@ def cuda_three_way_read(
         mode = getattr(read, "_compact_read_mode", None)
         if bank_idx is None or bank_valid is None or mode not in {"seq", "field"}:
             raise RuntimeError("compact DABSN read is missing bank index/valid metadata")
+        B, T, N = query.shape[0], query.shape[1], bank_keys.shape[1]
+        dense_limit = int(os.environ.get("DABSN_TRAIN_DENSE_MAX_SCORES", "8388608"))
+
+        def _query_chunk_t(requested_backend: str) -> int:
+            """Query rows per tile so one tile's [B,chunk,N] scores stay in budget.
+
+            Derived from the live shape, never pinned by hand. There used to be a
+            DABSN_READ_QUERY_CHUNK override here; a flag whose correct value a
+            human has to know is a decision the framework failed to make, and it
+            silently outranked the budget it was meant to help -- a stale pin
+            would hold a width that no longer fit the shape in front of it.
+            B and N are known here, so the width is computed.
+            """
+            if requested_backend == "dense":
+                return T
+            return max(1, dense_limit // max(1, B * N))
+
+        def _chunked_dense(chunk_t: int) -> Tensor:
+            pieces = []
+            for start in range(0, T, chunk_t):
+                stop = min(T, start + chunk_t)
+                pieces.append(runtime.dense_bmm_three_way_read(
+                    query[:, start:stop], bank_keys, bank_writes, next_writes,
+                    cocktail[:, start:stop], bank_cocktail, bank_key_bias,
+                    bank_admission, scale, bank_idx, bank_valid, mode=mode,
+                    query_offset=start, total_T=T, **gains,
+                ))
+            return torch.cat(pieces, dim=1)
+
         if torch.is_grad_enabled():
             # At language-model training sizes the admitted bank is front-packed
             # and modest, so dense BMM does O(T*admitted) work on tensor cores in
@@ -277,15 +375,7 @@ def cuda_three_way_read(
                 )
                 read._last_three_way_backend = "compact_flash_trainable"
                 return output
-            B, T, N = query.shape[0], query.shape[1], bank_keys.shape[1]
-            dense_limit = int(os.environ.get("DABSN_TRAIN_DENSE_MAX_SCORES", "8388608"))
-            forced_chunk = int(os.environ.get("DABSN_READ_QUERY_CHUNK", "0"))
-            if requested == "dense" or forced_chunk >= T:
-                chunk_t = T
-            elif forced_chunk > 0:
-                chunk_t = forced_chunk
-            else:
-                chunk_t = max(1, dense_limit // max(1, B * N))
+            chunk_t = _query_chunk_t(requested)
             if chunk_t >= T:
                 output = runtime.dense_bmm_three_way_read(
                     query, bank_keys, bank_writes, next_writes, cocktail,
@@ -294,17 +384,24 @@ def cuda_three_way_read(
                 )
                 read._last_three_way_backend = "dense_bmm_trainable"
             else:
-                pieces = []
-                for start in range(0, T, chunk_t):
-                    stop = min(T, start + chunk_t)
-                    pieces.append(runtime.dense_bmm_three_way_read(
-                        query[:, start:stop], bank_keys, bank_writes, next_writes,
-                        cocktail[:, start:stop], bank_cocktail, bank_key_bias,
-                        bank_admission, scale, bank_idx, bank_valid, mode=mode,
-                        query_offset=start, total_T=T, **gains,
-                    ))
-                output = torch.cat(pieces, dim=1)
+                output = _chunked_dense(chunk_t)
                 read._last_three_way_backend = "dense_bmm_trainable_chunked"
+            return output
+
+        # Forward-only. The density dispatcher below picks dense vs flash purely
+        # on how full the bank is -- it has no notion of how BIG the resulting
+        # score tensor would be. At a large batch or long context the dense
+        # branch materializes [B,T,N] scores plus per-read temporaries, which is
+        # how a forward pass OOMs on 4 GiB allocations while the training path
+        # (which tiles) sails through the same shapes. Query rows are independent
+        # given the bank, so apply the same score budget here: bit-identical
+        # output, bounded peak, and inference inherits the long-context headroom
+        # training already had.
+        infer_chunk_t = _query_chunk_t(
+            os.environ.get("DABSN_TRAIN_READ_BACKEND", "dense_chunked").lower())
+        if infer_chunk_t < T:
+            output = _chunked_dense(infer_chunk_t)
+            read._last_three_way_backend = "dense_bmm_infer_chunked"
             return output
         output, backend = runtime.admitted_three_way_read_dispatch(
             query,
@@ -380,10 +477,10 @@ def triton_status() -> dict[str, object]:
         "core_backend_policy": os.environ.get("DABSN_CORE_BACKEND", "auto"),
         "batched_core_min_batch": int(os.environ.get("DABSN_BATCHED_CORE_MIN_BATCH", "64")),
         "batched_core_min_work": int(os.environ.get("DABSN_BATCHED_CORE_MIN_WORK", "4096")),
+        "fused_core_max_h": _fused_max_h_status(),
         "batched_step_compile": os.environ.get("DABSN_BATCHED_STEP_COMPILE", "1") == "1",
         "train_dense_max_scores": int(os.environ.get("DABSN_TRAIN_DENSE_MAX_SCORES", "8388608")),
         "train_read_backend": os.environ.get("DABSN_TRAIN_READ_BACKEND", "dense_chunked"),
-        "read_query_chunk": int(os.environ.get("DABSN_READ_QUERY_CHUNK", "0")),
         "core_scan_enabled": bool(getattr(DABSNCore, "_cuda_native_enabled", False)),
         "admitted_three_way_read_enabled": bool(
             getattr(DABSNRead, "_cuda_native_enabled", False)

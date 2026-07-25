@@ -18,7 +18,7 @@ from .config import (
     resolve_dabsn_layers,
 )
 from .core import DABSNCore
-from .read import DABSNRead
+from .read import DABSNRead, _stream_is_capturing
 
 
 class DABSNBlock(nn.Module):
@@ -50,15 +50,119 @@ class DABSNBlock(nn.Module):
         self.last_trace: dict[str, object] = {}
         self.last_signals: dict[str, Tensor] = {}
 
+    def _resolve_block_chunk_t(self, inputs: Tensor) -> int:
+        """Decide the time-chunk width for the core scan.
+
+        ``block_chunk_t``/``DABSN_BLOCK_CHUNK_T``: ``-1`` forces off, ``>0`` is an
+        explicit width, ``0`` (default) is auto -- engage only under real device
+        memory pressure. On CPU (or when free memory is unknown) auto stays off,
+        so CPU behavior and the release gate are unchanged.
+
+        Chunking is off under CUDA-graph capture at any setting: the per-chunk
+        ``checkpoint`` recompute is not capturable, and a graph already bounds
+        activation memory by replaying one fixed allocation. ``_capture_no_chunk``
+        (set by ``runtime.graph``) covers the warmup iterations too, so warmup and
+        capture run the same structure.
+        """
+        T = int(inputs.shape[1])
+        raw = os.environ.get("DABSN_BLOCK_CHUNK_T")
+        setting = int(raw) if raw not in (None, "") else 0
+        if getattr(self, "_capture_no_chunk", False) or _stream_is_capturing():
+            if setting > 0:
+                from .runtime.dispatch import warn_routing_once
+
+                warn_routing_once(
+                    "block_chunk",
+                    "DABSN_BLOCK_CHUNK_T is set but CUDA-graph capture cannot "
+                    "replay checkpoint recompute; chunking is off for graphed "
+                    "steps (the graph bounds activation memory itself)",
+                    chunk_t=setting,
+                )
+            return 0
+        if setting < 0:
+            return 0  # forced off
+        if setting > 0:
+            return min(setting, T)
+        # auto: decided ONCE per execution shape and remembered. Re-deciding per
+        # call would read whatever free memory happens to be around at that
+        # moment, so the same shape could chunk on one step and not the next --
+        # nondeterministic structure, and a warmup/capture mismatch waiting to
+        # happen. The first answer for a shape is the answer for that shape.
+        B = int(inputs.shape[0])
+        H = int(self.state_dim)
+        key = (B, T, H, inputs.dtype)
+        cache = self.__dict__.setdefault("_block_chunk_auto", {})
+        if key in cache:
+            return cache[key]
+        if not inputs.is_cuda:
+            cache[key] = 0
+            return 0
+        try:
+            free_bytes, _total = torch.cuda.mem_get_info(inputs.device)
+        except Exception:
+            cache[key] = 0
+            return 0
+        elem = inputs.element_size()
+        # ~8 full-T [B,T,H] tapes are the core's activation working set.
+        est = 8 * B * T * H * elem
+        decision = 0
+        if est > 0.5 * float(free_bytes):
+            # Target roughly a quarter of the footprint per chunk.
+            target = max(1, int(T * (0.5 * free_bytes) / est) // 4)
+            decision = max(1, min(target, T))
+        cache[key] = decision
+        return decision
+
+    def _chunked_core(self, inputs: Tensor, chunk_t: int):
+        """Run the core scan in exact time-chunks, carrying (budget, energy,
+        saturation) across chunk boundaries and assembling the full-T public
+        tapes. Each chunk is wrapped in ``torch.utils.checkpoint`` while training
+        so only one chunk's activation graph is live at a time -- the core's
+        activation working set drops from O(T) to O(chunk_t). Exactness is the
+        same carried-state parity the release gate pins (chunked == full).
+        """
+        B, T, _ = inputs.shape
+        carry = self.core.initial_state(B, device=inputs.device, dtype=inputs.dtype)
+        tapes: list[list[Tensor]] = [[] for _ in range(7)]
+        use_ckpt = self.training and torch.is_grad_enabled()
+        for t0 in range(0, T, chunk_t):
+            t1 = min(T, t0 + chunk_t)
+            chunk = inputs[:, t0:t1]
+
+            def run(chunk_in, b_in, e_in, c_in):
+                result, final = self.core.forward_from_state(
+                    chunk_in,
+                    initial_state=(b_in, e_in, c_in),
+                    return_writes=True,
+                    return_cocktail=True,
+                    return_final_state=True,
+                )
+                return (*result, *final)
+
+            if use_ckpt:
+                outs = checkpoint(run, chunk, carry[0], carry[1], carry[2], use_reentrant=False)
+            else:
+                outs = run(chunk, carry[0], carry[1], carry[2])
+            for i in range(7):
+                tapes[i].append(outs[i])
+            carry = (outs[7], outs[8], outs[9])
+        return tuple(torch.cat(parts, dim=1) for parts in tapes)
+
     def forward(self, inputs: Tensor) -> Tensor:
         if inputs.dim() == 4:
             batch, cells, steps, dim = inputs.shape
             inputs = inputs.reshape(batch, cells * steps, dim)
-        trajectory, novelty, plasticity, expression, write, energy, saturation = self.core(
-            inputs,
-            return_writes=True,
-            return_cocktail=True,
-        )
+        chunk_t = self._resolve_block_chunk_t(inputs)
+        if chunk_t and chunk_t < int(inputs.shape[1]):
+            trajectory, novelty, plasticity, expression, write, energy, saturation = (
+                self._chunked_core(inputs, chunk_t)
+            )
+        else:
+            trajectory, novelty, plasticity, expression, write, energy, saturation = self.core(
+                inputs,
+                return_writes=True,
+                return_cocktail=True,
+            )
         y, budget = trajectory.split(self.state_dim, dim=-1)
         read = self.read(
             y,
@@ -144,8 +248,16 @@ class DABSNBackbone(nn.Module):
             hidden = inputs.reshape(batch, height * width, dim)
         else:
             hidden = inputs
+        # Checkpoint recompute cannot be captured into a CUDA graph: it re-runs
+        # forward during backward against capture-pool addresses that no longer
+        # hold those activations at replay, which surfaces as an illegal memory
+        # access at the next sync. `runtime.graph` already pins it off across the
+        # whole warmup+capture window; this is the guard for a capture taken
+        # without that helper, so the step degrades to plain (correct, heavier)
+        # activations instead of corrupting the recorded graph.
+        recompute = self.grad_checkpoint and self.training and not _stream_is_capturing()
         for block in self.blocks:
-            if self.grad_checkpoint and self.training:
+            if recompute:
                 hidden = checkpoint(block, hidden, use_reentrant=False)
             else:
                 hidden = block(hidden)

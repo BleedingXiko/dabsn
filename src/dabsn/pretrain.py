@@ -35,6 +35,7 @@ from .model import DABSNSequenceLM
 from .runtime.api import verify_gradients
 from .runtime.grad_accum import ManualGradientAccumulator
 from .runtime.graph import make_graphed_train_callable
+from .runtime.loss import chunked_cross_entropy_from_logits
 
 
 def _load_corpus(config: DABSNPretrainConfig) -> np.ndarray:
@@ -131,6 +132,65 @@ def _memory_report(device: torch.device) -> dict[str, float]:
     }
 
 
+def _configure_cuda_allocator() -> None:
+    """Enable expandable segments so the caching allocator can grow into
+    fragmented free space instead of OOMing on one large contiguous request.
+
+    Appends to any existing ``PYTORCH_CUDA_ALLOC_CONF`` without clobbering an
+    operator's setting, is a no-op on platforms that ignore the flag, and can be
+    turned off with ``DABSN_DISABLE_EXPANDABLE_SEGMENTS=1``. Must run before the
+    first CUDA allocation to take effect.
+    """
+    if os.environ.get("DABSN_DISABLE_EXPANDABLE_SEGMENTS", "0") == "1":
+        return
+    existing = os.environ.get("PYTORCH_CUDA_ALLOC_CONF", "")
+    if "expandable_segments" in existing:
+        return
+    parts = [piece for piece in existing.split(",") if piece]
+    parts.append("expandable_segments:True")
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = ",".join(parts)
+
+
+def _oom_actionable_message(
+    config: DABSNPretrainConfig, state, exc: BaseException, phase: str
+) -> str:
+    """Turn a bare CUDA OOM into an operator-actionable report.
+
+    Names the exact live shape (B/T/H/depth/precision/grad-accum), the allocator
+    stats at the failure, and a ranked list of levers -- so an OOM is never a
+    dead end.
+    """
+    hidden = getattr(config, "hidden_dim", "?")
+    depth = getattr(config, "depth", "?")
+    mem = _memory_report(state.device) if getattr(state, "device", None) is not None else {}
+    mem_str = (
+        f"allocated={mem.get('allocated_gb', 0):.2f}GB "
+        f"reserved={mem.get('reserved_gb', 0):.2f}GB "
+        f"peak={mem.get('peak_gb', 0):.2f}GB"
+        if mem
+        else "n/a"
+    )
+    fixes = [
+        f"lower batch_size (now {config.batch_size}) or raise grad_accum_steps "
+        f"(now {config.grad_accum_steps}) to keep the token budget",
+        "set grad_checkpoint=True on the model to trade compute for activation memory",
+        "shrink train_context (now "
+        f"{getattr(config, 'train_context', '?')}) or enable block-time chunking "
+        "(DABSN_BLOCK_CHUNK_T)",
+        "enable chunked loss (DABSN_LOSS_CHUNK_SCORES) to avoid the [B*T,V] logits peak",
+        "reduce read scores per tile (DABSN_TRAIN_DENSE_MAX_SCORES)",
+    ]
+    ranked = "\n".join(f"  {i + 1}. {fix}" for i, fix in enumerate(fixes))
+    return (
+        f"CUDA out of memory during {phase}. "
+        f"Live shape: batch={config.batch_size} context={getattr(config, 'train_context', '?')} "
+        f"hidden={hidden} depth={depth} precision={config.precision} "
+        f"grad_accum={config.grad_accum_steps}. Allocator: {mem_str}.\n"
+        f"Actionable fixes (most effective first):\n{ranked}\n"
+        f"Original error: {type(exc).__name__}: {str(exc)[:300]}"
+    )
+
+
 def _validate_model_config(model: DABSNSequenceLM, config: DABSNPretrainConfig) -> None:
     expected_layers = [spec.to_metadata() for spec in config.layer_specs()]
     actual_layers = [spec.to_metadata() for spec in model.layers]
@@ -181,10 +241,7 @@ def _evaluate(
                     rng=rng,
                 )
                 with autocast_context(state.device, precision):
-                    loss = F.cross_entropy(
-                        model(inputs).reshape(-1, config.vocab),
-                        targets.reshape(-1),
-                    )
+                    loss = chunked_cross_entropy_from_logits(model(inputs), targets)
                 local += loss.detach() / config.val_batches
             losses[int(context)] = _mean_across_ranks(local, state)
     model.train()
@@ -234,6 +291,9 @@ def pretrain_next_token(
     rank zero host memory.
     """
 
+    # Expandable segments must be set before the first CUDA allocation, which
+    # setup_distributed may trigger -- configure the allocator first.
+    _configure_cuda_allocator()
     state = setup_distributed(config.distributed, device)
     destination = Path(output)
     try:
@@ -243,6 +303,10 @@ def pretrain_next_token(
         kernel_report = enable_kernels(selected_backend, required=True)
         precision = resolve_precision(config.precision, state.device)
         os.environ["DABSN_LONG_SCAN_CHUNK"] = str(int(config.long_scan_chunk))
+        if int(getattr(config, "loss_chunk_scores", 0)) > 0:
+            os.environ["DABSN_LOSS_CHUNK_SCORES"] = str(int(config.loss_chunk_scores))
+        if int(getattr(config, "block_chunk_t", 0)) != 0:
+            os.environ["DABSN_BLOCK_CHUNK_T"] = str(int(config.block_chunk_t))
         if state.device.type == "cuda":
             torch.cuda.set_device(state.local_rank)
             torch.cuda.reset_peak_memory_stats(state.device)
@@ -416,10 +480,12 @@ def pretrain_next_token(
                 accumulator.begin_microbatch()
             with no_sync_context(train_model, synchronize=update_boundary):
                 with autocast_context(state.device, precision):
-                    loss = F.cross_entropy(
-                        graph_call(inputs).reshape(-1, config.vocab),
-                        targets.reshape(-1),
-                    )
+                    # Chunk the FP32 CE upcast so the [B*T, V] logits never spawn
+                    # a second full-size FP32 copy at the loss (auto-engaged by
+                    # the element budget; identical loss otherwise). The graphed
+                    # forward is captured in `graph_call`; the loss stays outside
+                    # capture, so this does not change the graph.
+                    loss = chunked_cross_entropy_from_logits(graph_call(inputs), targets)
                 local_loss = loss.detach()
                 scaled = loss / config.grad_accum_steps
                 if scaler is None:
@@ -579,6 +645,13 @@ def pretrain_next_token(
             "final_export": None if final_export is None else str(final_export),
             "cuda_graph": graph_note if config.cuda_graph else None,
         }
+    except torch.cuda.OutOfMemoryError as exc:
+        # Never surface a bare allocator OOM: attach the live shape, allocator
+        # stats, and a ranked list of levers so the operator knows exactly what
+        # to change.
+        raise torch.cuda.OutOfMemoryError(
+            _oom_actionable_message(config, state, exc, "pretraining")
+        ) from exc
     finally:
         cleanup_distributed(state)
 

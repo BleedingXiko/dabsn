@@ -47,6 +47,45 @@ def _read_submodules(module: nn.Module) -> list[nn.Module]:
     return [m for m in module.modules() if hasattr(m, "read_geometry")]
 
 
+def _pin_capture_safe_recompute(module: nn.Module):
+    """Take activation recompute out of the capture window.
+
+    Two paths re-run forward during backward: the backbone's ``grad_checkpoint``
+    and the block's auto time-chunking. Neither survives capture. The recompute
+    allocates as it runs, so it is recorded against capture-pool addresses that
+    no longer hold those activations at replay -- surfacing as
+    ``cudaErrorIllegalAddress`` at whatever call next synchronizes. Worse, the
+    block's *auto* decision reads live free memory, so warmup and capture can
+    disagree on the chunk count and record a graph whose structure never
+    matched -- the same misalignment ``_pin_capture_safe_reads`` exists to
+    prevent. A captured graph already bounds activation memory by replaying one
+    fixed allocation, so recompute buys nothing inside it. Returns a restore
+    closure; eager and non-graph steps keep checkpointing untouched.
+    """
+
+    backbones = [m for m in module.modules() if hasattr(m, "grad_checkpoint")]
+    blocks = [m for m in module.modules() if hasattr(m, "_resolve_block_chunk_t")]
+    saved_ckpt = [(m, m.grad_checkpoint) for m in backbones]
+    saved_chunk = [(m, getattr(m, "_capture_no_chunk", None)) for m in blocks]
+
+    for m in backbones:
+        m.grad_checkpoint = False
+    for m in blocks:
+        m._capture_no_chunk = True
+
+    def restore() -> None:
+        for m, prev in saved_ckpt:
+            m.grad_checkpoint = prev
+        for m, prev in saved_chunk:
+            if prev is None:
+                if hasattr(m, "_capture_no_chunk"):
+                    delattr(m, "_capture_no_chunk")
+            else:
+                m._capture_no_chunk = prev
+
+    return restore
+
+
 def _pin_capture_safe_reads(module: nn.Module, sample_args: Sequence[Tensor]):
     """Make the admitted read shape-stable for graph capture, and sub-quadratic.
 
@@ -168,6 +207,57 @@ def _assert_signatures_close(
         raise RuntimeError(f"CUDA-graph gradient parity failed: {failures}")
 
 
+def _reject_capture_of_a_replicated_module(module: nn.Module) -> None:
+    """Refuse to record a step whose gradients are owned by a collective.
+
+    DDP and FSDP do their work through autograd hooks: DDP fires a reducer hook
+    per gradient bucket, FSDP all-gathers parameters before a module runs and
+    reduce-scatters gradients after. Those hooks are the boundary between what
+    the graph can legally replay and what it cannot -- the reducer keeps a
+    reference to AccumulateGrad nodes across iterations, so a recorded region
+    replays against nodes that belong to a previous iteration's graph, and
+    FSDP's all-gather allocates outside the captured pool.
+
+    PyTorch signals this rather than crashing: the AccumulateGrad stream-mismatch
+    warning names DDP and graph capture in the same sentence. A warning during
+    a long training run is not enough -- by the time anyone reads it the
+    gradients are already wrong. So this is a hard failure with the two ways
+    out, per the rule that everything either works together or says what to do
+    instead.
+
+    Wrap ORDER is what makes the good path possible: capture the inner module
+    first, then wrap the graphed callable in DDP. The recorded region then
+    contains only the module's own math and the reducer hooks stay outside it.
+    """
+    kind = None
+    for cls_path, label in (
+        ("torch.nn.parallel.distributed.DistributedDataParallel", "DDP"),
+        ("torch.distributed.fsdp.fully_sharded_data_parallel.FullyShardedDataParallel", "FSDP"),
+    ):
+        name = type(module).__module__ + "." + type(module).__qualname__
+        if name == cls_path:
+            kind = label
+            break
+    if kind is None:
+        return
+    raise RuntimeError(
+        f"refusing to CUDA-graph a {kind}-wrapped module.\n"
+        f"{kind} installs autograd hooks that own gradient communication, and a "
+        "recorded region replays against hook state from the iteration it was "
+        "captured in -- the gradients silently stop being correct rather than "
+        "raising.\n"
+        "Fixes, in order:\n"
+        "  1. Capture the INNER module, then wrap the graphed callable: "
+        "`graphed = make_graphed_train_callable(model, args); ddp = "
+        f"wrap_distributed(graphed, state)`. The {kind} hooks then sit outside "
+        "the recorded region, which is the supported arrangement.\n"
+        "  2. Or leave capture off for distributed runs (DABSN_SCAN_GRAPH=0 "
+        "also disables the per-chunk scan graphs). Data-parallel throughput is "
+        "dominated by the collective, not by launch overhead, so capture buys "
+        "much less here than it does single-GPU."
+    )
+
+
 def make_graphed_train_callable(
     module: nn.Module,
     sample_args: Sequence[Tensor],
@@ -217,6 +307,7 @@ def make_graphed_train_callable(
         return module
     if warmup_iters < 1:
         raise ValueError("warmup_iters must be at least one")
+    _reject_capture_of_a_replicated_module(module)
 
     reduce = loss_reduce or _default_reduce
 
@@ -226,6 +317,10 @@ def make_graphed_train_callable(
     # Pin the admitted read to a fixed, sub-quadratic width for the whole build
     # (warmup + capture must agree, or the recorded graph misaligns). Restored
     # afterward so eager/non-graph steps keep their data-dependent sparse width.
+    # Recompute must be off for the whole build too: the eager pre-warmup inside
+    # _pin_capture_safe_reads, the warmup iters, and the capture all have to run
+    # the same structure, and checkpoint recompute is not capturable at all.
+    restore_recompute = _pin_capture_safe_recompute(module)
     restore_reads = _pin_capture_safe_reads(module, sample_args)
     try:
         eager_loss = None
@@ -265,6 +360,7 @@ def make_graphed_train_callable(
                 )
     finally:
         restore_reads()
+        restore_recompute()
 
     return graphed
 
