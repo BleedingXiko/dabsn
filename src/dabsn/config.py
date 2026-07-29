@@ -170,6 +170,8 @@ class DABSNConfig:
     output_adapter: str = "field"
     task: str | None = None
     layers: list[DABSNLayerSpec | Mapping[str, object]] = field(default_factory=list)
+    residual: bool = False
+    mlp_ratio: float | None = None
 
     def __post_init__(self) -> None:
         if self.input_dim <= 0 or self.out_dim <= 0:
@@ -178,6 +180,8 @@ class DABSNConfig:
             raise ValueError("hidden_dim and depth must be positive")
         if self.geometry not in {"seq", "field", "hybrid"}:
             raise ValueError("geometry must be seq, field, or hybrid")
+        if self.mlp_ratio is not None and float(self.mlp_ratio) <= 0:
+            raise ValueError("mlp_ratio must be positive or None")
 
     def layer_specs(self) -> list[DABSNLayerSpec]:
         if self.layers:
@@ -212,6 +216,8 @@ class DABSNPretrainConfig:
     layer_geometries: str | Sequence[str] | None = ("seq", "field", "hybrid")
     state_dim: int | None = None
     tie_embeddings: bool = True
+    residual: bool = False
+    mlp_ratio: float | None = None
     train_context: int = 2048
     eval_contexts: tuple[int, ...] = ()
     steps: int = 16_000
@@ -275,6 +281,8 @@ class DABSNPretrainConfig:
             raise ValueError("distributed must be none, ddp, or fsdp")
         if self.precision not in {"auto", "fp32", "fp16", "bf16"}:
             raise ValueError("precision must be auto, fp32, fp16, or bf16")
+        if self.mlp_ratio is not None and float(self.mlp_ratio) <= 0:
+            raise ValueError("mlp_ratio must be positive or None")
         if any(int(context) <= 0 for context in self.eval_contexts):
             raise ValueError("eval_contexts must contain positive lengths")
         if self.checkpoint_every < 0 or self.log_every < 0 or self.val_every < 0:

@@ -568,6 +568,21 @@ def _reverse_chunk_width(B: int, T: int, H: int, elem: int, device=None) -> int:
     return int(max(1, min(_scan_stage_bytes(device) // max(1, per_step), T)))
 
 
+def _reverse_capture_width(B: int, T: int, H: int, elem: int, device=None) -> int:
+    """Adaptive reverse width that always leaves the initial-state boundary eager.
+
+    ``_reverse_chunk_width`` is a memory-capacity calculation and may legitimately
+    return the complete sequence.  Reverse replay cannot include position zero:
+    that position reads the caller-owned initial state rather than a predecessor
+    in the staged tape.  Derive the capturable tail from the live sequence
+    length instead of rejecting capture whenever the capacity happens to cover
+    all ``T`` positions.
+    """
+    if T <= 1:
+        return 0
+    return min(_reverse_chunk_width(B, T, H, elem, device), T - 1)
+
+
 def _reverse_into_grads(*, reads, grads, outs, initial, carry, recurrent,
                         consts, B, T, H, dtype, device) -> None:
     """Run the whole reverse scan, replaying a captured chunk when possible.
@@ -596,9 +611,9 @@ def _reverse_into_grads(*, reads, grads, outs, initial, carry, recurrent,
         run_eager()
         return
 
-    chunk = _reverse_chunk_width(B, T, H, U.element_size(), device)
+    chunk = _reverse_capture_width(B, T, H, U.element_size(), device)
     # Step 0's chunk is handled eagerly, so a capture needs a full chunk above it.
-    if chunk < _SCAN_GRAPH_MIN_STEPS or T - chunk < 1:
+    if chunk < _SCAN_GRAPH_MIN_STEPS:
         run_eager()
         return
 
@@ -1374,17 +1389,42 @@ class DABSNCoreScanBatchedFused(torch.autograd.Function):
                 hidden=int(Wx.shape[-1]),
             )
         if used_triton:
-            from .triton_runtime import dabsn_core_scan_batched_fused_forward
-
-            tapes = dabsn_core_scan_batched_fused_forward(
-                Wx, Wgx, Ug, A,
-                beta, log_kappa, logit_recover,
-                k_s, k_y, k_b, k_n, k_bias,
-                r_s, r_y, r_b, r_n, r_bias,
-                logit_c_decay, k_c, r_c,
-                logit_alpha, log_lambda, logit_c_suppress,
-                initial_b, initial_e, initial_c,
+            from .triton_runtime import (
+                dabsn_core_scan_batched_fused_forward,
+                is_triton_out_of_resources,
             )
+
+            try:
+                tapes = dabsn_core_scan_batched_fused_forward(
+                    Wx, Wgx, Ug, A,
+                    beta, log_kappa, logit_recover,
+                    k_s, k_y, k_b, k_n, k_bias,
+                    r_s, r_y, r_b, r_n, r_bias,
+                    logit_c_decay, k_c, r_c,
+                    logit_alpha, log_lambda, logit_c_suppress,
+                    initial_b, initial_e, initial_c,
+                )
+            except Exception as exc:
+                if not is_triton_out_of_resources(exc):
+                    raise
+                ctx.used_triton = False
+                from dabsn.runtime.dispatch import warn_routing_once
+
+                warn_routing_once(
+                    "core_scan_fused",
+                    "fused forward exceeds this device's launch resources; "
+                    "using eager batched tape",
+                    hidden=int(Wx.shape[-1]),
+                )
+                tapes = _batched_forward_tapes(
+                    Wx, Wgx, Ug, A,
+                    beta, log_kappa, logit_recover,
+                    k_s, k_y, k_b, k_n, k_bias,
+                    r_s, r_y, r_b, r_n, r_bias,
+                    logit_c_decay, k_c, r_c,
+                    logit_alpha, log_lambda, logit_c_suppress,
+                    initial_b, initial_e, initial_c,
+                )
         else:
             tapes = _batched_forward_tapes(
                 Wx, Wgx, Ug, A,
@@ -1418,12 +1458,13 @@ class DABSNCoreScanBatchedFused(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, *grad_outputs):  # type: ignore[override]
-        # Off the GPU/Triton path (CPU, large H, or Triton disabled) the tapes
-        # came from the eager forward, so use the certified eager reverse. This
-        # is also the escape hatch: DABSN_FUSED_CORE_TRITON_BWD=0 forces it.
+        # Off the GPU/Triton path (CPU, large H, resource fallback, or Triton
+        # disabled) the tapes came from the eager forward, so use the certified
+        # eager reverse. The single-launch Triton reverse remains opt-in until
+        # it has parity across supported GPU architectures.
         use_triton_bwd = (
             getattr(ctx, "used_triton", False)
-            and os.environ.get("DABSN_FUSED_CORE_TRITON_BWD", "1") == "1"
+            and os.environ.get("DABSN_FUSED_CORE_TRITON_BWD", "0") == "1"
         )
         if not use_triton_bwd:
             # If the Triton forward ran but the single-launch reverse is disabled,

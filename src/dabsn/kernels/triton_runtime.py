@@ -720,19 +720,21 @@ _STATE_REG_BUDGET = 64
 
 
 def _fused_max_hidden(device=None, batch_tile: int = 16) -> int:
-    """Largest H the single-launch fused scan can carry -- derived, not declared.
+    """Largest H the implemented single-launch fused scan can carry.
 
     Three fp32 state tiles of ``[batch_tile, H]`` stay live across all T, spread
     over ``num_warps * 32`` threads. So the ceiling is a register-file question:
     solve ``3 * batch_tile * H / threads <= _STATE_REG_BUDGET`` for H and round
-    down to a power of two. A device with a bigger register file per thread gets
-    a wider fused path automatically; nothing here assumes a model size.
+    down to a power of two. Admission is also bounded by ``_ONE_TILE_MAX``,
+    the largest width the shipped fused kernel accepts. Wider shapes use the
+    unbounded batched GEMM scan.
 
-    ``DABSN_FUSED_CORE_MAX_H`` still overrides for experiments.
+    ``DABSN_FUSED_CORE_MAX_H`` may lower admission for experiments, but cannot
+    route an unsupported width into the kernel.
     """
     env = _os.environ.get("DABSN_FUSED_CORE_MAX_H")
     if env not in (None, ""):
-        return int(env)
+        return min(int(env), _ONE_TILE_MAX)
     threads = _fused_num_warps(1 << 30) * 32  # widest tiling => most threads
     max_regs = 255
     try:
@@ -749,7 +751,7 @@ def _fused_max_hidden(device=None, batch_tile: int = 16) -> int:
     raw = budget * threads // (3 * max(1, batch_tile))
     if raw < 16:
         return 16
-    return 1 << (raw.bit_length() - 1)  # round DOWN to a power of two
+    return min(1 << (raw.bit_length() - 1), _ONE_TILE_MAX)
 
 
 # ---------------------------------------------------------------------------
@@ -856,8 +858,12 @@ def _dabsn_core_scan_batched_fused_fwd(
             ugT_k = tl.load(Ug + mat_off, mask=mat_mask, other=0.0)
             aT_k = tl.load(A + mat_off, mask=mat_mask, other=0.0)
             y_k_c = y_k.to(ugT_k.dtype)
-            ug += tl.dot(y_k_c, ugT_k, out_dtype=tl.float32)   # [BLOCK_B, BLOCK_H]
-            ay += tl.dot(y_k_c, aT_k, out_dtype=tl.float32)
+            ug += tl.dot(
+                y_k_c, ugT_k, out_dtype=tl.float32, input_precision="ieee"
+            )                                                  # [BLOCK_B, BLOCK_H]
+            ay += tl.dot(
+                y_k_c, aT_k, out_dtype=tl.float32, input_precision="ieee"
+            )
 
         s = tl.minimum(1.0, tl.maximum(0.0, (wgx + ug) / 6.0 + 0.5))
         novelty = _tl_tanh(_tl_abs(ay - b_state))
@@ -894,13 +900,30 @@ def _dabsn_core_scan_batched_fused_fwd(
 
 
 def _fused_batch_tile(batch: int) -> int:
-    # tl.dot needs the M (batch) tile >= 16; pick the smallest power-of-two tile
-    # >= 16 that covers small batches without excess masked rows.
+    # tl.dot requires an M tile of at least 16. Start with the smallest
+    # power-of-two tile that covers the batch, capped to bound compilation.
     if batch <= 16:
         return 16
     if batch <= 32:
         return 32
     return 64
+
+
+def _fused_batch_tiles(batch: int) -> tuple[int, ...]:
+    """Candidate tiles, largest first, for resource-adaptive compilation."""
+
+    tile = _fused_batch_tile(batch)
+    candidates = []
+    while tile >= 16:
+        candidates.append(tile)
+        tile //= 2
+    return tuple(candidates)
+
+
+def is_triton_out_of_resources(exc: BaseException) -> bool:
+    """Recognize Triton's device-resource rejection without naming a GPU."""
+
+    return isinstance(exc, triton.runtime.errors.OutOfResources)
 
 
 def dabsn_core_scan_batched_fused_forward(
@@ -929,7 +952,6 @@ def dabsn_core_scan_batched_fused_forward(
             f"fused core forward supports one-tile widths (H<= {_ONE_TILE_MAX}); "
             f"got H={H}. Use DABSN_CORE_BACKEND=batched for larger widths."
         )
-    block_b = _fused_batch_tile(B)
     block_k = _block_k(H)
     dev = Wx.device
     f32 = torch.float32
@@ -958,22 +980,33 @@ def dabsn_core_scan_batched_fused_forward(
 
     ug_c = Ug.to(Wx.dtype).contiguous()
     a_c = A.to(Wx.dtype).contiguous()
-    grid = (triton.cdiv(B, block_b),)
-    _dabsn_core_scan_batched_fused_fwd[grid](
-        Wx.contiguous(), Wgx.contiguous(), ug_c, a_c,
-        beta.contiguous(), log_kappa.contiguous(), logit_recover.contiguous(),
-        k_s.contiguous(), k_y.contiguous(), k_b.contiguous(), k_n.contiguous(), k_bias.contiguous(),
-        r_s.contiguous(), r_y.contiguous(), r_b.contiguous(), r_n.contiguous(), r_bias.contiguous(),
-        logit_c_decay.contiguous(), k_c.contiguous(), r_c.contiguous(),
-        initial_b.float().contiguous(), initial_e.float().contiguous(), initial_c.float().contiguous(),
-        final_b, final_e, final_c,
-        U, novelty, p, ay, write, e_tape, c_tape, s_tape,
-        y_scratch,
-        logit_alpha.reshape(()), log_lambda.reshape(()), logit_c_suppress.reshape(()),
-        B, T,
-        H=H, BLOCK_B=block_b, BLOCK_H=block_h, BLOCK_K=block_k,
-        num_warps=_fused_num_warps(block_h),
-    )
+    resource_error = None
+    for block_b in _fused_batch_tiles(B):
+        grid = (triton.cdiv(B, block_b),)
+        try:
+            _dabsn_core_scan_batched_fused_fwd[grid](
+                Wx.contiguous(), Wgx.contiguous(), ug_c, a_c,
+                beta.contiguous(), log_kappa.contiguous(), logit_recover.contiguous(),
+                k_s.contiguous(), k_y.contiguous(), k_b.contiguous(), k_n.contiguous(), k_bias.contiguous(),
+                r_s.contiguous(), r_y.contiguous(), r_b.contiguous(), r_n.contiguous(), r_bias.contiguous(),
+                logit_c_decay.contiguous(), k_c.contiguous(), r_c.contiguous(),
+                initial_b.float().contiguous(), initial_e.float().contiguous(), initial_c.float().contiguous(),
+                final_b, final_e, final_c,
+                U, novelty, p, ay, write, e_tape, c_tape, s_tape,
+                y_scratch,
+                logit_alpha.reshape(()), log_lambda.reshape(()), logit_c_suppress.reshape(()),
+                B, T,
+                H=H, BLOCK_B=block_b, BLOCK_H=block_h, BLOCK_K=block_k,
+                num_warps=_fused_num_warps(block_h),
+            )
+            resource_error = None
+            break
+        except Exception as exc:
+            if not is_triton_out_of_resources(exc):
+                raise
+            resource_error = exc
+    if resource_error is not None:
+        raise resource_error
     # Tapes are already in Wx.dtype (written by the kernel); only the fp32
     # carried state is cast, to keep byte-for-byte parity with
     # `_batched_forward_tapes`.

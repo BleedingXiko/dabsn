@@ -35,6 +35,8 @@ def _introspect_config(model: DABSNModel | DABSNTaskModel) -> DABSNConfig:
             input_adapter=model.input_adapter_kind,
             output_adapter=body.output_adapter_kind,
             layers=[spec.to_metadata() for spec in backbone.layer_specs],
+            residual=bool(backbone.residual),
+            mlp_ratio=backbone.mlp_ratio,
         )
     return DABSNConfig(
         input_dim=int(model.input_dim),
@@ -43,6 +45,8 @@ def _introspect_config(model: DABSNModel | DABSNTaskModel) -> DABSNConfig:
         input_adapter="identity",
         output_adapter=model.output_adapter_kind,
         layers=[spec.to_metadata() for spec in model.backbone.layer_specs],
+        residual=bool(model.backbone.residual),
+        mlp_ratio=model.backbone.mlp_ratio,
     )
 
 
@@ -59,6 +63,8 @@ def dabsn_config_dict(model: Model) -> dict[str, object]:
             "layers": [spec.to_metadata() for spec in model.layers],
             "tie_embeddings": bool(model.tie_embeddings),
             "grad_checkpoint": bool(model.backbone.grad_checkpoint),
+            "residual": bool(model.residual),
+            "mlp_ratio": model.mlp_ratio,
         }
     config = getattr(model, "_dabsn_config", None) or _introspect_config(model)
     data = {name: getattr(config, name) for name in DABSNConfig.__dataclass_fields__}
@@ -83,6 +89,8 @@ def build_dabsn_from_checkpoint_config(config: Mapping[str, object]) -> Model:
             state_dim=config.get("state_dim"),
             tie_embeddings=bool(config.get("tie_embeddings", False)),
             grad_checkpoint=bool(config.get("grad_checkpoint", False)),
+            residual=bool(config.get("residual", False)),
+            mlp_ratio=config.get("mlp_ratio"),
         )
     config_fields = {
         name: value

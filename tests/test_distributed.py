@@ -59,6 +59,8 @@ def test_non_distributed_portable_training_checkpoint(tmp_path):
         [DABSNLayerSpec(7, 6, "seq"), DABSNLayerSpec(8, 7, "field")],
         output_adapter="token",
         grad_checkpoint=True,
+        residual=True,
+        mlp_ratio=2.0,
     )
     groups = dabsn_adamw_param_groups(model, 0.1)
     wrapped = prepare_distributed_model(model, state)
@@ -137,6 +139,8 @@ def test_non_distributed_sharded_training_checkpoint(tmp_path):
         3,
         [DABSNLayerSpec(7, 6, "seq")],
         output_adapter="token",
+        residual=True,
+        mlp_ratio=2.0,
     )
     groups = dabsn_adamw_param_groups(model, 0.1)
     wrapped = prepare_distributed_model(model, state)
@@ -162,6 +166,8 @@ def test_non_distributed_sharded_training_checkpoint(tmp_path):
         3,
         [DABSNLayerSpec(7, 6, "seq")],
         output_adapter="token",
+        residual=True,
+        mlp_ratio=2.0,
     )
     restored_groups = dabsn_adamw_param_groups(restored, 0.1)
     restored_wrapped = prepare_distributed_model(restored, state)
@@ -187,6 +193,8 @@ def test_nested_fsdp_state_names_normalize_to_portable_model_keys():
         3,
         [DABSNLayerSpec(7, 6, "seq"), DABSNLayerSpec(8, 7, "field")],
         output_adapter="token",
+        residual=True,
+        mlp_ratio=2.0,
     )
     wrapped = DABSNSequenceModule(model)
     nested = {}

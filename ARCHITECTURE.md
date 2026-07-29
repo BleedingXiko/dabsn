@@ -20,18 +20,31 @@ Each `DABSNBlock` contains:
 1. `DABSNCore`, a recurrent novelty-budget-plasticity system.
 2. `DABSNRead`, an admitted read over committed writes and carried memory.
 3. A learned read gain and an optional state-width projection.
+4. An optional stack residual and optional post-DABSN residual MLP.
 
 The core emits the recurrent trajectory `cat[y, budget]` together with novelty,
 plasticity, expression, committed write, energy, and saturation signals. The
 read combines admitted short memory, successor induction, permanent associative
 memory, predictive expectation, and recurrent long memory. A block returns:
 
+Let `d = state_to_hidden(y + read_gain * read)`. With both optional additions
+enabled, a block returns:
+
 ```text
-state_to_hidden(y + read_gain * read)
+h   = skip(x) + d
+out = h + fc2(relu(fc1(mlp_rmsnorm(h))) ** 2)
 ```
 
+`skip` is identity at equal widths and a bias-free learned projection when a
+block changes width. `mlp_rmsnorm` belongs only to the MLP branch: the DABSN
+input, recurrence, read, output, and residual trunk are never normalized.
+`fc2` is zero-initialized, so the MLP branch is exactly an identity update at
+initialization. With `mlp_ratio=None`, no MLP or normalization parameters exist;
+with `residual=True` that leaves the pure `skip(x) + dabsn(x)` block.
+
 `DABSNBackbone` stacks blocks with independently selected hidden widths,
-recurrent-state widths, and read geometries.
+recurrent-state widths, and read geometries. `residual` and `mlp_ratio` are
+model-level settings shared by every block; there are no per-block MLP modes.
 
 ## Read geometry
 

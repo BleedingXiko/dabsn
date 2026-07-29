@@ -17,12 +17,39 @@ forward/backward directly, so DABSN's custom-autograd boundaries are preserved.
 
 from __future__ import annotations
 
+import os
 from collections.abc import Callable, Sequence
 
 import torch
 from torch import Tensor, nn
 
 Reduce = Callable[[object], Tensor]
+
+
+def _suspend_nested_scan_graphs():
+    """Give an outer CUDA graph exclusive ownership of capture.
+
+    DABSN's scan graphs are the normal eager-training optimisation.  Building a
+    whole-module graph is a different capture layer: its warmups run on a side
+    stream and must execute the same uncaptured scan structure that the outer
+    recording will see.  Temporarily disabling inner scan capture across the
+    *entire* build window prevents nested graphs and default/capture-stream
+    dependencies.  The caller's policy is restored exactly afterward.
+    """
+
+    key = "DABSN_SCAN_GRAPH"
+    existed = key in os.environ
+    previous = os.environ.get(key)
+    os.environ[key] = "0"
+
+    def restore() -> None:
+        if existed:
+            assert previous is not None
+            os.environ[key] = previous
+        else:
+            os.environ.pop(key, None)
+
+    return restore
 
 
 def _default_reduce(output: object) -> Tensor:
@@ -320,9 +347,12 @@ def make_graphed_train_callable(
     # Recompute must be off for the whole build too: the eager pre-warmup inside
     # _pin_capture_safe_reads, the warmup iters, and the capture all have to run
     # the same structure, and checkpoint recompute is not capturable at all.
-    restore_recompute = _pin_capture_safe_recompute(module)
-    restore_reads = _pin_capture_safe_reads(module, sample_args)
+    restore_scan_graphs = _suspend_nested_scan_graphs()
+    restore_recompute = None
+    restore_reads = None
     try:
+        restore_recompute = _pin_capture_safe_recompute(module)
+        restore_reads = _pin_capture_safe_reads(module, sample_args)
         eager_loss = None
         eager_signature = None
         if verify:
@@ -359,8 +389,11 @@ def make_graphed_train_callable(
                     eager_signature, graph_signature, rtol=grad_rtol, atol=grad_atol
                 )
     finally:
-        restore_reads()
-        restore_recompute()
+        if restore_reads is not None:
+            restore_reads()
+        if restore_recompute is not None:
+            restore_recompute()
+        restore_scan_graphs()
 
     return graphed
 

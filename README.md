@@ -80,6 +80,8 @@ model = DABSNModel(
         DABSNLayerSpec(192, 128, "seq"),
     ],
     output_adapter="token",
+    residual=True,
+    mlp_ratio=4.0,
 ).to(device)
 
 inputs = torch.randn(8, 256, 24, device=device)
@@ -104,6 +106,13 @@ Every model is a normal `torch.nn.Module`. Use the supplied runtime helpers or
 an ordinary PyTorch training loop:
 [`examples/minimal_train.py`](https://github.com/BleedingXiko/dabsn/blob/main/examples/minimal_train.py)
 is the same step written with no DABSN helpers and no native backend.
+
+`residual=True` makes each block return `skip(x) + dabsn(x)`, using a learned
+bias-free projection only when the block changes width. `mlp_ratio=4.0` adds the
+fixed post-DABSN update `h + mlp(mlp_rmsnorm(h))`. The normalization exists only
+inside that MLP branch and never touches DABSN or the residual trunk. Set
+`mlp_ratio=None` (the default) for pure DABSN with no MLP parameters; both new
+settings default off so existing checkpoints retain their original architecture.
 
 ## Model geometry
 

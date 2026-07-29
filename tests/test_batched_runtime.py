@@ -706,6 +706,34 @@ def test_reverse_chunk_width_accounts_for_fp32_grad_staging():
     assert _reverse_chunk_width(B=4, T=8, H=64, elem=2) == 8
 
 
+def test_reverse_capture_width_is_shape_adaptive_and_leaves_step_zero_eager():
+    from dabsn.kernels.batched_runtime import _reverse_capture_width
+
+    for batch in (1, 8, 32, 256):
+        for hidden in (64, 448, 2048):
+            for context in (1, 2, 31, 32, 128, 512, 1024, 4096):
+                width = _reverse_capture_width(
+                    B=batch,
+                    T=context,
+                    H=hidden,
+                    elem=2,
+                )
+                if context == 1:
+                    assert width == 0
+                else:
+                    assert 1 <= width <= context - 1
+
+
+def test_reverse_capture_uses_full_adaptive_tail_when_budget_covers_sequence(
+    monkeypatch,
+):
+    import dabsn.kernels.batched_runtime as runtime
+
+    monkeypatch.setattr(runtime, "_reverse_chunk_width", lambda *args, **kwargs: args[1])
+    for context in (2, 17, 128, 512, 1024):
+        assert runtime._reverse_capture_width(32, context, 448, 2) == context - 1
+
+
 def test_chunk_widths_hold_their_invariants_at_every_shape():
     """Capture must degrade sanely at ANY shape, not just the ones benchmarked.
 

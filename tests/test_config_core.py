@@ -62,8 +62,19 @@ def test_core_carried_state_matches_one_full_sequence() -> None:
         return_final_state=True,
     )
     for full_tensor, left_tensor, right_tensor in zip(full, left, right):
-        assert torch.equal(full_tensor, torch.cat([left_tensor, right_tensor], dim=1))
-    assert all(
-        torch.equal(chunked_state, one_call_state)
-        for chunked_state, one_call_state in zip(final_state, full_state)
-    )
+        # The two calls change the leading GEMM shape. PyTorch may select a
+        # different legal GEMM kernel on another Torch build/device, producing
+        # last-bit float32 rounding while preserving the recurrent trajectory.
+        torch.testing.assert_close(
+            torch.cat([left_tensor, right_tensor], dim=1),
+            full_tensor,
+            rtol=1e-5,
+            atol=1e-6,
+        )
+    for chunked_state, one_call_state in zip(final_state, full_state):
+        torch.testing.assert_close(
+            chunked_state,
+            one_call_state,
+            rtol=1e-5,
+            atol=1e-6,
+        )

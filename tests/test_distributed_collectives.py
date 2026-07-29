@@ -41,13 +41,19 @@ _RANK_TIMEOUT_S = 180
 
 def _build_model() -> DABSNSequenceLM:
     torch.manual_seed(1234)
-    return DABSNSequenceLM(
+    model = DABSNSequenceLM(
         vocab=_VOCAB,
         hidden_dim=_HIDDEN,
         depth=2,
         layers=f"seq:{_HIDDEN}:{_HIDDEN},field:{_HIDDEN}:{_HIDDEN}",
         tie_embeddings=False,
+        residual=True,
+        mlp_ratio=2.0,
     )
+    with torch.no_grad():
+        for block in model.backbone.blocks:
+            block.mlp_fc2.weight.normal_(mean=0.0, std=0.02)
+    return model
 
 
 def _make_batch() -> tuple[torch.Tensor, torch.Tensor]:

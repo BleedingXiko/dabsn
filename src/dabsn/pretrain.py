@@ -207,6 +207,14 @@ def _validate_model_config(model: DABSNSequenceLM, config: DABSNPretrainConfig) 
         mismatches.append(
             f"tie_embeddings checkpoint={model.tie_embeddings} requested={config.tie_embeddings}"
         )
+    if model.residual != config.residual:
+        mismatches.append(
+            f"residual checkpoint={model.residual} requested={config.residual}"
+        )
+    if model.mlp_ratio != config.mlp_ratio:
+        mismatches.append(
+            f"mlp_ratio checkpoint={model.mlp_ratio} requested={config.mlp_ratio}"
+        )
     if mismatches:
         raise ValueError("resume configuration does not match checkpoint: " + "; ".join(mismatches))
 
@@ -338,6 +346,8 @@ def pretrain_next_token(
                 state_dim=config.state_dim,
                 tie_embeddings=config.tie_embeddings,
                 grad_checkpoint=config.grad_checkpoint,
+                residual=config.residual,
+                mlp_ratio=config.mlp_ratio,
             ).to(state.device)
 
         global_tokens_per_step = (

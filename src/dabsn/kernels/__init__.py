@@ -87,9 +87,10 @@ def enable(
 ) -> dict[str, object]:
     """Enable one explicit backend family.
 
-    ``required=True`` refuses missing extensions, the wrong device, and silent
-    fallbacks. Backend switching inside one process is rejected because the
-    runtime installs class-level dispatch hooks.
+    ``required=True`` refuses a missing extension when the backend is enabled.
+    Installed class-level hooks remain device-safe: a later tensor on the other
+    device uses the eager implementation instead of inheriting a stale
+    process-wide ``required`` flag.
     """
 
     global _ACTIVE_BACKEND

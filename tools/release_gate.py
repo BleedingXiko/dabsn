@@ -112,7 +112,19 @@ def _model_reference(
 ) -> tuple[DABSNModel, DABSNModel, torch.Tensor, torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
     torch.manual_seed(20260715)
     layers = [DABSNLayerSpec(8, 8, geometry) for geometry in ("seq", "field", "hybrid")]
-    reference = DABSNModel(5, 3, layers, output_adapter="token").to(device)
+    reference = DABSNModel(
+        5,
+        3,
+        layers,
+        output_adapter="token",
+        residual=True,
+        mlp_ratio=2.0,
+    ).to(device)
+    # The branch is an intentional no-op at initialization. Move fc2 off zero
+    # so this gate also proves every MLP parameter gradient through native cores.
+    with torch.no_grad():
+        for block in reference.backbone.blocks:
+            block.mlp_fc2.weight.normal_(mean=0.0, std=0.02)
     native = copy.deepcopy(reference)
     base = torch.randn(2, 8, 5, device=device)
     reference_input = base.detach().clone().requires_grad_(True)

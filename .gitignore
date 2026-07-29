@@ -14,8 +14,21 @@ paper1/main.out
 # local development virtualenv
 .venv/
 
-# temporary kaggle gate bundle (delete after T4)
-dabsn_kaggle_t4_gate.zip
+# local training experiments, notebooks, and their exported bundles
+/DABSN_*/
+/*.ipynb
+/*.ipynb.*
+
+# generated root-level release, checkpoint, and verification artifacts
+/*.zip
+/*.zip.*
+/*.whl
+/*.pt
+
+# local planning/status notes and notebook generators
+/STATUS.md
+/plans/
+/tools/build_qwen25_dabsn_transplant_notebook.py
 
 # internal scale-proving / benchmarking harness: kept locally for our own
 # measurement, not part of the published framework.
@@ -23,5 +36,5 @@ tools/colab_prove.py
 tools/scale_bench.py
 tools/train_scale_gate.py
 tools/build_scale_gate_bundle.py
+tools/memory_gate.py
 tests/test_scale_bench.py
-dabsn_train_scale_gate.zip

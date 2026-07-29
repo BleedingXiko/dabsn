@@ -144,10 +144,7 @@ def native_core_forward(
     fused forward-only scan. Optional native execution falls back to the
     PyTorch reference path for unsupported inputs.
     """
-    required = bool(getattr(type(core), "_cpu_native_required", False))
     ext = _load_ext()
-    if e_in.is_cuda and required:
-        raise RuntimeError("native CPU DABSN core was required, but received a CUDA tensor")
     if ext is None or e_in.is_cuda:
         return core._eager_forward_from_state(
             e_in,
@@ -327,9 +324,6 @@ def native_three_way_read(self, q, kb, wb, wb_next, cocktail, cb, key_bias_g, ad
     gradients are required.
     """
     ext = _load_ext()
-    required = bool(getattr(type(self), "_cpu_native_required", False))
-    if q.is_cuda and required:
-        raise RuntimeError("native CPU DABSN read was required, but received a CUDA tensor")
     if ext is None or q.is_cuda:
         return _EAGER_THREE_WAY_READ(
             self, q, kb, wb, wb_next, cocktail, cb, key_bias_g, adm_g, scale,
@@ -354,6 +348,7 @@ def native_three_way_read(self, q, kb, wb, wb_next, cocktail, cb, key_bias_g, ad
     # Small fields of up to 64 cells are faster through PyTorch's batched
     # matmul/softmax autograd. Larger admitted banks use the C++ path to avoid
     # Python-side score materialization.
+    required = bool(getattr(type(self), "_cpu_native_required", False))
     if not required and needs_grad and q.shape[1] <= 64 and kb.shape[1] <= 64:
         return _EAGER_THREE_WAY_READ(
             self, q, kb, wb, wb_next, cocktail, cb, key_bias_g, adm_g, scale,

@@ -7,6 +7,7 @@ parity -- the guarantees that make the helper safe for cluster-scale training.
 """
 
 import copy
+import os
 
 import pytest
 import torch
@@ -106,6 +107,27 @@ def test_cpu_passthrough_still_trains_normally():
 def test_empty_sample_args_returns_module_unchanged():
     model = _model()
     assert make_graphed_train_callable(model, ()) is model
+
+
+@pytest.mark.parametrize("initial", [None, "0", "1"])
+def test_outer_graph_build_exclusively_owns_capture_and_restores_policy(
+    monkeypatch, initial
+):
+    from dabsn.runtime.graph import _suspend_nested_scan_graphs
+
+    if initial is None:
+        monkeypatch.delenv("DABSN_SCAN_GRAPH", raising=False)
+    else:
+        monkeypatch.setenv("DABSN_SCAN_GRAPH", initial)
+
+    restore = _suspend_nested_scan_graphs()
+    assert os.environ["DABSN_SCAN_GRAPH"] == "0"
+    restore()
+
+    if initial is None:
+        assert "DABSN_SCAN_GRAPH" not in os.environ
+    else:
+        assert os.environ["DABSN_SCAN_GRAPH"] == initial
 
 
 # --------------------------------------------------------------------------- #

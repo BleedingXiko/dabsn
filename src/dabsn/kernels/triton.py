@@ -156,8 +156,6 @@ def cuda_core_forward(
     return_final_state: bool = False,
 ):
     if not inputs.is_cuda:
-        if bool(getattr(type(core), "_cuda_native_required", False)):
-            raise RuntimeError("Triton DABSN core was required, but received a CPU tensor")
         return _EAGER_CORE_FORWARD_FROM_STATE(
             core,
             inputs,
@@ -289,8 +287,6 @@ def cuda_three_way_read(
     induct_eligible: Tensor | None,
 ) -> Tensor:
     if not query.is_cuda:
-        if bool(getattr(type(read), "_cuda_native_required", False)):
-            raise RuntimeError("Triton DABSN read was required, but received a CPU tensor")
         return _EAGER_THREE_WAY_READ(
             read,
             query,

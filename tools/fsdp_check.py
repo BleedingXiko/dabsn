@@ -70,6 +70,8 @@ def main() -> int:
             layers,
             output_adapter="token",
             grad_checkpoint=True,
+            residual=True,
+            mlp_ratio=2.0,
         ).to(state.device)
         compiled_gradient_rows = verify_gradients(
             raw_model,
@@ -201,6 +203,8 @@ def main() -> int:
             layers,
             output_adapter="token",
             grad_checkpoint=True,
+            residual=True,
+            mlp_ratio=2.0,
         ).to(state.device)
         sharded_groups = dabsn_adamw_param_groups(sharded_raw, 0.1)
         sharded_model = prepare_distributed_model(sharded_raw, state, precision="fp32")
@@ -240,6 +244,8 @@ def main() -> int:
             layers,
             output_adapter="token",
             grad_checkpoint=True,
+            residual=True,
+            mlp_ratio=2.0,
         ).to(state.device)
         amp_groups = dabsn_adamw_param_groups(amp_raw, 0.1)
         amp_model = prepare_distributed_model(amp_raw, state, precision="fp16")
