@@ -44,7 +44,6 @@ class _AdmittedReadParameters(nn.Module):
         self.adm_saturation_gain = _parameter(0.5)
         self.adm_energy_gain = _parameter(0.25)
         self.adm_bias = _parameter(-2.0)
-        self.adm_train_band = _parameter(0.0)
 
     def admission(
         self,
@@ -94,7 +93,6 @@ class DABSNRead(nn.Module):
         self.pad_gain = _parameter(1.0)
         self.short_gain = _parameter(1.0)
         self.induct_gain = _parameter(0.1)
-        self.long_decay = _parameter(0.0)
         self.cocktail_gain = _parameter(1.0)
         if read_geometry == "hybrid":
             self.hybrid_gate = _parameter(0.0)

@@ -217,6 +217,10 @@ def load_dabsn(
     device = torch.device("cpu" if map_location is None else map_location)
     model = build_dabsn_from_checkpoint_config(metadata["config"]).to(device)
     state_dict = load_file(str(source), device=str(device))
+    # Drop parameters removed from the model but present in older checkpoints,
+    # so legacy files still load under strict=True.
+    for stale in [k for k in state_dict if k.rsplit(".", 1)[-1] in {"long_decay", "adm_train_band"}]:
+        del state_dict[stale]
     for duplicate, original in metadata["shared"].items():
         if original not in state_dict:
             raise ValueError(
