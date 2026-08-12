@@ -215,6 +215,16 @@ def _validate_model_config(model: DABSNSequenceLM, config: DABSNPretrainConfig) 
         mismatches.append(
             f"mlp_ratio checkpoint={model.mlp_ratio} requested={config.mlp_ratio}"
         )
+    if model.mlp_middle_depth != config.mlp_middle_depth:
+        mismatches.append(
+            "mlp_middle_depth "
+            f"checkpoint={model.mlp_middle_depth} requested={config.mlp_middle_depth}"
+        )
+    if model.mlp_depth_index != config.mlp_depth_index:
+        mismatches.append(
+            "mlp_depth_index "
+            f"checkpoint={model.mlp_depth_index} requested={config.mlp_depth_index}"
+        )
     if mismatches:
         raise ValueError("resume configuration does not match checkpoint: " + "; ".join(mismatches))
 
@@ -348,6 +358,8 @@ def pretrain_next_token(
                 grad_checkpoint=config.grad_checkpoint,
                 residual=config.residual,
                 mlp_ratio=config.mlp_ratio,
+                mlp_middle_depth=config.mlp_middle_depth,
+                mlp_depth_index=config.mlp_depth_index,
             ).to(state.device)
 
         global_tokens_per_step = (

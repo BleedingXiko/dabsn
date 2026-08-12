@@ -35,6 +35,27 @@ class _MLPRMSNorm(nn.Module):
         return (inputs.float() * scale).to(inputs.dtype) * self.weight
 
 
+class _ResidualMLP(nn.Module):
+    """Standalone copy of the canonical post-DABSN residual MLP branch."""
+
+    def __init__(self, dim: int, ratio: float) -> None:
+        super().__init__()
+        inner_dim = int(round(float(ratio) * int(dim)))
+        if inner_dim <= 0:
+            raise ValueError("mlp_ratio is too small to produce a non-empty MLP")
+        self.dim = int(dim)
+        self.ratio = float(ratio)
+        self.norm = _MLPRMSNorm(self.dim)
+        self.fc1 = nn.Linear(self.dim, inner_dim, bias=False)
+        self.fc2 = nn.Linear(inner_dim, self.dim, bias=False)
+        nn.init.normal_(self.fc1.weight, mean=0.0, std=0.02)
+        nn.init.zeros_(self.fc2.weight)
+
+    def forward(self, inputs: Tensor) -> Tensor:
+        branch = self.fc2(F.relu(self.fc1(self.norm(inputs))).square())
+        return inputs + branch
+
+
 class DABSNBlock(nn.Module):
     """One canonical core plus admitted/permanent/long read."""
 
@@ -275,6 +296,8 @@ class DABSNBackbone(nn.Module):
         *,
         residual: bool = False,
         mlp_ratio: float | None = None,
+        mlp_middle_depth: int = 0,
+        mlp_depth_index: int = 0,
     ) -> None:
         super().__init__()
         self.input_dim = input_dim
@@ -282,6 +305,19 @@ class DABSNBackbone(nn.Module):
         self.grad_checkpoint = grad_checkpoint
         self.residual = bool(residual)
         self.mlp_ratio = None if mlp_ratio is None else float(mlp_ratio)
+        self.mlp_middle_depth = int(mlp_middle_depth)
+        self.mlp_depth_index = int(mlp_depth_index)
+        if self.mlp_middle_depth < 0:
+            raise ValueError("mlp_middle_depth must be non-negative")
+        if self.mlp_middle_depth:
+            if self.mlp_ratio is None:
+                raise ValueError("mlp_middle_depth requires mlp_ratio")
+            if len(self.layer_specs) < 2:
+                raise ValueError("mlp_middle_depth requires at least two DABSN blocks")
+            if not 0 <= self.mlp_depth_index < len(self.layer_specs) - 1:
+                raise ValueError(
+                    "mlp_depth_index must select a DABSN block before the final block"
+                )
         blocks: list[DABSNBlock] = []
         width = input_dim
         for spec in self.layer_specs:
@@ -297,6 +333,14 @@ class DABSNBackbone(nn.Module):
             )
             width = spec.hidden_dim
         self.blocks = nn.ModuleList(blocks)
+        if self.mlp_middle_depth:
+            middle_width = self.layer_specs[self.mlp_depth_index].hidden_dim
+            self.middle_mlps = nn.ModuleList(
+                _ResidualMLP(middle_width, self.mlp_ratio)
+                for _ in range(self.mlp_middle_depth)
+            )
+        else:
+            self.middle_mlps = nn.ModuleList()
         self.output_dim = width
 
     @torch.compiler.disable
@@ -320,11 +364,17 @@ class DABSNBackbone(nn.Module):
         # without that helper, so the step degrades to plain (correct, heavier)
         # activations instead of corrupting the recorded graph.
         recompute = self.grad_checkpoint and self.training and not _stream_is_capturing()
-        for block in self.blocks:
+        for index, block in enumerate(self.blocks):
             if recompute:
                 hidden = checkpoint(block, hidden, use_reentrant=False)
             else:
                 hidden = block(hidden)
+            if index == self.mlp_depth_index:
+                for mlp in self.middle_mlps:
+                    if recompute:
+                        hidden = checkpoint(mlp, hidden, use_reentrant=False)
+                    else:
+                        hidden = mlp(hidden)
         if field_rank and hidden.dim() > 2:
             return hidden.reshape(batch, height, width, -1)
         return hidden
@@ -355,6 +405,8 @@ class DABSNModel(nn.Module):
         grad_checkpoint: bool = False,
         residual: bool = False,
         mlp_ratio: float | None = None,
+        mlp_middle_depth: int = 0,
+        mlp_depth_index: int = 0,
     ) -> None:
         super().__init__()
         self.input_dim = input_dim
@@ -366,6 +418,8 @@ class DABSNModel(nn.Module):
             grad_checkpoint,
             residual=residual,
             mlp_ratio=mlp_ratio,
+            mlp_middle_depth=mlp_middle_depth,
+            mlp_depth_index=mlp_depth_index,
         )
         self.output_adapter = build_output_head(
             output_adapter,
@@ -435,6 +489,8 @@ class DABSNTaskModel(nn.Module):
         grad_checkpoint: bool = False,
         residual: bool = False,
         mlp_ratio: float | None = None,
+        mlp_middle_depth: int = 0,
+        mlp_depth_index: int = 0,
     ) -> None:
         super().__init__()
         self.raw_input_dim = int(raw_input_dim)
@@ -455,6 +511,8 @@ class DABSNTaskModel(nn.Module):
             grad_checkpoint=grad_checkpoint,
             residual=residual,
             mlp_ratio=mlp_ratio,
+            mlp_middle_depth=mlp_middle_depth,
+            mlp_depth_index=mlp_depth_index,
         )
 
     @property
@@ -512,6 +570,8 @@ class DABSNSequenceLM(nn.Module):
         grad_checkpoint: bool = False,
         residual: bool = False,
         mlp_ratio: float | None = None,
+        mlp_middle_depth: int = 0,
+        mlp_depth_index: int = 0,
     ) -> None:
         super().__init__()
         self.block_name = "dabsn"
@@ -521,6 +581,8 @@ class DABSNSequenceLM(nn.Module):
         self.tie_embeddings = bool(tie_embeddings)
         self.residual = bool(residual)
         self.mlp_ratio = None if mlp_ratio is None else float(mlp_ratio)
+        self.mlp_middle_depth = int(mlp_middle_depth)
+        self.mlp_depth_index = int(mlp_depth_index)
         self.layers = resolve_dabsn_layers(
             layers=layers,
             hidden_dim=self.hidden_dim,
@@ -537,6 +599,8 @@ class DABSNSequenceLM(nn.Module):
             grad_checkpoint=grad_checkpoint,
             residual=self.residual,
             mlp_ratio=self.mlp_ratio,
+            mlp_middle_depth=self.mlp_middle_depth,
+            mlp_depth_index=self.mlp_depth_index,
         )
         self.readout = nn.Linear(self.backbone.output_dim, self.vocab)
         if self.tie_embeddings and self.backbone.output_dim == self.hidden_dim:
@@ -595,6 +659,8 @@ def build_dabsn(
     grad_checkpoint: bool = False,
     residual: bool = False,
     mlp_ratio: float | None = None,
+    mlp_middle_depth: int = 0,
+    mlp_depth_index: int = 0,
 ) -> DABSNModel:
     config = DABSNConfig(
         input_dim=input_dim,
@@ -606,6 +672,8 @@ def build_dabsn(
         output_adapter=output_adapter,
         residual=residual,
         mlp_ratio=mlp_ratio,
+        mlp_middle_depth=mlp_middle_depth,
+        mlp_depth_index=mlp_depth_index,
     )
     return build_dabsn_from_config(config, grad_checkpoint=grad_checkpoint)
 
@@ -629,6 +697,8 @@ def build_dabsn_from_config(
             grad_checkpoint=grad_checkpoint,
             residual=config.residual,
             mlp_ratio=config.mlp_ratio,
+            mlp_middle_depth=config.mlp_middle_depth,
+            mlp_depth_index=config.mlp_depth_index,
         )
     else:
         model = DABSNModel(
@@ -639,6 +709,8 @@ def build_dabsn_from_config(
             grad_checkpoint=grad_checkpoint,
             residual=config.residual,
             mlp_ratio=config.mlp_ratio,
+            mlp_middle_depth=config.mlp_middle_depth,
+            mlp_depth_index=config.mlp_depth_index,
         )
     model._dabsn_config = config
     return model

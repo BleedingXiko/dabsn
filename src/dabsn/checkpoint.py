@@ -37,6 +37,8 @@ def _introspect_config(model: DABSNModel | DABSNTaskModel) -> DABSNConfig:
             layers=[spec.to_metadata() for spec in backbone.layer_specs],
             residual=bool(backbone.residual),
             mlp_ratio=backbone.mlp_ratio,
+            mlp_middle_depth=backbone.mlp_middle_depth,
+            mlp_depth_index=backbone.mlp_depth_index,
         )
     return DABSNConfig(
         input_dim=int(model.input_dim),
@@ -47,6 +49,8 @@ def _introspect_config(model: DABSNModel | DABSNTaskModel) -> DABSNConfig:
         layers=[spec.to_metadata() for spec in model.backbone.layer_specs],
         residual=bool(model.backbone.residual),
         mlp_ratio=model.backbone.mlp_ratio,
+        mlp_middle_depth=model.backbone.mlp_middle_depth,
+        mlp_depth_index=model.backbone.mlp_depth_index,
     )
 
 
@@ -65,6 +69,8 @@ def dabsn_config_dict(model: Model) -> dict[str, object]:
             "grad_checkpoint": bool(model.backbone.grad_checkpoint),
             "residual": bool(model.residual),
             "mlp_ratio": model.mlp_ratio,
+            "mlp_middle_depth": int(model.mlp_middle_depth),
+            "mlp_depth_index": int(model.mlp_depth_index),
         }
     config = getattr(model, "_dabsn_config", None) or _introspect_config(model)
     data = {name: getattr(config, name) for name in DABSNConfig.__dataclass_fields__}
@@ -91,6 +97,8 @@ def build_dabsn_from_checkpoint_config(config: Mapping[str, object]) -> Model:
             grad_checkpoint=bool(config.get("grad_checkpoint", False)),
             residual=bool(config.get("residual", False)),
             mlp_ratio=config.get("mlp_ratio"),
+            mlp_middle_depth=int(config.get("mlp_middle_depth", 0)),
+            mlp_depth_index=int(config.get("mlp_depth_index", 0)),
         )
     config_fields = {
         name: value

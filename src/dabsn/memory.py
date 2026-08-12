@@ -155,6 +155,8 @@ def fingerprint_of(model: DABSNSequenceLM) -> dict[str, object]:
         "tie_embeddings": bool(model.tie_embeddings),
         "residual": bool(model.residual),
         "mlp_ratio": model.mlp_ratio,
+        "mlp_middle_depth": int(model.mlp_middle_depth),
+        "mlp_depth_index": int(model.mlp_depth_index),
     }
 
 
@@ -167,6 +169,8 @@ def _check_fingerprint(memory: DABSNMemory, model: DABSNSequenceLM) -> None:
     # architecture, so missing keys normalize to the backward-compatible defaults.
     observed.setdefault("residual", False)
     observed.setdefault("mlp_ratio", None)
+    observed.setdefault("mlp_middle_depth", 0)
+    observed.setdefault("mlp_depth_index", 0)
     if observed != expected:
         mismatched = [
             f"{key}: memory={observed.get(key)!r} model={value!r}"
@@ -315,6 +319,9 @@ def _run(
                 hidden, state[index] = _ingest_block(
                     block, hidden, state[index], position
                 )
+                if index == model.backbone.mlp_depth_index:
+                    for mlp in model.backbone.middle_mlps:
+                        hidden = mlp(hidden)
             outputs.append(hidden)
             position += stop - start
 

@@ -114,6 +114,34 @@ inside that MLP branch and never touches DABSN or the residual trunk. Set
 `mlp_ratio=None` (the default) for pure DABSN with no MLP parameters; both new
 settings default off so existing checkpoints retain their original architecture.
 
+For a DABSN front/rear pair with ordinary nonlinear processing in between, set
+`mlp_middle_depth` to the number of standalone residual MLP blocks and
+`mlp_depth_index` to the zero-based DABSN block after which they run. The middle
+blocks use the same `mlp_ratio`, RMSNorm, ReLU-squared, bias-free projections,
+and zero-initialized output projection as the post-DABSN branch:
+
+```python
+from dabsn import DABSNSequenceLM
+
+# DABSN[0] -> 20 MLP blocks -> DABSN[1]
+model = DABSNSequenceLM(
+    vocab=50_257,
+    hidden_dim=768,
+    depth=2,
+    layers="seq:768:768,seq:768:768",
+    residual=True,
+    mlp_ratio=4.0,
+    mlp_middle_depth=20,
+    mlp_depth_index=0,
+    tie_embeddings=False,
+)
+```
+
+`layers` continues to list DABSN blocks only. With a middle depth of zero
+(the default), the insertion index has no effect and existing behavior is
+unchanged. Carried `.dmem` memory likewise remains one bank per DABSN block;
+the stateless middle MLPs add no per-token memory.
+
 ## Model geometry
 
 Each layer owns an output width, recurrent-state width, and read geometry.

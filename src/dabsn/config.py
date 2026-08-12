@@ -10,6 +10,28 @@ from typing import Mapping, Sequence
 DABSN_ARCH = "dabsn"
 
 
+def _validate_middle_mlp(
+    *,
+    mlp_ratio: float | None,
+    mlp_middle_depth: int,
+    mlp_depth_index: int,
+    dabsn_depth: int,
+) -> None:
+    middle_depth = int(mlp_middle_depth)
+    if middle_depth < 0:
+        raise ValueError("mlp_middle_depth must be non-negative")
+    if middle_depth == 0:
+        return
+    if mlp_ratio is None:
+        raise ValueError("mlp_middle_depth requires mlp_ratio")
+    if int(dabsn_depth) < 2:
+        raise ValueError("mlp_middle_depth requires at least two DABSN blocks")
+    if not 0 <= int(mlp_depth_index) < int(dabsn_depth) - 1:
+        raise ValueError(
+            "mlp_depth_index must select a DABSN block before the final block"
+        )
+
+
 @dataclass(frozen=True)
 class DABSNLayerSpec:
     """Width and read geometry for one canonical DABSN block."""
@@ -172,6 +194,8 @@ class DABSNConfig:
     layers: list[DABSNLayerSpec | Mapping[str, object]] = field(default_factory=list)
     residual: bool = False
     mlp_ratio: float | None = None
+    mlp_middle_depth: int = 0
+    mlp_depth_index: int = 0
 
     def __post_init__(self) -> None:
         if self.input_dim <= 0 or self.out_dim <= 0:
@@ -182,6 +206,12 @@ class DABSNConfig:
             raise ValueError("geometry must be seq, field, or hybrid")
         if self.mlp_ratio is not None and float(self.mlp_ratio) <= 0:
             raise ValueError("mlp_ratio must be positive or None")
+        _validate_middle_mlp(
+            mlp_ratio=self.mlp_ratio,
+            mlp_middle_depth=self.mlp_middle_depth,
+            mlp_depth_index=self.mlp_depth_index,
+            dabsn_depth=len(self.layer_specs()),
+        )
 
     def layer_specs(self) -> list[DABSNLayerSpec]:
         if self.layers:
@@ -218,6 +248,8 @@ class DABSNPretrainConfig:
     tie_embeddings: bool = True
     residual: bool = False
     mlp_ratio: float | None = None
+    mlp_middle_depth: int = 0
+    mlp_depth_index: int = 0
     train_context: int = 2048
     eval_contexts: tuple[int, ...] = ()
     steps: int = 16_000
@@ -283,6 +315,12 @@ class DABSNPretrainConfig:
             raise ValueError("precision must be auto, fp32, fp16, or bf16")
         if self.mlp_ratio is not None and float(self.mlp_ratio) <= 0:
             raise ValueError("mlp_ratio must be positive or None")
+        _validate_middle_mlp(
+            mlp_ratio=self.mlp_ratio,
+            mlp_middle_depth=self.mlp_middle_depth,
+            mlp_depth_index=self.mlp_depth_index,
+            dabsn_depth=len(self.layer_specs()),
+        )
         if any(int(context) <= 0 for context in self.eval_contexts):
             raise ValueError("eval_contexts must contain positive lengths")
         if self.checkpoint_every < 0 or self.log_every < 0 or self.val_every < 0:

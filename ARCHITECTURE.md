@@ -46,6 +46,20 @@ with `residual=True` that leaves the pure `skip(x) + dabsn(x)` block.
 recurrent-state widths, and read geometries. `residual` and `mlp_ratio` are
 model-level settings shared by every block; there are no per-block MLP modes.
 
+## Optional interposed MLP tower
+
+`mlp_middle_depth` inserts that many ordinary residual MLP blocks after the
+DABSN block selected by zero-based `mlp_depth_index`. The configured DABSN list
+remains DABSN-only: with two blocks and an index of zero, execution is
+`DABSN[0] -> middle MLPs -> DABSN[1]`. The tower uses the selected block's output
+width, which is already the following DABSN block's input width, and uses the
+same `mlp_ratio` contract above. At depth zero it is absent without changing
+existing parameters or execution.
+
+The tower is stateless. `dabsn.memory` replays it at the same boundary during
+carried inference, but `.dmem` continues to store exactly one carried state and
+read bank per configured DABSN block.
+
 ## Read geometry
 
 Geometry changes memory eligibility, not the core recurrence:
