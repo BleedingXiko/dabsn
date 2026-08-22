@@ -235,6 +235,6 @@ __all__ = [
     "verify_gradients",
 ]
 
-__version__ = "0.1.7"
+__version__ = "0.1.8"
 
 register_builtin_components()

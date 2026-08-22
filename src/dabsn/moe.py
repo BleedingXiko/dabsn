@@ -184,13 +184,19 @@ class GenericExpertGroup(nn.Module):
             positions = torch.nonzero(expert_ids == expert_index, as_tuple=False).flatten()
             if positions.numel() == 0:
                 continue
-            values = expert(inputs.index_select(0, positions))
-            if values.shape != inputs.index_select(0, positions).shape:
+            routed = inputs.index_select(0, positions)
+            values = expert(routed)
+            if values.shape != routed.shape:
                 raise ValueError(
                     f"expert {expert_index} changed routed item shape from "
-                    f"{tuple(inputs.index_select(0, positions).shape)} to {tuple(values.shape)}"
+                    f"{tuple(routed.shape)} to {tuple(values.shape)}"
                 )
-            output.index_copy_(0, positions, values)
+            # An expert is arbitrary user code and under autocast it will return
+            # the autocast dtype while the routed items are still the master
+            # dtype. Every expert's result lands in one buffer, so the group --
+            # not the expert -- owns that conversion. This is the same contract
+            # the grouped MLP path keeps with its own `.to(inputs.dtype)`.
+            output.index_copy_(0, positions, values.to(output.dtype))
         return output
 
     def __len__(self) -> int:

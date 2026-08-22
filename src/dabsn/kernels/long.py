@@ -407,16 +407,27 @@ def _linear_recurrence_setup(ctx, inputs, output) -> None:
     ctx.save_for_backward(*inputs)
 
 
+@torch.library.custom_op("dabsn::_linrec_backward", mutates_args=())
+def _linrec_bwd_op(a: Tensor, g: Tensor, y_init: Tensor, grad_out: Tensor) -> list[Tensor]:
+    """Opaque backward boundary so torch.compile/AOT-autograd never traces into Triton."""
+    if a.is_cuda:
+        da, dg, dy = _triton_linrec_backward(a, g, y_init, grad_out)
+    else:
+        da, dg, dy = _linrec_backward(a, g, y_init, grad_out)
+    return [da, dg, dy]
+
+
+@_linrec_bwd_op.register_fake
+def _linrec_bwd_op_fake(a: Tensor, g: Tensor, y_init: Tensor, grad_out: Tensor) -> list[Tensor]:
+    return [torch.empty_like(a), torch.empty_like(g), torch.empty_like(y_init)]
+
+
 def _linear_recurrence_registered_backward(ctx, grad_out: Tensor):
     a, g, y_init = ctx.saved_tensors
-    if a.is_cuda:
-        return _triton_linrec_backward(
-            a.contiguous(),
-            g.contiguous(),
-            y_init.contiguous(),
-            grad_out.contiguous(),
-        )
-    return _linrec_backward(a, g, y_init, grad_out.contiguous())
+    da, dg, dy = _linrec_bwd_op(
+        a.contiguous(), g.contiguous(), y_init.contiguous(), grad_out.contiguous()
+    )
+    return da, dg, dy
 
 
 torch.library.register_autograd(

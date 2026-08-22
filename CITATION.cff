@@ -2,7 +2,7 @@ cff-version: 1.2.0
 message: "If you use DABSN or its native runtime, please cite this software and the accompanying paper."
 title: "DABSN: Persistent-Modulation Sequence and Field Modeling"
 type: software
-version: 0.1.7
+version: 0.1.8
 date-released: 2026-08-21
 license: Apache-2.0
 url: "https://github.com/BleedingXiko/dabsn"
