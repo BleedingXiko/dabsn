@@ -35,13 +35,9 @@ def test_gather_before_normalize_is_bit_identical():
     gather_hidden = idx.unsqueeze(-1).expand(-1, -1, H)
 
     # new order: gather then normalize
-    keys_new = torch.nn.functional.normalize(
-        torch.gather(write_a, 1, gather_hidden), dim=-1
-    )
+    keys_new = torch.nn.functional.normalize(torch.gather(write_a, 1, gather_hidden), dim=-1)
     # old order: normalize then gather
-    keys_old = torch.gather(
-        torch.nn.functional.normalize(write_b, dim=-1), 1, gather_hidden
-    )
+    keys_old = torch.gather(torch.nn.functional.normalize(write_b, dim=-1), 1, gather_hidden)
     assert torch.equal(keys_new, keys_old)
 
     grad = torch.randn_like(keys_new)
@@ -52,8 +48,19 @@ def test_gather_before_normalize_is_bit_identical():
 
 def _ref(read, query, mk, wm, nwm, rc, mc, kbias, adm, scale, allow, ind):
     return read._three_way_read(
-        query, mk, wm, nwm, rc, mc, kbias, adm, scale,
-        allow, ind, allow.any(dim=-1), ind.any(dim=-1),
+        query,
+        mk,
+        wm,
+        nwm,
+        rc,
+        mc,
+        kbias,
+        adm,
+        scale,
+        allow,
+        ind,
+        allow.any(dim=-1),
+        ind.any(dim=-1),
     )
 
 
@@ -70,9 +77,7 @@ def test_reference_read_is_query_chunkable(geometry):
     adm = torch.randn(B, N)
     scale = torch.tensor(1.2)
     bank_idx = torch.tensor([[0, 1, 3, 4, 5], [0, 2, 3, 4, 5]])
-    bank_valid = torch.tensor(
-        [[True, True, False, True, True], [True, True, True, False, True]]
-    )
+    bank_valid = torch.tensor([[True, True, False, True, True], [True, True, True, False, True]])
     qpos = torch.arange(T).view(1, T, 1)
     allow = bank_valid.unsqueeze(1) & (bank_idx.unsqueeze(1) <= qpos)
     ind = bank_valid.unsqueeze(1) & (bank_idx.unsqueeze(1) < qpos)
@@ -82,10 +87,22 @@ def test_reference_read_is_query_chunkable(geometry):
         pieces = []
         for t0 in range(0, T, chunk):
             t1 = min(T, t0 + chunk)
-            pieces.append(_ref(
-                read, query[:, t0:t1], mk, wm, nwm, rc[:, t0:t1], mc,
-                kbias, adm, scale, allow[:, t0:t1], ind[:, t0:t1],
-            ))
+            pieces.append(
+                _ref(
+                    read,
+                    query[:, t0:t1],
+                    mk,
+                    wm,
+                    nwm,
+                    rc[:, t0:t1],
+                    mc,
+                    kbias,
+                    adm,
+                    scale,
+                    allow[:, t0:t1],
+                    ind[:, t0:t1],
+                )
+            )
         chunked = torch.cat(pieces, dim=1)
         # Query rows are independent given the bank, so tiling is mathematically
         # exact; the only gap is float rounding from differing reduction shapes.
@@ -104,19 +121,35 @@ def test_inference_read_respects_the_score_budget(monkeypatch):
     """
     from dabsn.kernels import triton as kt
 
-    src = inspect.getsource(kt.cuda_three_way_read)
+    src = inspect.getsource(kt.cuda_compact_three_way_read)
     grad_split = src.index("if torch.is_grad_enabled():")
     infer_half = src[grad_split:]
     # The budget helper must be defined BEFORE the grad split (shared by both),
     # and the forward-only half must actually consult it.
-    assert "_query_chunk_t" in src[:grad_split], (
+    assert "dense_limit" in src[:grad_split], (
         "the score budget must be computed before the grad-mode split so the "
         "forward-only path can use it too"
     )
-    assert "_query_chunk_t" in infer_half and "_chunked_dense" in infer_half, (
+    assert "admitted_three_way_read_compact_dense_bmm" in infer_half, (
         "the forward-only read path must tile queries under the score budget; "
         "without it a large-batch forward allocates the full [B,T,N] scores"
     )
+
+
+def test_cuda_enable_does_not_replace_read_method():
+    from dabsn.kernels import triton as kt
+
+    source = inspect.getsource(kt.enable_triton_kernels)
+    assert 'setattr(DABSNRead, "_three_way_read"' not in source
+    dispatch = inspect.getsource(kt.cuda_compact_three_way_read)
+    assert "_compact_bank_idx" not in dispatch
+    assert "_compact_bank_valid" not in dispatch
+    assert "admitted_three_way_read_compact_flash(" in dispatch
+    assert "admitted_three_way_read_compact_dense_bmm(" in dispatch
+    assert '"registered_compact_flash_trainable"' in dispatch
+    assert '"registered_compact_flash_infer"' in dispatch
+    assert '"registered_dense_bmm_infer"' in dispatch
+    assert "runtime.admitted_three_way_read_dispatch(" not in dispatch
 
 
 def test_read_weight_normalization_allocates_no_extra_full_tensors():
@@ -138,9 +171,11 @@ def test_read_weight_normalization_allocates_no_extra_full_tensors():
     # is textual and must hold everywhere the file ships.
     import dabsn.kernels as _k
 
-    path = pathlib.Path(_k.__file__).with_name("triton_runtime.py")
+    kernel_dir = pathlib.Path(_k.__file__).parent
     code = "\n".join(
-        line for line in path.read_text().splitlines()
+        line
+        for path in (kernel_dir / "triton_runtime.py", kernel_dir / "compact_admitted.py")
+        for line in path.read_text().splitlines()
         if not line.lstrip().startswith("#")
     )
     # No third/fourth/fifth [B,T,N] buffer for the eligibility fixup.
@@ -148,8 +183,7 @@ def test_read_weight_normalization_allocates_no_extra_full_tensors():
     assert "torch.zeros_like(weights)" not in code
     assert "torch.nan_to_num(w), torch.zeros_like(w)" not in code
     # The zeroing lands on the read vector, which bmm does not save.
-    assert ".float().mul_(elig)" in code
-    assert "torch.bmm(weights, values).mul_(elig.unsqueeze(-1))" in code
+    assert "torch.bmm(weights.to(values.dtype), values).float().mul_(eligible)" in code
     # Finite-minimum masking, so there is no NaN to repair after the softmax.
     assert code.count("torch.finfo(scores.dtype).min") >= 1
-    assert "neg = torch.finfo(scores.dtype).min" in code
+    assert "minimum = torch.finfo(scores.dtype).min" in code

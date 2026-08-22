@@ -6,8 +6,6 @@ silent fall-off from a fast path is announced exactly once per distinct
 logs, yet an operator can always see *why* a given backend was chosen and when a
 CUDA call quietly dropped to a slower path.
 
-This module deliberately has no DABSN imports (only stdlib) so any layer -- the
-kernels, the model, the tools -- can import it without a circular dependency.
 Set ``DABSN_SILENCE_ROUTING=1`` to mute it entirely.
 """
 
@@ -41,11 +39,23 @@ def _once(key: tuple) -> bool:
 
 def log_routing_once(component: str, decision: str, **fields) -> None:
     """Announce a backend selection once per (component, decision, shape)."""
-    if _silenced():
-        return
     key = ("route", component, decision, tuple(sorted(fields.items())))
     if _once(key):
-        _LOG.info("DABSN routing [%s] -> %s  %s", component, decision, _fields_str(fields))
+        from dabsn.events import EventCode, emit_event
+
+        emit_event(
+            EventCode.KERNEL_SELECTION,
+            component_id=component,
+            selected_path=decision,
+            **fields,
+        )
+        if not _silenced():
+            _LOG.info(
+                "DABSN routing [%s] -> %s  %s",
+                component,
+                decision,
+                _fields_str(fields),
+            )
 
 
 def warn_routing_once(component: str, message: str, **fields) -> None:
@@ -55,13 +65,40 @@ def warn_routing_once(component: str, message: str, **fields) -> None:
     dropping to the eager scan, an explicit backend request being overridden for
     safety -- with a concrete, actionable reason.
     """
-    if _silenced():
-        return
     key = ("warn", component, message, tuple(sorted(fields.items())))
     if _once(key):
-        _LOG.warning(
-            "DABSN routing WARNING [%s]: %s  %s", component, message, _fields_str(fields)
+        from dabsn.events import EventCode, emit_event
+
+        event_fields = dict(fields)
+        requested_path = str(
+            event_fields.pop("requested_path", event_fields.pop("requested_backend", "optimized"))
         )
+        selected_path = str(
+            event_fields.pop("selected_path", event_fields.pop("selected_backend", "reference"))
+        )
+        corrective_action = str(
+            event_fields.pop(
+                "corrective_action",
+                "inspect the capability report and select a supported backend explicitly",
+            )
+        )
+        emit_event(
+            EventCode.PERFORMANCE_FALLBACK,
+            component_id=component,
+            fallback=True,
+            reason=message,
+            requested_path=requested_path,
+            selected_path=selected_path,
+            corrective_action=corrective_action,
+            **event_fields,
+        )
+        if not _silenced():
+            _LOG.warning(
+                "DABSN routing WARNING [%s]: %s  %s",
+                component,
+                message,
+                _fields_str(fields),
+            )
 
 
 def reset_routing_log() -> None:

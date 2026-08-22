@@ -10,6 +10,7 @@ from torch import Tensor
 try:
     import triton
     import triton.language as tl
+
     _HAS_TRITON = True
     _TRITON_IMPORT_ERROR = None
 except Exception as exc:
@@ -66,9 +67,7 @@ def _scan_forward(k: Tensor, v: Tensor, beta: Tensor) -> Tensor:
     return torch.stack(outs, dim=1)
 
 
-def _scan_backward(
-    k: Tensor, v: Tensor, beta: Tensor, g: Tensor
-) -> Tuple[Tensor, Tensor, Tensor]:
+def _scan_backward(k: Tensor, v: Tensor, beta: Tensor, g: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
     """Analytic reverse pass. g = dL/d(recons) [B,T,h] -> (dk, dv, dbeta).
 
     Recomputes the S_i stack forward (O(T*h^2) transient, freed at return), then
@@ -100,14 +99,14 @@ def _scan_backward(
         bi = beta[:, i].view(b, 1)
         ei = vi - ri
 
-        Ak = torch.einsum("bvk,bk->bv", A, ki)                # A k_i              [B,h_v]
-        dv[:, i, :] = (bi * Ak)
-        dbeta[:, i] = torch.einsum("bv,bv->b", Ak, ei)        # <A k_i, e_i>
+        Ak = torch.einsum("bvk,bk->bv", A, ki)  # A k_i              [B,h_v]
+        dv[:, i, :] = bi * Ak
+        dbeta[:, i] = torch.einsum("bv,bv->b", Ak, ei)  # <A k_i, e_i>
 
-        Stg = torch.einsum("bvk,bv->bk", Si, gi)              # S_i^T g_i          [B,h_k]
-        AtV = torch.einsum("bvk,bv->bk", A, vi)               # A^T v_i            [B,h_k]
-        StAk = torch.einsum("bvk,bv->bk", Si, Ak)             # S_i^T (A k_i)      [B,h_k]
-        AtSk = torch.einsum("bvk,bv->bk", A, ri)              # A^T (S_i k_i)      [B,h_k]
+        Stg = torch.einsum("bvk,bv->bk", Si, gi)  # S_i^T g_i          [B,h_k]
+        AtV = torch.einsum("bvk,bv->bk", A, vi)  # A^T v_i            [B,h_k]
+        StAk = torch.einsum("bvk,bv->bk", Si, Ak)  # S_i^T (A k_i)      [B,h_k]
+        AtSk = torch.einsum("bvk,bv->bk", A, ri)  # A^T (S_i k_i)      [B,h_k]
         dk[:, i, :] = Stg + bi * AtV - bi * (StAk + AtSk)
 
         # A_i = g_i k_i^T + A - beta_i (A k_i) k_i^T
@@ -126,41 +125,63 @@ if _HAS_TRITON:
 
     @triton.jit
     def _permanent_fwd_kernel(
-        K, V, BETA, OUT,
-        B, T, H,
-        stride_kb, stride_kt, stride_kh,
-        stride_bb, stride_bt,
-        BV: tl.constexpr, BH: tl.constexpr,
+        K,
+        V,
+        BETA,
+        OUT,
+        B,
+        T,
+        H,
+        stride_kb,
+        stride_kt,
+        stride_kh,
+        stride_bb,
+        stride_bt,
+        BV: tl.constexpr,
+        BH: tl.constexpr,
     ):
         # program owns one batch and a BV-block of value rows; holds that slab of
         # state [BV, H] in registers and streams the whole sequence through it.
         pid_b = tl.program_id(0)
         pid_v = tl.program_id(1)
-        v_off = pid_v * BV + tl.arange(0, BV)        # [BV] value-dim rows
-        h_off = tl.arange(0, BH)                     # [BH] key-dim cols
+        v_off = pid_v * BV + tl.arange(0, BV)  # [BV] value-dim rows
+        h_off = tl.arange(0, BH)  # [BH] key-dim cols
         v_mask = v_off < H
         h_mask = h_off < H
         state = tl.zeros((BV, BH), dtype=tl.float32)  # fast-weight slab S[v,k]
         for i in range(0, T):
             kp = K + pid_b * stride_kb + i * stride_kt + h_off * stride_kh
-            ki = tl.load(kp, mask=h_mask, other=0.0)              # [BH]
-            recon = tl.sum(state * ki[None, :], axis=1)           # [BV]  S_i k_i
+            ki = tl.load(kp, mask=h_mask, other=0.0)  # [BH]
+            recon = tl.sum(state * ki[None, :], axis=1)  # [BV]  S_i k_i
             op = OUT + pid_b * stride_kb + i * stride_kt + v_off * stride_kh
             tl.store(op, recon, mask=v_mask)
             vp = V + pid_b * stride_kb + i * stride_kt + v_off * stride_kh
-            vi = tl.load(vp, mask=v_mask, other=0.0)              # [BV]
+            vi = tl.load(vp, mask=v_mask, other=0.0)  # [BV]
             bp = BETA + pid_b * stride_bb + i * stride_bt
             bi = tl.load(bp)
-            err = vi - recon                                      # [BV]
-            state = state + bi * err[:, None] * ki[None, :]       # rank-1 delta update
+            err = vi - recon  # [BV]
+            state = state + bi * err[:, None] * ki[None, :]  # rank-1 delta update
 
     @triton.jit
     def _permanent_bwd_kernel(
-        K, V, BETA, GRAD_OUT, DKEY, DVALUE, DBETA, STATE_TAPE,
-        B, T, H,
-        stride_kb, stride_kt, stride_kh,
-        stride_bb, stride_bt,
-        BV: tl.constexpr, BH: tl.constexpr,
+        K,
+        V,
+        BETA,
+        GRAD_OUT,
+        DKEY,
+        DVALUE,
+        DBETA,
+        STATE_TAPE,
+        B,
+        T,
+        H,
+        stride_kb,
+        stride_kt,
+        stride_kh,
+        stride_bb,
+        stride_bt,
+        BV: tl.constexpr,
+        BH: tl.constexpr,
     ):
         # Each program owns one batch and a block of value rows. It first
         # reconstructs the exact pre-step state rows, then runs their reverse
@@ -233,11 +254,7 @@ if _HAS_TRITON:
                 key_part,
                 mask=h_mask,
             )
-            adjoint = (
-                gi[:, None] * ki[None, :]
-                + adjoint
-                - bi * adjoint_key[:, None] * ki[None, :]
-            )
+            adjoint = gi[:, None] * ki[None, :] + adjoint - bi * adjoint_key[:, None] * ki[None, :]
 
 
 def _triton_forward(k: Tensor, v: Tensor, beta: Tensor) -> Tensor:
@@ -247,11 +264,20 @@ def _triton_forward(k: Tensor, v: Tensor, beta: Tensor) -> Tensor:
     BV = BH
     grid = (b, triton.cdiv(h, BV))
     _permanent_fwd_kernel[grid](
-        k, v, beta, out,
-        b, t, h,
-        k.stride(0), k.stride(1), k.stride(2),
-        beta.stride(0), beta.stride(1),
-        BV=BV, BH=BH,
+        k,
+        v,
+        beta,
+        out,
+        b,
+        t,
+        h,
+        k.stride(0),
+        k.stride(1),
+        k.stride(2),
+        beta.stride(0),
+        beta.stride(1),
+        BV=BV,
+        BH=BH,
     )
     return out
 
@@ -263,18 +289,29 @@ def _triton_backward(
     dkey = torch.zeros_like(k)
     dvalue = torch.empty_like(v)
     dbeta = torch.zeros_like(beta)
-    state_tape = torch.empty(
-        (b, t, h, h), device=k.device, dtype=torch.float32
-    )
+    state_tape = torch.empty((b, t, h, h), device=k.device, dtype=torch.float32)
     BH = triton.next_power_of_2(h)
     BV = min(16, BH)
     grid = (b, triton.cdiv(h, BV))
     _permanent_bwd_kernel[grid](
-        k, v, beta, grad_out, dkey, dvalue, dbeta, state_tape,
-        b, t, h,
-        k.stride(0), k.stride(1), k.stride(2),
-        beta.stride(0), beta.stride(1),
-        BV=BV, BH=BH,
+        k,
+        v,
+        beta,
+        grad_out,
+        dkey,
+        dvalue,
+        dbeta,
+        state_tape,
+        b,
+        t,
+        h,
+        k.stride(0),
+        k.stride(1),
+        k.stride(2),
+        beta.stride(0),
+        beta.stride(1),
+        BV=BV,
+        BH=BH,
     )
     return dkey, dvalue, dbeta
 
@@ -323,8 +360,10 @@ class PermanentDeltaScan(torch.autograd.Function):
                 raise RuntimeError("Triton permanent-pad backward is unavailable on CUDA")
             try:
                 dk, dv, dbeta = _triton_backward(
-                    k.float().contiguous(), v.float().contiguous(),
-                    beta.float().contiguous(), grad_out.float().contiguous(),
+                    k.float().contiguous(),
+                    v.float().contiguous(),
+                    beta.float().contiguous(),
+                    grad_out.float().contiguous(),
                 )
                 return dk.to(k.dtype), dv.to(v.dtype), dbeta.to(beta.dtype)
             except Exception as exc:
@@ -342,8 +381,78 @@ class PermanentDeltaScan(torch.autograd.Function):
         return dk, dv, dbeta
 
 
-def permanent_delta_scan(k: Tensor, v: Tensor, beta: Tensor) -> Tensor:
+@torch.library.custom_op("dabsn::permanent_delta_scan", mutates_args=())
+def _permanent_delta_scan_op(k: Tensor, v: Tensor, beta: Tensor) -> Tensor:
+    """Stable dispatcher boundary around the selected scan implementation."""
+
     return PermanentDeltaScan.apply(k, v, beta)
+
+
+@_permanent_delta_scan_op.register_fake
+def _permanent_delta_scan_fake(k: Tensor, v: Tensor, beta: Tensor) -> Tensor:
+    if k.dim() != 3 or v.shape != k.shape or beta.shape != k.shape[:2]:
+        raise ValueError("expected k/v [B,T,H] and beta [B,T]")
+    return torch.empty_like(v)
+
+
+def _permanent_delta_scan_setup(ctx, inputs, output) -> None:
+    k, v, beta = inputs
+    ctx.save_for_backward(k, v, beta)
+
+
+def _permanent_delta_scan_registered_backward(ctx, grad_out: Tensor):
+    k, v, beta = ctx.saved_tensors
+    if k.is_cuda:
+        dk, dv, dbeta = _triton_backward(
+            k.float().contiguous(),
+            v.float().contiguous(),
+            beta.float().contiguous(),
+            grad_out.float().contiguous(),
+        )
+        return dk.to(k.dtype), dv.to(v.dtype), dbeta.to(beta.dtype)
+    if _CPU_NATIVE_ENABLED:
+        from .cpu import _load_ext
+
+        extension = _load_ext(required=_CPU_NATIVE_REQUIRED)
+        if extension is not None:
+            dk, dv, dbeta = extension.permanent_delta_scan_bwd_cpu(
+                k.float().contiguous(),
+                v.float().contiguous(),
+                beta.float().contiguous(),
+                grad_out.float().contiguous(),
+            )
+            return dk.to(k.dtype), dv.to(v.dtype), dbeta.to(beta.dtype)
+    return _scan_backward(k, v, beta, grad_out.contiguous())
+
+
+torch.library.register_autograd(
+    _permanent_delta_scan_op,
+    _permanent_delta_scan_registered_backward,
+    setup_context=_permanent_delta_scan_setup,
+)
+
+
+@torch.library.register_vmap(_permanent_delta_scan_op)
+def _permanent_delta_scan_vmap(info, in_dims, k, v, beta):
+    batch_size = info.batch_size
+
+    def select(value, dim, index):
+        return value if dim is None else value.movedim(dim, 0)[index]
+
+    outputs = [
+        _permanent_delta_scan_op(
+            select(k, in_dims[0], index),
+            select(v, in_dims[1], index),
+            select(beta, in_dims[2], index),
+        )
+        for index in range(batch_size)
+    ]
+    return torch.stack(outputs), 0
+
+
+def permanent_delta_scan(k: Tensor, v: Tensor, beta: Tensor) -> Tensor:
+    return _permanent_delta_scan_op(k, v, beta)
+
 
 def permanent_delta_read(
     expression: Tensor,

@@ -13,9 +13,13 @@ def test_paper_source_and_generator_are_self_contained():
     assert (paper / "main.pdf").is_file()
     assert len(list((paper / "figs").glob("fig*.pdf"))) == 3
     required = {
-        "copy_length.csv", "mqar_length.csv", "keyvalue_length.csv",
-        "ablation_knockout.csv", "a5_word_results.csv",
-        "a5_seed1_linear_ablation.csv", "headline_results_paper1.csv",
+        "copy_length.csv",
+        "mqar_length.csv",
+        "keyvalue_length.csv",
+        "ablation_knockout.csv",
+        "a5_word_results.csv",
+        "a5_seed1_linear_ablation.csv",
+        "headline_results_paper1.csv",
     }
     assert required <= {path.name for path in (paper / "ancillary_results").glob("*.csv")}
     assert not (root / ".zenodo.json").exists()

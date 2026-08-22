@@ -19,9 +19,9 @@ from dabsn import (
     save_dabsn,
 )
 from dabsn.checkpoint import build_dabsn_from_checkpoint_config
+from dabsn.config import DABSNPretrainConfig
 from dabsn.model import build_dabsn_from_config
 from dabsn.pretrain import _validate_model_config
-from dabsn.config import DABSNPretrainConfig
 
 
 def _plain_copy(block: DABSNBlock) -> DABSNBlock:
@@ -82,9 +82,7 @@ def test_mlp_is_post_dabsn_residual_and_fc2_zero_makes_it_initially_identity():
 
     with torch.no_grad():
         block.mlp_fc2.weight.normal_(mean=0.0, std=0.02)
-    branch = block.mlp_fc2(
-        F.relu(block.mlp_fc1(block.mlp_norm(dabsn_residual))).square()
-    )
+    branch = block.mlp_fc2(F.relu(block.mlp_fc1(block.mlp_norm(dabsn_residual))).square())
     torch.testing.assert_close(
         block(inputs),
         dabsn_residual + branch,

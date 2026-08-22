@@ -19,8 +19,8 @@ from dabsn import (
 )
 from dabsn.cli import main as cli_main
 from dabsn.distributed import (
-    DistributedState,
     DABSNSequenceModule,
+    DistributedState,
     _portable_state_dict,
     load_distributed_optimizer,
     optimizer_checkpoint_path,
@@ -90,12 +90,15 @@ def test_non_distributed_portable_training_checkpoint(tmp_path):
     restored_groups = dabsn_adamw_param_groups(restored, 0.1)
     restored_wrapped = prepare_distributed_model(restored, state)
     restored_optimizer = torch.optim.AdamW(restored_groups, lr=1e-3)
-    assert load_distributed_optimizer(
-        restored_optimizer,
-        restored_wrapped,
-        path,
-        state,
-    ) == 17
+    assert (
+        load_distributed_optimizer(
+            restored_optimizer,
+            restored_wrapped,
+            path,
+            state,
+        )
+        == 17
+    )
     assert restored_optimizer.state_dict()["state"]
 
     sidecar = optimizer_checkpoint_path(path)
@@ -111,7 +114,7 @@ def test_non_distributed_portable_training_checkpoint(tmp_path):
         )
 
 
-def test_sharded_checkpoint_recovers_last_committed_directory(tmp_path):
+def test_sharded_checkpoint_inspects_last_commit_without_mutating_disk(tmp_path):
     state = setup_distributed("none", "cpu")
     model = DABSNModel(
         4,
@@ -129,8 +132,9 @@ def test_sharded_checkpoint_recovers_last_committed_directory(tmp_path):
     from dabsn.distributed import inspect_sharded_training_checkpoint
 
     assert inspect_sharded_training_checkpoint(path)["step"] == 5
-    assert path.is_dir()
-    assert not backup.exists()
+    assert not path.exists()
+    assert backup.is_dir()
+
 
 def test_non_distributed_sharded_training_checkpoint(tmp_path):
     state = setup_distributed("none", "cpu")
@@ -331,6 +335,9 @@ def test_distributed_state_reports_sharding_truth():
         "optimizer_sharded": False,
         "batch_parallel": False,
         "context_parallel": False,
+        "topology": {"axes": [{"name": "data", "size": 1}]},
+        "topology_fingerprint": state.topology.fingerprint(),
+        "coordinate": {"data": 0},
     }
 
 

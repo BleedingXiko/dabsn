@@ -2,16 +2,14 @@
 
 from __future__ import annotations
 
-import math
 import os as _os
-from typing import Optional, Tuple
+from typing import Tuple, cast
 
 import torch
 import torch.nn.functional as F
-from torch import Tensor
-
 import triton
 import triton.language as tl
+from torch import Tensor
 
 
 def _device_default_chunk_config() -> dict:
@@ -29,7 +27,7 @@ def _device_default_chunk_config() -> dict:
         major, _minor = torch.cuda.get_device_capability()
     except Exception:
         major = None
-    if major == 7:            # Turing / Volta (T4, V100)
+    if major == 7:  # Turing / Volta (T4, V100)
         block_k, num_warps, num_stages = 64, 4, 2
     elif major is not None and major >= 8:  # Ampere+ (A100, L4, Hopper)
         block_k, num_warps, num_stages = 64, 8, 3
@@ -45,14 +43,20 @@ def _chunk_autotune_configs():
         for block_k in (32, 64, 128):
             for num_warps in (4, 8, 16):
                 for num_stages in (2, 3):
-                    cfgs.append(triton.Config({"BLOCK_K": block_k},
-                                              num_warps=num_warps, num_stages=num_stages))
+                    cfgs.append(
+                        triton.Config(
+                            {"BLOCK_K": block_k}, num_warps=num_warps, num_stages=num_stages
+                        )
+                    )
         return cfgs
     default = _device_default_chunk_config()
-    return [triton.Config(
-        {"BLOCK_K": int(_os.environ.get("DABSN_AUTOTUNE_BLOCK_K", default["BLOCK_K"]))},
-        num_warps=int(_os.environ.get("DABSN_AUTOTUNE_WARPS", default["num_warps"])),
-        num_stages=int(_os.environ.get("DABSN_AUTOTUNE_STAGES", default["num_stages"])))]
+    return [
+        triton.Config(
+            {"BLOCK_K": int(_os.environ.get("DABSN_AUTOTUNE_BLOCK_K", default["BLOCK_K"]))},
+            num_warps=int(_os.environ.get("DABSN_AUTOTUNE_WARPS", default["num_warps"])),
+            num_stages=int(_os.environ.get("DABSN_AUTOTUNE_STAGES", default["num_stages"])),
+        )
+    ]
 
 
 _FWD_CHUNK_AUTOTUNE = _chunk_autotune_configs()
@@ -195,7 +199,7 @@ def _dabsn_core_scan_reference(
         ay_outs.append(ay)
         write_outs.append(p * ay)
 
-    outs_tuple = (
+    outs_tuple: tuple[Tensor, ...] = (
         torch.stack(outs, dim=1),
         torch.stack(nov_outs, dim=1),
         torch.stack(p_outs, dim=1),
@@ -214,15 +218,40 @@ def _dabsn_core_scan_reference(
 
 @triton.jit
 def _dabsn_core_scan_fwd(
-    Wx, Wgx, Ug, A,
-    beta, log_kappa, logit_recover,
-    k_s, k_y, k_b, k_n, k_bias,
-    r_s, r_y, r_b, r_n, r_bias,
-    logit_c_decay, k_c, r_c,
-    initial_b, initial_e, initial_c,
-    final_b, final_e, final_c,
-    U, novelty_o, p_o, ay_o, write_o,
-    e_o, c_o, s_o,
+    Wx,
+    Wgx,
+    Ug,
+    A,
+    beta,
+    log_kappa,
+    logit_recover,
+    k_s,
+    k_y,
+    k_b,
+    k_n,
+    k_bias,
+    r_s,
+    r_y,
+    r_b,
+    r_n,
+    r_bias,
+    logit_c_decay,
+    k_c,
+    r_c,
+    initial_b,
+    initial_e,
+    initial_c,
+    final_b,
+    final_e,
+    final_c,
+    U,
+    novelty_o,
+    p_o,
+    ay_o,
+    write_o,
+    e_o,
+    c_o,
+    s_o,
     logit_alpha,
     log_lambda,
     logit_c_suppress,
@@ -323,15 +352,40 @@ def _dabsn_core_scan_fwd(
 @triton.autotune(configs=_FWD_CHUNK_AUTOTUNE, key=["H"])
 @triton.jit
 def _dabsn_core_scan_fwd_chunked(
-    Wx, Wgx, Ug, A,
-    beta, log_kappa, logit_recover,
-    k_s, k_y, k_b, k_n, k_bias,
-    r_s, r_y, r_b, r_n, r_bias,
-    logit_c_decay, k_c, r_c,
-    initial_b, initial_e, initial_c,
-    final_b, final_e, final_c,
-    U, novelty_o, p_o, ay_o, write_o,
-    e_o, c_o, s_o,
+    Wx,
+    Wgx,
+    Ug,
+    A,
+    beta,
+    log_kappa,
+    logit_recover,
+    k_s,
+    k_y,
+    k_b,
+    k_n,
+    k_bias,
+    r_s,
+    r_y,
+    r_b,
+    r_n,
+    r_bias,
+    logit_c_decay,
+    k_c,
+    r_c,
+    initial_b,
+    initial_e,
+    initial_c,
+    final_b,
+    final_e,
+    final_c,
+    U,
+    novelty_o,
+    p_o,
+    ay_o,
+    write_o,
+    e_o,
+    c_o,
+    s_o,
     y_scratch,
     logit_alpha,
     log_lambda,
@@ -408,8 +462,12 @@ def _dabsn_core_scan_fwd_chunked(
             kmask = kcol < H
             y_k = tl.load(y_scratch + y_row_base + kcol, mask=kmask, other=0.0)
             blk_mask = mask[:, None] & kmask[None, :]
-            a_blk = tl.load(A + h[:, None] * H + kcol[None, :], mask=blk_mask, other=0.0).to(tl.float32)
-            ug_blk = tl.load(Ug + h[:, None] * H + kcol[None, :], mask=blk_mask, other=0.0).to(tl.float32)
+            a_blk = tl.load(A + h[:, None] * H + kcol[None, :], mask=blk_mask, other=0.0).to(
+                tl.float32
+            )
+            ug_blk = tl.load(Ug + h[:, None] * H + kcol[None, :], mask=blk_mask, other=0.0).to(
+                tl.float32
+            )
             ay += tl.sum(a_blk * y_k[None, :], axis=1)
             ug += tl.sum(ug_blk * y_k[None, :], axis=1)
 
@@ -470,33 +528,92 @@ def _block_h(hidden_dim: int) -> int:
 
 
 def _launch_fwd_scan(
-    Wx, Wgx, Ug, A,
-    beta, log_kappa, logit_recover,
-    k_s, k_y, k_b, k_n, k_bias,
-    r_s, r_y, r_b, r_n, r_bias,
-    logit_c_decay, k_c, r_c,
-    initial_b, initial_e, initial_c,
-    final_b, final_e, final_c,
-    U, novelty, p, ay, write,
-    e_tape, c_tape, s_tape,
-    logit_alpha, log_lambda, logit_c_suppress,
-    B, T, H, store_tape,
+    Wx,
+    Wgx,
+    Ug,
+    A,
+    beta,
+    log_kappa,
+    logit_recover,
+    k_s,
+    k_y,
+    k_b,
+    k_n,
+    k_bias,
+    r_s,
+    r_y,
+    r_b,
+    r_n,
+    r_bias,
+    logit_c_decay,
+    k_c,
+    r_c,
+    initial_b,
+    initial_e,
+    initial_c,
+    final_b,
+    final_e,
+    final_c,
+    U,
+    novelty,
+    p,
+    ay,
+    write,
+    e_tape,
+    c_tape,
+    s_tape,
+    logit_alpha,
+    log_lambda,
+    logit_c_suppress,
+    B,
+    T,
+    H,
+    store_tape,
 ) -> None:
     """Pick the one-tile (small H) or chunked-matvec (large H) forward kernel."""
     block = _block_h(H)
     if block <= _ONE_TILE_MAX:
         _dabsn_core_scan_fwd[(B,)](
-            Wx, Wgx, Ug, A,
-            beta, log_kappa, logit_recover,
-            k_s, k_y, k_b, k_n, k_bias,
-            r_s, r_y, r_b, r_n, r_bias,
-            logit_c_decay, k_c, r_c,
-            initial_b, initial_e, initial_c,
-            final_b, final_e, final_c,
-            U, novelty, p, ay, write,
-            e_tape, c_tape, s_tape,
-            logit_alpha, log_lambda, logit_c_suppress,
-            B, T, H,
+            Wx,
+            Wgx,
+            Ug,
+            A,
+            beta,
+            log_kappa,
+            logit_recover,
+            k_s,
+            k_y,
+            k_b,
+            k_n,
+            k_bias,
+            r_s,
+            r_y,
+            r_b,
+            r_n,
+            r_bias,
+            logit_c_decay,
+            k_c,
+            r_c,
+            initial_b,
+            initial_e,
+            initial_c,
+            final_b,
+            final_e,
+            final_c,
+            U,
+            novelty,
+            p,
+            ay,
+            write,
+            e_tape,
+            c_tape,
+            s_tape,
+            logit_alpha,
+            log_lambda,
+            logit_c_suppress,
+            B,
+            T,
+            H,
             store_tape,
             BLOCK_H=block,
             num_warps=_fused_num_warps(block),
@@ -505,18 +622,47 @@ def _launch_fwd_scan(
     y_scratch = torch.empty((B, H), device=Wx.device, dtype=torch.float32)
     # BLOCK_K / num_warps / num_stages are chosen by @triton.autotune (keyed on H).
     _dabsn_core_scan_fwd_chunked[(B,)](
-        Wx, Wgx, Ug, A,
-        beta, log_kappa, logit_recover,
-        k_s, k_y, k_b, k_n, k_bias,
-        r_s, r_y, r_b, r_n, r_bias,
-        logit_c_decay, k_c, r_c,
-        initial_b, initial_e, initial_c,
-        final_b, final_e, final_c,
-        U, novelty, p, ay, write,
-        e_tape, c_tape, s_tape,
+        Wx,
+        Wgx,
+        Ug,
+        A,
+        beta,
+        log_kappa,
+        logit_recover,
+        k_s,
+        k_y,
+        k_b,
+        k_n,
+        k_bias,
+        r_s,
+        r_y,
+        r_b,
+        r_n,
+        r_bias,
+        logit_c_decay,
+        k_c,
+        r_c,
+        initial_b,
+        initial_e,
+        initial_c,
+        final_b,
+        final_e,
+        final_c,
+        U,
+        novelty,
+        p,
+        ay,
+        write,
+        e_tape,
+        c_tape,
+        s_tape,
         y_scratch,
-        logit_alpha, log_lambda, logit_c_suppress,
-        B, T, H,
+        logit_alpha,
+        log_lambda,
+        logit_c_suppress,
+        B,
+        T,
+        H,
         store_tape,
         BLOCK_H=block,
     )
@@ -560,7 +706,9 @@ def dabsn_core_scan_triton(
     if not Wx.is_cuda:
         raise TypeError("Triton kernel requires CUDA tensors")
     _check_supported_dtype(Wx.dtype, "Wx")
-    if not (Wx.is_contiguous() and Wgx.is_contiguous() and Ug.is_contiguous() and A.is_contiguous()):
+    if not (
+        Wx.is_contiguous() and Wgx.is_contiguous() and Ug.is_contiguous() and A.is_contiguous()
+    ):
         raise ValueError("Wx, Wgx, Ug, and A must be contiguous")
     B, T, H = Wx.shape
     if Wgx.shape != Wx.shape:
@@ -592,17 +740,46 @@ def dabsn_core_scan_triton(
     final_c = torch.empty_like(final_b)
     dummy_tape = U
     _launch_fwd_scan(
-        Wx, Wgx, Ug, A,
-        beta, log_kappa, logit_recover,
-        k_s, k_y, k_b, k_n, k_bias,
-        r_s, r_y, r_b, r_n, r_bias,
-        logit_c_decay, k_c, r_c,
-        initial_b, initial_e, initial_c,
-        final_b, final_e, final_c,
-        U, novelty, p, ay, write,
-        dummy_tape, dummy_tape, dummy_tape,
-        logit_alpha, log_lambda, logit_c_suppress,
-        B, T, H,
+        Wx,
+        Wgx,
+        Ug,
+        A,
+        beta,
+        log_kappa,
+        logit_recover,
+        k_s,
+        k_y,
+        k_b,
+        k_n,
+        k_bias,
+        r_s,
+        r_y,
+        r_b,
+        r_n,
+        r_bias,
+        logit_c_decay,
+        k_c,
+        r_c,
+        initial_b,
+        initial_e,
+        initial_c,
+        final_b,
+        final_e,
+        final_c,
+        U,
+        novelty,
+        p,
+        ay,
+        write,
+        dummy_tape,
+        dummy_tape,
+        dummy_tape,
+        logit_alpha,
+        log_lambda,
+        logit_c_suppress,
+        B,
+        T,
+        H,
         False,
     )
     outputs = (U, novelty, p, ay, write)
@@ -649,7 +826,9 @@ def dabsn_core_scan_triton_tape(
     if not Wx.is_cuda:
         raise TypeError("Triton kernel requires CUDA tensors")
     _check_supported_dtype(Wx.dtype, "Wx")
-    if not (Wx.is_contiguous() and Wgx.is_contiguous() and Ug.is_contiguous() and A.is_contiguous()):
+    if not (
+        Wx.is_contiguous() and Wgx.is_contiguous() and Ug.is_contiguous() and A.is_contiguous()
+    ):
         raise ValueError("Wx, Wgx, Ug, and A must be contiguous")
     B, T, H = Wx.shape
     if Wgx.shape != Wx.shape:
@@ -682,17 +861,46 @@ def dabsn_core_scan_triton_tape(
     final_c = torch.empty_like(final_b)
 
     _launch_fwd_scan(
-        Wx, Wgx, Ug, A,
-        beta, log_kappa, logit_recover,
-        k_s, k_y, k_b, k_n, k_bias,
-        r_s, r_y, r_b, r_n, r_bias,
-        logit_c_decay, k_c, r_c,
-        initial_b, initial_e, initial_c,
-        final_b, final_e, final_c,
-        U, novelty, p, ay, write,
-        e_tape, c_tape, s_tape,
-        logit_alpha, log_lambda, logit_c_suppress,
-        B, T, H,
+        Wx,
+        Wgx,
+        Ug,
+        A,
+        beta,
+        log_kappa,
+        logit_recover,
+        k_s,
+        k_y,
+        k_b,
+        k_n,
+        k_bias,
+        r_s,
+        r_y,
+        r_b,
+        r_n,
+        r_bias,
+        logit_c_decay,
+        k_c,
+        r_c,
+        initial_b,
+        initial_e,
+        initial_c,
+        final_b,
+        final_e,
+        final_c,
+        U,
+        novelty,
+        p,
+        ay,
+        write,
+        e_tape,
+        c_tape,
+        s_tape,
+        logit_alpha,
+        log_lambda,
+        logit_c_suppress,
+        B,
+        T,
+        H,
         True,
     )
     outputs = (U, novelty, p, ay, write, e_tape, c_tape, s_tape)
@@ -759,18 +967,46 @@ def _fused_max_hidden(device=None, batch_tile: int = 16) -> int:
 # ---------------------------------------------------------------------------
 @triton.jit
 def _dabsn_core_scan_batched_fused_fwd(
-    Wx, Wgx, Ug, A,
-    beta, log_kappa, logit_recover,
-    k_s, k_y, k_b, k_n, k_bias,
-    r_s, r_y, r_b, r_n, r_bias,
-    logit_c_decay, k_c, r_c,
-    initial_b, initial_e, initial_c,
-    final_b, final_e, final_c,
-    U, novelty_o, p_o, ay_o, write_o,
-    e_o, c_o, s_o,
+    Wx,
+    Wgx,
+    Ug,
+    A,
+    beta,
+    log_kappa,
+    logit_recover,
+    k_s,
+    k_y,
+    k_b,
+    k_n,
+    k_bias,
+    r_s,
+    r_y,
+    r_b,
+    r_n,
+    r_bias,
+    logit_c_decay,
+    k_c,
+    r_c,
+    initial_b,
+    initial_e,
+    initial_c,
+    final_b,
+    final_e,
+    final_c,
+    U,
+    novelty_o,
+    p_o,
+    ay_o,
+    write_o,
+    e_o,
+    c_o,
+    s_o,
     y_scratch,
-    logit_alpha, log_lambda, logit_c_suppress,
-    B, T,
+    logit_alpha,
+    log_lambda,
+    logit_c_suppress,
+    B,
+    T,
     H: tl.constexpr,
     BLOCK_B: tl.constexpr,
     BLOCK_H: tl.constexpr,
@@ -795,13 +1031,13 @@ def _dabsn_core_scan_batched_fused_fwd(
     """
 
     bt = tl.program_id(0)
-    rows = bt * BLOCK_B + tl.arange(0, BLOCK_B)          # [BLOCK_B]
+    rows = bt * BLOCK_B + tl.arange(0, BLOCK_B)  # [BLOCK_B]
     row_mask = rows < B
-    h = tl.arange(0, BLOCK_H)                            # [BLOCK_H]
+    h = tl.arange(0, BLOCK_H)  # [BLOCK_H]
     hmask = h < H
-    tile_mask = row_mask[:, None] & hmask[None, :]       # [BLOCK_B, BLOCK_H]
+    tile_mask = row_mask[:, None] & hmask[None, :]  # [BLOCK_B, BLOCK_H]
 
-    sb = rows[:, None] * H + h[None, :]                  # offset into [B, H]
+    sb = rows[:, None] * H + h[None, :]  # offset into [B, H]
     b_state = tl.load(initial_b + sb, mask=tile_mask, other=0.0).to(tl.float32)
     e_state = tl.load(initial_e + sb, mask=tile_mask, other=1.0).to(tl.float32)
     c_state = tl.load(initial_c + sb, mask=tile_mask, other=0.0).to(tl.float32)
@@ -811,8 +1047,12 @@ def _dabsn_core_scan_batched_fused_fwd(
     c_suppress = tl.sigmoid(tl.load(logit_c_suppress).to(tl.float32))
 
     beta_v = tl.load(beta + h, mask=hmask, other=0.0).to(tl.float32)[None, :]
-    kappa = tl.log(1.0 + tl.exp(tl.load(log_kappa + h, mask=hmask, other=-80.0).to(tl.float32)))[None, :]
-    recover = tl.sigmoid(tl.load(logit_recover + h, mask=hmask, other=-80.0).to(tl.float32))[None, :]
+    kappa = tl.log(1.0 + tl.exp(tl.load(log_kappa + h, mask=hmask, other=-80.0).to(tl.float32)))[
+        None, :
+    ]
+    recover = tl.sigmoid(tl.load(logit_recover + h, mask=hmask, other=-80.0).to(tl.float32))[
+        None, :
+    ]
     ks = tl.load(k_s + h, mask=hmask, other=0.0).to(tl.float32)[None, :]
     ky = tl.load(k_y + h, mask=hmask, other=0.0).to(tl.float32)[None, :]
     kb = tl.load(k_b + h, mask=hmask, other=0.0).to(tl.float32)[None, :]
@@ -823,7 +1063,9 @@ def _dabsn_core_scan_batched_fused_fwd(
     rb = tl.load(r_b + h, mask=hmask, other=0.0).to(tl.float32)[None, :]
     rn = tl.load(r_n + h, mask=hmask, other=0.0).to(tl.float32)[None, :]
     rbias = tl.load(r_bias + h, mask=hmask, other=0.0).to(tl.float32)[None, :]
-    c_decay = tl.sigmoid(tl.load(logit_c_decay + h, mask=hmask, other=-80.0).to(tl.float32))[None, :]
+    c_decay = tl.sigmoid(tl.load(logit_c_decay + h, mask=hmask, other=-80.0).to(tl.float32))[
+        None, :
+    ]
     kc = tl.load(k_c + h, mask=hmask, other=0.0).to(tl.float32)[None, :]
     rc = tl.load(r_c + h, mask=hmask, other=0.0).to(tl.float32)[None, :]
 
@@ -832,7 +1074,7 @@ def _dabsn_core_scan_batched_fused_fwd(
         wx = tl.load(Wx + base, mask=tile_mask, other=0.0).to(tl.float32)
         wgx = tl.load(Wgx + base, mask=tile_mask, other=0.0).to(tl.float32)
 
-        y = _tl_tanh(wx + b_state)                             # [BLOCK_B, BLOCK_H] fp32
+        y = _tl_tanh(wx + b_state)  # [BLOCK_B, BLOCK_H] fp32
 
         # Stash y so a K-chunk tl.dot can read column slices owned block-wide.
         # Barrier BEFORE the store guards the previous step's chunk reads from
@@ -852,18 +1094,16 @@ def _dabsn_core_scan_batched_fused_fwd(
                 y_scratch + rows[:, None] * H + kcol[None, :],
                 mask=row_mask[:, None] & kmask[None, :],
                 other=0.0,
-            )                                                  # [BLOCK_B, BLOCK_K] fp32
-            mat_off = h[None, :] * H + kcol[:, None]           # [BLOCK_K, BLOCK_H]
+            )  # [BLOCK_B, BLOCK_K] fp32
+            mat_off = h[None, :] * H + kcol[:, None]  # [BLOCK_K, BLOCK_H]
             mat_mask = kmask[:, None] & hmask[None, :]
             ugT_k = tl.load(Ug + mat_off, mask=mat_mask, other=0.0)
             aT_k = tl.load(A + mat_off, mask=mat_mask, other=0.0)
             y_k_c = y_k.to(ugT_k.dtype)
             ug += tl.dot(
                 y_k_c, ugT_k, out_dtype=tl.float32, input_precision="ieee"
-            )                                                  # [BLOCK_B, BLOCK_H]
-            ay += tl.dot(
-                y_k_c, aT_k, out_dtype=tl.float32, input_precision="ieee"
-            )
+            )  # [BLOCK_B, BLOCK_H]
+            ay += tl.dot(y_k_c, aT_k, out_dtype=tl.float32, input_precision="ieee")
 
         s = tl.minimum(1.0, tl.maximum(0.0, (wgx + ug) / 6.0 + 0.5))
         novelty = _tl_tanh(_tl_abs(ay - b_state))
@@ -927,13 +1167,32 @@ def is_triton_out_of_resources(exc: BaseException) -> bool:
 
 
 def dabsn_core_scan_batched_fused_forward(
-    Wx, Wgx, Ug, A,
-    beta, log_kappa, logit_recover,
-    k_s, k_y, k_b, k_n, k_bias,
-    r_s, r_y, r_b, r_n, r_bias,
-    logit_c_decay, k_c, r_c,
-    logit_alpha, log_lambda, logit_c_suppress,
-    initial_b, initial_e, initial_c,
+    Wx,
+    Wgx,
+    Ug,
+    A,
+    beta,
+    log_kappa,
+    logit_recover,
+    k_s,
+    k_y,
+    k_b,
+    k_n,
+    k_bias,
+    r_s,
+    r_y,
+    r_b,
+    r_n,
+    r_bias,
+    logit_c_decay,
+    k_c,
+    r_c,
+    logit_alpha,
+    log_lambda,
+    logit_c_suppress,
+    initial_b,
+    initial_e,
+    initial_c,
 ) -> Tuple[Tensor, ...]:
     """Launch the fused forward scan; return tapes in ``(U, novelty, p, ay,
     write, e_tape, c_tape, s_tape, final_b, final_e, final_c)`` order, cast to
@@ -985,18 +1244,50 @@ def dabsn_core_scan_batched_fused_forward(
         grid = (triton.cdiv(B, block_b),)
         try:
             _dabsn_core_scan_batched_fused_fwd[grid](
-                Wx.contiguous(), Wgx.contiguous(), ug_c, a_c,
-                beta.contiguous(), log_kappa.contiguous(), logit_recover.contiguous(),
-                k_s.contiguous(), k_y.contiguous(), k_b.contiguous(), k_n.contiguous(), k_bias.contiguous(),
-                r_s.contiguous(), r_y.contiguous(), r_b.contiguous(), r_n.contiguous(), r_bias.contiguous(),
-                logit_c_decay.contiguous(), k_c.contiguous(), r_c.contiguous(),
-                initial_b.float().contiguous(), initial_e.float().contiguous(), initial_c.float().contiguous(),
-                final_b, final_e, final_c,
-                U, novelty, p, ay, write, e_tape, c_tape, s_tape,
+                Wx.contiguous(),
+                Wgx.contiguous(),
+                ug_c,
+                a_c,
+                beta.contiguous(),
+                log_kappa.contiguous(),
+                logit_recover.contiguous(),
+                k_s.contiguous(),
+                k_y.contiguous(),
+                k_b.contiguous(),
+                k_n.contiguous(),
+                k_bias.contiguous(),
+                r_s.contiguous(),
+                r_y.contiguous(),
+                r_b.contiguous(),
+                r_n.contiguous(),
+                r_bias.contiguous(),
+                logit_c_decay.contiguous(),
+                k_c.contiguous(),
+                r_c.contiguous(),
+                initial_b.float().contiguous(),
+                initial_e.float().contiguous(),
+                initial_c.float().contiguous(),
+                final_b,
+                final_e,
+                final_c,
+                U,
+                novelty,
+                p,
+                ay,
+                write,
+                e_tape,
+                c_tape,
+                s_tape,
                 y_scratch,
-                logit_alpha.reshape(()), log_lambda.reshape(()), logit_c_suppress.reshape(()),
-                B, T,
-                H=H, BLOCK_B=block_b, BLOCK_H=block_h, BLOCK_K=block_k,
+                logit_alpha.reshape(()),
+                log_lambda.reshape(()),
+                logit_c_suppress.reshape(()),
+                B,
+                T,
+                H=H,
+                BLOCK_B=block_b,
+                BLOCK_H=block_h,
+                BLOCK_K=block_k,
                 num_warps=_fused_num_warps(block_h),
             )
             resource_error = None
@@ -1012,25 +1303,71 @@ def dabsn_core_scan_batched_fused_forward(
     # `_batched_forward_tapes`.
     cast = Wx.dtype
     return (
-        U, novelty, p, ay, write, e_tape, c_tape, s_tape,
-        final_b.to(cast), final_e.to(cast), final_c.to(cast),
+        U,
+        novelty,
+        p,
+        ay,
+        write,
+        e_tape,
+        c_tape,
+        s_tape,
+        final_b.to(cast),
+        final_e.to(cast),
+        final_c.to(cast),
     )
 
 
 @triton.jit
 def _dabsn_core_scan_bwd(
-    U, Novelty, P, Ay, Etape, Ctape, Stape,
-    InitialB, InitialC,
-    A, Ug,
-    beta, log_kappa, logit_recover,
-    k_s, k_y, k_b, k_n, k_bias,
-    r_s, r_y, r_b, r_n, r_bias,
-    logit_c_decay, k_c, r_c,
-    gU, gNov, gP, gAy, gWrite, gEOut, gCOut, gFinalB, gFinalE, gFinalC,
-    gWx, gWgx, DAy, DUg,
-    gInitialB, gInitialE, gInitialC,
-    gparam_p, gscal_p,
-    logit_alpha, log_lambda, logit_c_suppress,
+    U,
+    Novelty,
+    P,
+    Ay,
+    Etape,
+    Ctape,
+    Stape,
+    InitialB,
+    InitialC,
+    A,
+    Ug,
+    beta,
+    log_kappa,
+    logit_recover,
+    k_s,
+    k_y,
+    k_b,
+    k_n,
+    k_bias,
+    r_s,
+    r_y,
+    r_b,
+    r_n,
+    r_bias,
+    logit_c_decay,
+    k_c,
+    r_c,
+    gU,
+    gNov,
+    gP,
+    gAy,
+    gWrite,
+    gEOut,
+    gCOut,
+    gFinalB,
+    gFinalE,
+    gFinalC,
+    gWx,
+    gWgx,
+    DAy,
+    DUg,
+    gInitialB,
+    gInitialE,
+    gInitialC,
+    gparam_p,
+    gscal_p,
+    logit_alpha,
+    log_lambda,
+    logit_c_suppress,
     T,
     H: tl.constexpr,
     NP: tl.constexpr,
@@ -1050,7 +1387,6 @@ def _dabsn_core_scan_bwd(
     mask = h < H
 
     # ---- constant per-dim params (loaded once) ----
-    beta_v = tl.load(beta + h, mask=mask, other=0.0).to(tl.float32)
     lk = tl.load(log_kappa + h, mask=mask, other=-80.0).to(tl.float32)
     lr = tl.load(logit_recover + h, mask=mask, other=-80.0).to(tl.float32)
     kappa = tl.log(1.0 + tl.exp(lk))
@@ -1121,15 +1457,13 @@ def _dabsn_core_scan_bwd(
         base_prev = (bidx * T + tprev) * H
         first_f = tl.where(t == 0, 1.0, 0.0)  # scalar 1.0 at t==0 else 0.0
         prev_f = 1.0 - first_f
-        b_prev = (
-            prev_f * tl.load(U + ub_prev + H + h, mask=mask, other=0.0).to(tl.float32)
-            + first_f * tl.load(InitialB + state_base + h, mask=mask, other=0.0).to(tl.float32)
-        )
+        b_prev = prev_f * tl.load(U + ub_prev + H + h, mask=mask, other=0.0).to(
+            tl.float32
+        ) + first_f * tl.load(InitialB + state_base + h, mask=mask, other=0.0).to(tl.float32)
         e_prev = tl.load(Etape + base + h, mask=mask, other=1.0).to(tl.float32)
-        c_prev = (
-            prev_f * tl.load(Ctape + base_prev + h, mask=mask, other=0.0).to(tl.float32)
-            + first_f * tl.load(InitialC + state_base + h, mask=mask, other=0.0).to(tl.float32)
-        )
+        c_prev = prev_f * tl.load(Ctape + base_prev + h, mask=mask, other=0.0).to(
+            tl.float32
+        ) + first_f * tl.load(InitialC + state_base + h, mask=mask, other=0.0).to(tl.float32)
 
         s = tl.load(Stape + base + h, mask=mask, other=0.0).to(tl.float32)
         p = tl.load(P + base + h, mask=mask, other=0.0).to(tl.float32)
@@ -1232,7 +1566,9 @@ def _dabsn_core_scan_bwd(
         g_c_prev = g_c_new * decay
         g_decay = g_c_new * (c_prev - stress)
         a_cdecay += g_decay * decay * (1.0 - decay)
-        a_csup += tl.sum(tl.where(mask, gnov_eff * nov * (-c_new) * suppress * (1.0 - suppress), 0.0), axis=0)
+        a_csup += tl.sum(
+            tl.where(mask, gnov_eff * nov * (-c_new) * suppress * (1.0 - suppress), 0.0), axis=0
+        )
         gnov_total = gnov0 + g_novelty
 
         # ---- slice 6: novelty = tanh(|ay - b_prev|) ----
@@ -1286,19 +1622,57 @@ def _dabsn_core_scan_bwd(
 @triton.autotune(configs=_BWD_CHUNK_AUTOTUNE, key=["H"], reset_to_zero=_BWD_RESET_ZERO)
 @triton.jit
 def _dabsn_core_scan_bwd_chunked(
-    U, Novelty, P, Ay, Etape, Ctape, Stape,
-    InitialB, InitialC,
-    A, Ug,
-    beta, log_kappa, logit_recover,
-    k_s, k_y, k_b, k_n, k_bias,
-    r_s, r_y, r_b, r_n, r_bias,
-    logit_c_decay, k_c, r_c,
-    gU, gNov, gP, gAy, gWrite, gEOut, gCOut, gFinalB, gFinalE, gFinalC,
-    gWx, gWgx, DAy, DUg,
-    gInitialB, gInitialE, gInitialC,
-    gparam_p, gscal_p,
-    dpre_scratch, day_scratch,
-    logit_alpha, log_lambda, logit_c_suppress,
+    U,
+    Novelty,
+    P,
+    Ay,
+    Etape,
+    Ctape,
+    Stape,
+    InitialB,
+    InitialC,
+    A,
+    Ug,
+    beta,
+    log_kappa,
+    logit_recover,
+    k_s,
+    k_y,
+    k_b,
+    k_n,
+    k_bias,
+    r_s,
+    r_y,
+    r_b,
+    r_n,
+    r_bias,
+    logit_c_decay,
+    k_c,
+    r_c,
+    gU,
+    gNov,
+    gP,
+    gAy,
+    gWrite,
+    gEOut,
+    gCOut,
+    gFinalB,
+    gFinalE,
+    gFinalC,
+    gWx,
+    gWgx,
+    DAy,
+    DUg,
+    gInitialB,
+    gInitialE,
+    gInitialC,
+    gparam_p,
+    gscal_p,
+    dpre_scratch,
+    day_scratch,
+    logit_alpha,
+    log_lambda,
+    logit_c_suppress,
     T,
     H: tl.constexpr,
     NP: tl.constexpr,
@@ -1318,7 +1692,6 @@ def _dabsn_core_scan_bwd_chunked(
     h = tl.arange(0, BLOCK_H)
     mask = h < H
 
-    beta_v = tl.load(beta + h, mask=mask, other=0.0).to(tl.float32)
     lk = tl.load(log_kappa + h, mask=mask, other=-80.0).to(tl.float32)
     lr = tl.load(logit_recover + h, mask=mask, other=-80.0).to(tl.float32)
     kappa = tl.log(1.0 + tl.exp(lk))
@@ -1381,15 +1754,13 @@ def _dabsn_core_scan_bwd_chunked(
         base_prev = (bidx * T + tprev) * H
         first_f = tl.where(t == 0, 1.0, 0.0)
         prev_f = 1.0 - first_f
-        b_prev = (
-            prev_f * tl.load(U + ub_prev + H + h, mask=mask, other=0.0).to(tl.float32)
-            + first_f * tl.load(InitialB + state_base + h, mask=mask, other=0.0).to(tl.float32)
-        )
+        b_prev = prev_f * tl.load(U + ub_prev + H + h, mask=mask, other=0.0).to(
+            tl.float32
+        ) + first_f * tl.load(InitialB + state_base + h, mask=mask, other=0.0).to(tl.float32)
         e_prev = tl.load(Etape + base + h, mask=mask, other=1.0).to(tl.float32)
-        c_prev = (
-            prev_f * tl.load(Ctape + base_prev + h, mask=mask, other=0.0).to(tl.float32)
-            + first_f * tl.load(InitialC + state_base + h, mask=mask, other=0.0).to(tl.float32)
-        )
+        c_prev = prev_f * tl.load(Ctape + base_prev + h, mask=mask, other=0.0).to(
+            tl.float32
+        ) + first_f * tl.load(InitialC + state_base + h, mask=mask, other=0.0).to(tl.float32)
 
         s = tl.load(Stape + base + h, mask=mask, other=0.0).to(tl.float32)
         p = tl.load(P + base + h, mask=mask, other=0.0).to(tl.float32)
@@ -1492,7 +1863,9 @@ def _dabsn_core_scan_bwd_chunked(
         g_c_prev = g_c_new * decay
         g_decay = g_c_new * (c_prev - stress)
         a_cdecay += g_decay * decay * (1.0 - decay)
-        a_csup += tl.sum(tl.where(mask, gnov_eff * nov * (-c_new) * suppress * (1.0 - suppress), 0.0), axis=0)
+        a_csup += tl.sum(
+            tl.where(mask, gnov_eff * nov * (-c_new) * suppress * (1.0 - suppress), 0.0), axis=0
+        )
         gnov_total = gnov0 + g_novelty
 
         # ---- slice 6: novelty = tanh(|ay - b_prev|) ----
@@ -1519,8 +1892,12 @@ def _dabsn_core_scan_bwd_chunked(
             dpre_i = tl.load(dpre_scratch + bidx * H + irow, mask=imask, other=0.0)
             day_i = tl.load(day_scratch + bidx * H + irow, mask=imask, other=0.0)
             blk_mask = imask[:, None] & mask[None, :]
-            ug_blk = tl.load(Ug + irow[:, None] * H + h[None, :], mask=blk_mask, other=0.0).to(tl.float32)
-            a_blk = tl.load(A + irow[:, None] * H + h[None, :], mask=blk_mask, other=0.0).to(tl.float32)
+            ug_blk = tl.load(Ug + irow[:, None] * H + h[None, :], mask=blk_mask, other=0.0).to(
+                tl.float32
+            )
+            a_blk = tl.load(A + irow[:, None] * H + h[None, :], mask=blk_mask, other=0.0).to(
+                tl.float32
+            )
             gy_mat += tl.sum(ug_blk * dpre_i[:, None], axis=0)
             gy_mat += tl.sum(a_blk * day_i[:, None], axis=0)
         gy_accum += gy_mat
@@ -1561,15 +1938,45 @@ def _dabsn_core_scan_bwd_chunked(
 
 
 def _dabsn_core_fused_backward(
-    U, p, ay, e_tape, c_tape, s_tape,
-    initial_b, initial_c,
-    A, Ug,
-    beta, log_kappa, logit_recover,
-    k_s, k_y, k_b, k_n, k_bias,
-    r_s, r_y, r_b, r_n, r_bias,
-    logit_c_decay, k_c, r_c,
-    logit_alpha, log_lambda, logit_c_suppress,
-    gU, gnov, gp, gay, gwrite, ge_out, gc_out, gfinal_b, gfinal_e, gfinal_c,
+    U,
+    p,
+    ay,
+    e_tape,
+    c_tape,
+    s_tape,
+    initial_b,
+    initial_c,
+    A,
+    Ug,
+    beta,
+    log_kappa,
+    logit_recover,
+    k_s,
+    k_y,
+    k_b,
+    k_n,
+    k_bias,
+    r_s,
+    r_y,
+    r_b,
+    r_n,
+    r_bias,
+    logit_c_decay,
+    k_c,
+    r_c,
+    logit_alpha,
+    log_lambda,
+    logit_c_suppress,
+    gU,
+    gnov,
+    gp,
+    gay,
+    gwrite,
+    ge_out,
+    gc_out,
+    gfinal_b,
+    gfinal_e,
+    gfinal_c,
 ):
     """Launch the fused reverse-scan kernel and finish grad_A / grad_Ug via GEMM.
 
@@ -1596,28 +2003,65 @@ def _dabsn_core_fused_backward(
     common_args = (
         # 2nd slot is the kernel's (unused) Novelty pointer -- feed ay as a
         # valid dummy; novelty is recomputed inside the kernel.
-        U.contiguous(), ay.contiguous(), p.contiguous(), ay.contiguous(),
-        e_tape.contiguous(), c_tape.contiguous(), s_tape.contiguous(),
-        initial_b.contiguous(), initial_c.contiguous(),
-        A.contiguous(), Ug.contiguous(),
-        beta.contiguous(), log_kappa.contiguous(), logit_recover.contiguous(),
-        k_s.contiguous(), k_y.contiguous(), k_b.contiguous(), k_n.contiguous(), k_bias.contiguous(),
-        r_s.contiguous(), r_y.contiguous(), r_b.contiguous(), r_n.contiguous(), r_bias.contiguous(),
-        logit_c_decay.contiguous(), k_c.contiguous(), r_c.contiguous(),
-        gU.contiguous(), gnov.contiguous(), gp.contiguous(), gay.contiguous(), gwrite.contiguous(),
-        ge_out.contiguous(), gc_out.contiguous(),
-        gfinal_b.contiguous(), gfinal_e.contiguous(), gfinal_c.contiguous(),
-        gWx, gWgx, DAy, DUg,
-        ginitial_b, ginitial_e, ginitial_c,
-        gparam_p, gscal_p,
+        U.contiguous(),
+        ay.contiguous(),
+        p.contiguous(),
+        ay.contiguous(),
+        e_tape.contiguous(),
+        c_tape.contiguous(),
+        s_tape.contiguous(),
+        initial_b.contiguous(),
+        initial_c.contiguous(),
+        A.contiguous(),
+        Ug.contiguous(),
+        beta.contiguous(),
+        log_kappa.contiguous(),
+        logit_recover.contiguous(),
+        k_s.contiguous(),
+        k_y.contiguous(),
+        k_b.contiguous(),
+        k_n.contiguous(),
+        k_bias.contiguous(),
+        r_s.contiguous(),
+        r_y.contiguous(),
+        r_b.contiguous(),
+        r_n.contiguous(),
+        r_bias.contiguous(),
+        logit_c_decay.contiguous(),
+        k_c.contiguous(),
+        r_c.contiguous(),
+        gU.contiguous(),
+        gnov.contiguous(),
+        gp.contiguous(),
+        gay.contiguous(),
+        gwrite.contiguous(),
+        ge_out.contiguous(),
+        gc_out.contiguous(),
+        gfinal_b.contiguous(),
+        gfinal_e.contiguous(),
+        gfinal_c.contiguous(),
+        gWx,
+        gWgx,
+        DAy,
+        DUg,
+        ginitial_b,
+        ginitial_e,
+        ginitial_c,
+        gparam_p,
+        gscal_p,
     )
     tail_args = (
-        logit_alpha.contiguous(), log_lambda.contiguous(), logit_c_suppress.contiguous(),
-        T, H, NP,
+        logit_alpha.contiguous(),
+        log_lambda.contiguous(),
+        logit_c_suppress.contiguous(),
+        T,
+        H,
+        NP,
     )
     if block <= _ONE_TILE_MAX:
         _dabsn_core_scan_bwd[(B,)](
-            *common_args, *tail_args,
+            *common_args,
+            *tail_args,
             BLOCK_H=block,
             num_warps=_fused_num_warps(block),
         )
@@ -1626,7 +2070,10 @@ def _dabsn_core_fused_backward(
         day_scratch = torch.zeros((B, H), device=device, dtype=torch.float32)
         # BLOCK_K / num_warps / num_stages chosen by @triton.autotune (keyed on H).
         _dabsn_core_scan_bwd_chunked[(B,)](
-            *common_args, dpre_scratch, day_scratch, *tail_args,
+            *common_args,
+            dpre_scratch,
+            day_scratch,
+            *tail_args,
             BLOCK_H=block,
         )
 
@@ -1642,7 +2089,7 @@ class DABSNCoreScanTritonFusedBackward(torch.autograd.Function):
     """Triton forward plus fused one-tile or chunked reverse-scan backward."""
 
     @staticmethod
-    def forward(  # type: ignore[override]
+    def forward(
         ctx,
         Wx: Tensor,
         Wgx: Tensor,
@@ -1678,11 +2125,26 @@ class DABSNCoreScanTritonFusedBackward(torch.autograd.Function):
         ctx.precise_tape = bool(precise_tape)
         ctx.return_final_state = bool(return_final_state)
         outs = dabsn_core_scan_triton_tape(
-            Wx, Wgx, Ug, A,
-            beta, log_kappa, logit_recover,
-            k_s, k_y, k_b, k_n, k_bias,
-            r_s, r_y, r_b, r_n, r_bias,
-            logit_c_decay, k_c, r_c,
+            Wx,
+            Wgx,
+            Ug,
+            A,
+            beta,
+            log_kappa,
+            logit_recover,
+            k_s,
+            k_y,
+            k_b,
+            k_n,
+            k_bias,
+            r_s,
+            r_y,
+            r_b,
+            r_n,
+            r_bias,
+            logit_c_decay,
+            k_c,
+            r_c,
             logit_alpha=logit_alpha,
             log_lambda=log_lambda,
             logit_c_suppress=logit_c_suppress,
@@ -1691,13 +2153,32 @@ class DABSNCoreScanTritonFusedBackward(torch.autograd.Function):
             return_final_state=True,
         )
         ctx.save_for_backward(
-            Wx, Wgx, Ug, A,
-            beta, log_kappa, logit_recover,
-            k_s, k_y, k_b, k_n, k_bias,
-            r_s, r_y, r_b, r_n, r_bias,
-            logit_c_decay, k_c, r_c,
-            logit_alpha, log_lambda, logit_c_suppress,
-            initial_b, initial_e, initial_c,
+            Wx,
+            Wgx,
+            Ug,
+            A,
+            beta,
+            log_kappa,
+            logit_recover,
+            k_s,
+            k_y,
+            k_b,
+            k_n,
+            k_bias,
+            r_s,
+            r_y,
+            r_b,
+            r_n,
+            r_bias,
+            logit_c_decay,
+            k_c,
+            r_c,
+            logit_alpha,
+            log_lambda,
+            logit_c_suppress,
+            initial_b,
+            initial_e,
+            initial_c,
             *outs,
         )
         public = list(outs[:7] if bool(return_tape) else outs[:5])
@@ -1706,18 +2187,46 @@ class DABSNCoreScanTritonFusedBackward(torch.autograd.Function):
         return tuple(t.to(Wx.dtype) for t in public)
 
     @staticmethod
-    def backward(ctx, *grad_outputs):  # type: ignore[override]
+    def backward(ctx, *grad_outputs):
         saved = ctx.saved_tensors
         (
-            Wx, Wgx, Ug, A,
-            beta, log_kappa, logit_recover,
-            k_s, k_y, k_b, k_n, k_bias,
-            r_s, r_y, r_b, r_n, r_bias,
-            logit_c_decay, k_c, r_c,
-            logit_alpha, log_lambda, logit_c_suppress,
-            initial_b, initial_e, initial_c,
-            U, novelty, p, ay, write, e_tape, c_tape, s_tape,
-            final_b, final_e, final_c,
+            Wx,
+            Wgx,
+            Ug,
+            A,
+            beta,
+            log_kappa,
+            logit_recover,
+            k_s,
+            k_y,
+            k_b,
+            k_n,
+            k_bias,
+            r_s,
+            r_y,
+            r_b,
+            r_n,
+            r_bias,
+            logit_c_decay,
+            k_c,
+            r_c,
+            logit_alpha,
+            log_lambda,
+            logit_c_suppress,
+            initial_b,
+            initial_e,
+            initial_c,
+            U,
+            novelty,
+            p,
+            ay,
+            write,
+            e_tape,
+            c_tape,
+            s_tape,
+            final_b,
+            final_e,
+            final_c,
         ) = saved
         gU, gnov_out, gp_out, gay_out, gwrite_out = (
             torch.zeros_like(out) if grad is None else grad.contiguous()
@@ -1755,17 +2264,48 @@ class DABSNCoreScanTritonFusedBackward(torch.autograd.Function):
             gfinal_e = torch.zeros_like(final_e)
             gfinal_c = torch.zeros_like(final_c)
 
-        gWx, gWgx, grad_A, grad_Ug, gparam, gscal, ginitial_b, ginitial_e, ginitial_c = _dabsn_core_fused_backward(
-            U, p, ay, e_tape, c_tape, s_tape,
-            initial_b, initial_c,
-            A, Ug,
-            beta, log_kappa, logit_recover,
-            k_s, k_y, k_b, k_n, k_bias,
-            r_s, r_y, r_b, r_n, r_bias,
-            logit_c_decay, k_c, r_c,
-            logit_alpha, log_lambda, logit_c_suppress,
-            gU, gnov_out, gp_out, gay_out, gwrite_out, ge_out, gc_out,
-            gfinal_b, gfinal_e, gfinal_c,
+        gWx, gWgx, grad_A, grad_Ug, gparam, gscal, ginitial_b, ginitial_e, ginitial_c = (
+            _dabsn_core_fused_backward(
+                U,
+                p,
+                ay,
+                e_tape,
+                c_tape,
+                s_tape,
+                initial_b,
+                initial_c,
+                A,
+                Ug,
+                beta,
+                log_kappa,
+                logit_recover,
+                k_s,
+                k_y,
+                k_b,
+                k_n,
+                k_bias,
+                r_s,
+                r_y,
+                r_b,
+                r_n,
+                r_bias,
+                logit_c_decay,
+                k_c,
+                r_c,
+                logit_alpha,
+                log_lambda,
+                logit_c_suppress,
+                gU,
+                gnov_out,
+                gp_out,
+                gay_out,
+                gwrite_out,
+                ge_out,
+                gc_out,
+                gfinal_b,
+                gfinal_e,
+                gfinal_c,
+            )
         )
 
         return (
@@ -1845,22 +2385,58 @@ def dabsn_core_scan_trainable_fused(
     if any(value.shape != (B, H) for value in (initial_b, initial_e, initial_c)):
         raise ValueError(f"initial_state tensors must have shape {(B, H)}")
     return DABSNCoreScanTritonFusedBackward.apply(
-        Wx, Wgx, Ug, A,
-        beta, log_kappa, logit_recover,
-        k_s, k_y, k_b, k_n, k_bias,
-        r_s, r_y, r_b, r_n, r_bias,
-        logit_c_decay, k_c, r_c,
-        logit_alpha, log_lambda, logit_c_suppress,
-        initial_b, initial_e, initial_c,
-        bool(return_tape), bool(precise_tape),
+        Wx,
+        Wgx,
+        Ug,
+        A,
+        beta,
+        log_kappa,
+        logit_recover,
+        k_s,
+        k_y,
+        k_b,
+        k_n,
+        k_bias,
+        r_s,
+        r_y,
+        r_b,
+        r_n,
+        r_bias,
+        logit_c_decay,
+        k_c,
+        r_c,
+        logit_alpha,
+        log_lambda,
+        logit_c_suppress,
+        initial_b,
+        initial_e,
+        initial_c,
+        bool(return_tape),
+        bool(precise_tape),
         bool(return_final_state),
     )
 
 
 @triton.jit
 def _dabsn_admitted_three_way_fwd(
-    Q, KB, WB, WBNext, Cocktail, CB, KeyBias, Adm, Allow, InductAllow, HasElig, InductElig, Out,
-    Scale, ShortGain, PadGain, InductGain, CocktailGain,
+    Q,
+    KB,
+    WB,
+    WBNext,
+    Cocktail,
+    CB,
+    KeyBias,
+    Adm,
+    Allow,
+    InductAllow,
+    HasElig,
+    InductElig,
+    Out,
+    Scale,
+    ShortGain,
+    PadGain,
+    InductGain,
+    CocktailGain,
     T: tl.constexpr,
     N: tl.constexpr,
     H: tl.constexpr,
@@ -1900,7 +2476,9 @@ def _dabsn_admitted_three_way_fwd(
         wb = tl.load(WB + (bidx * N + j) * H + h, mask=hmask, other=0.0).to(tl.float32)
         wbn = tl.load(WBNext + (bidx * N + j) * H + h, mask=hmask, other=0.0).to(tl.float32)
         dot = tl.sum(q * k, axis=0) * scale
-        key_adm = tl.load(KeyBias + bidx * N + j).to(tl.float32) + tl.load(Adm + bidx * N + j).to(tl.float32)
+        key_adm = tl.load(KeyBias + bidx * N + j).to(tl.float32) + tl.load(Adm + bidx * N + j).to(
+            tl.float32
+        )
         short_score = dot + key_adm
         cb0 = tl.load(CB + (bidx * N + j) * 4 + 0).to(tl.float32)
         cb1 = tl.load(CB + (bidx * N + j) * 4 + 1).to(tl.float32)
@@ -1941,15 +2519,32 @@ def _dabsn_admitted_three_way_fwd(
 
     short = tl.where(has, acc_s / tl.maximum(l_s, 1.0e-12), tl.zeros((BLOCK_H,), tl.float32))
     perm = tl.where(has, acc_p / tl.maximum(l_p, 1.0e-12), tl.zeros((BLOCK_H,), tl.float32))
-    induct = tl.where(induct_has, acc_i / tl.maximum(l_i, 1.0e-12), tl.zeros((BLOCK_H,), tl.float32))
+    induct = tl.where(
+        induct_has, acc_i / tl.maximum(l_i, 1.0e-12), tl.zeros((BLOCK_H,), tl.float32)
+    )
     out = short_gain * short + pad_gain * perm + induct_gain * induct
     tl.store(Out + (bidx * T + tidx) * H + h, out, mask=hmask)
 
 
 @triton.jit
 def _dabsn_admitted_three_way_compact_fwd(
-    Q, KB, WB, WBNext, Cocktail, CB, KeyBias, Adm, BankIdx, BankValid, Count, Out,
-    Scale, ShortGain, PadGain, InductGain, CocktailGain,
+    Q,
+    KB,
+    WB,
+    WBNext,
+    Cocktail,
+    CB,
+    KeyBias,
+    Adm,
+    BankIdx,
+    BankValid,
+    Count,
+    Out,
+    Scale,
+    ShortGain,
+    PadGain,
+    InductGain,
+    CocktailGain,
     T: tl.constexpr,
     N: tl.constexpr,
     H: tl.constexpr,
@@ -2003,7 +2598,9 @@ def _dabsn_admitted_three_way_compact_fwd(
         wb = tl.load(WB + (bidx * N + j) * H + h, mask=hmask, other=0.0).to(tl.float32)
         wbn = tl.load(WBNext + (bidx * N + j) * H + h, mask=hmask, other=0.0).to(tl.float32)
         dot = tl.sum(q * k, axis=0) * scale
-        key_adm = tl.load(KeyBias + bidx * N + j).to(tl.float32) + tl.load(Adm + bidx * N + j).to(tl.float32)
+        key_adm = tl.load(KeyBias + bidx * N + j).to(tl.float32) + tl.load(Adm + bidx * N + j).to(
+            tl.float32
+        )
         short_score = dot + key_adm
         cb0 = tl.load(CB + (bidx * N + j) * 4 + 0).to(tl.float32)
         cb1 = tl.load(CB + (bidx * N + j) * 4 + 1).to(tl.float32)
@@ -2041,15 +2638,32 @@ def _dabsn_admitted_three_way_compact_fwd(
 
     short = tl.where(has != 0, acc_s / tl.maximum(l_s, 1.0e-12), tl.zeros((BLOCK_H,), tl.float32))
     perm = tl.where(has != 0, acc_p / tl.maximum(l_p, 1.0e-12), tl.zeros((BLOCK_H,), tl.float32))
-    induct = tl.where(induct_has != 0, acc_i / tl.maximum(l_i, 1.0e-12), tl.zeros((BLOCK_H,), tl.float32))
+    induct = tl.where(
+        induct_has != 0, acc_i / tl.maximum(l_i, 1.0e-12), tl.zeros((BLOCK_H,), tl.float32)
+    )
     out = short_gain * short + pad_gain * perm + induct_gain * induct
     tl.store(Out + (bidx * T + tidx) * H + h, out, mask=hmask)
 
 
 @triton.jit
 def _dabsn_admitted_three_way_compact_flash_fwd(
-    Q, KB, WB, WBNext, Cocktail, CB, KeyBias, Adm, BankIdx, BankValid, Count, Out,
-    Scale, ShortGain, PadGain, InductGain, CocktailGain,
+    Q,
+    KB,
+    WB,
+    WBNext,
+    Cocktail,
+    CB,
+    KeyBias,
+    Adm,
+    BankIdx,
+    BankValid,
+    Count,
+    Out,
+    Scale,
+    ShortGain,
+    PadGain,
+    InductGain,
+    CocktailGain,
     T: tl.constexpr,
     N: tl.constexpr,
     H: tl.constexpr,
@@ -2129,16 +2743,20 @@ def _dabsn_admitted_three_way_compact_flash_fwd(
                 scores += tl.dot(q, tl.trans(k), input_precision="tf32x3")
 
         scores *= scale
-        key_adm = (
-            tl.load(KeyBias + bidx * N + offs_n, mask=n_valid, other=0.0).to(tl.float32)
-            + tl.load(Adm + bidx * N + offs_n, mask=n_valid, other=0.0).to(tl.float32)
-        )
+        key_adm = tl.load(KeyBias + bidx * N + offs_n, mask=n_valid, other=0.0).to(
+            tl.float32
+        ) + tl.load(Adm + bidx * N + offs_n, mask=n_valid, other=0.0).to(tl.float32)
         cb0 = tl.load(CB + (bidx * N + offs_n) * 4 + 0, mask=n_valid, other=0.0).to(tl.float32)
         cb1 = tl.load(CB + (bidx * N + offs_n) * 4 + 1, mask=n_valid, other=0.0).to(tl.float32)
         cb2 = tl.load(CB + (bidx * N + offs_n) * 4 + 2, mask=n_valid, other=0.0).to(tl.float32)
         cb3 = tl.load(CB + (bidx * N + offs_n) * 4 + 3, mask=n_valid, other=0.0).to(tl.float32)
         short_scores = scores + key_adm[None, :]
-        cocktail_scores = (c0[:, None] * cb0[None, :] + c1[:, None] * cb1[None, :] + c2[:, None] * cb2[None, :] + c3[:, None] * cb3[None, :]) * cocktail_gain
+        cocktail_scores = (
+            c0[:, None] * cb0[None, :]
+            + c1[:, None] * cb1[None, :]
+            + c2[:, None] * cb2[None, :]
+            + c3[:, None] * cb3[None, :]
+        ) * cocktail_gain
         perm_scores = short_scores + cocktail_scores
 
         if MODE == 0:
@@ -2171,11 +2789,17 @@ def _dabsn_admitted_three_way_compact_flash_fwd(
         beta_s = tl.where(allow, beta_s, 0.0)
         l_s = l_s * alpha_s + tl.sum(beta_s, axis=1)
         if PREC == "ieee":
-            acc_s = acc_s * alpha_s[:, None] + tl.dot(beta_s.to(values.dtype), values, input_precision="ieee")
+            acc_s = acc_s * alpha_s[:, None] + tl.dot(
+                beta_s.to(values.dtype), values, input_precision="ieee"
+            )
         elif PREC == "tf32":
-            acc_s = acc_s * alpha_s[:, None] + tl.dot(beta_s.to(values.dtype), values, input_precision="tf32")
+            acc_s = acc_s * alpha_s[:, None] + tl.dot(
+                beta_s.to(values.dtype), values, input_precision="tf32"
+            )
         else:
-            acc_s = acc_s * alpha_s[:, None] + tl.dot(beta_s.to(values.dtype), values, input_precision="tf32x3")
+            acc_s = acc_s * alpha_s[:, None] + tl.dot(
+                beta_s.to(values.dtype), values, input_precision="tf32x3"
+            )
         m_s = new_m_s
 
         new_m_p = tl.maximum(m_p, tl.max(p_score, axis=1))
@@ -2184,11 +2808,17 @@ def _dabsn_admitted_three_way_compact_flash_fwd(
         beta_p = tl.where(allow, beta_p, 0.0)
         l_p = l_p * alpha_p + tl.sum(beta_p, axis=1)
         if PREC == "ieee":
-            acc_p = acc_p * alpha_p[:, None] + tl.dot(beta_p.to(values.dtype), values, input_precision="ieee")
+            acc_p = acc_p * alpha_p[:, None] + tl.dot(
+                beta_p.to(values.dtype), values, input_precision="ieee"
+            )
         elif PREC == "tf32":
-            acc_p = acc_p * alpha_p[:, None] + tl.dot(beta_p.to(values.dtype), values, input_precision="tf32")
+            acc_p = acc_p * alpha_p[:, None] + tl.dot(
+                beta_p.to(values.dtype), values, input_precision="tf32"
+            )
         else:
-            acc_p = acc_p * alpha_p[:, None] + tl.dot(beta_p.to(values.dtype), values, input_precision="tf32x3")
+            acc_p = acc_p * alpha_p[:, None] + tl.dot(
+                beta_p.to(values.dtype), values, input_precision="tf32x3"
+            )
         m_p = new_m_p
 
         new_m_i = tl.maximum(m_i, tl.max(i_score, axis=1))
@@ -2197,11 +2827,17 @@ def _dabsn_admitted_three_way_compact_flash_fwd(
         beta_i = tl.where(induct_allow, beta_i, 0.0)
         l_i = l_i * alpha_i + tl.sum(beta_i, axis=1)
         if PREC == "ieee":
-            acc_i = acc_i * alpha_i[:, None] + tl.dot(beta_i.to(next_values.dtype), next_values, input_precision="ieee")
+            acc_i = acc_i * alpha_i[:, None] + tl.dot(
+                beta_i.to(next_values.dtype), next_values, input_precision="ieee"
+            )
         elif PREC == "tf32":
-            acc_i = acc_i * alpha_i[:, None] + tl.dot(beta_i.to(next_values.dtype), next_values, input_precision="tf32")
+            acc_i = acc_i * alpha_i[:, None] + tl.dot(
+                beta_i.to(next_values.dtype), next_values, input_precision="tf32"
+            )
         else:
-            acc_i = acc_i * alpha_i[:, None] + tl.dot(beta_i.to(next_values.dtype), next_values, input_precision="tf32x3")
+            acc_i = acc_i * alpha_i[:, None] + tl.dot(
+                beta_i.to(next_values.dtype), next_values, input_precision="tf32x3"
+            )
         m_i = new_m_i
 
     short = acc_s / tl.maximum(l_s, 1.0e-12)[:, None]
@@ -2220,11 +2856,37 @@ def _dabsn_admitted_three_way_compact_flash_fwd(
 
 @triton.jit
 def _dabsn_admitted_three_way_bwd(
-    Q, KB, WB, WBNext, Cocktail, CB, KeyBias, Adm,
-    Allow, InductAllow, HasElig, InductElig, GradOut,
-    GradQ, GradKB, GradWB, GradWBNext, GradCocktail, GradCB, GradKeyBias, GradAdm,
-    GradScaleParts, GradShortGainParts, GradPadGainParts, GradInductGainParts, GradCocktailGainParts,
-    Scale, ShortGain, PadGain, InductGain, CocktailGain,
+    Q,
+    KB,
+    WB,
+    WBNext,
+    Cocktail,
+    CB,
+    KeyBias,
+    Adm,
+    Allow,
+    InductAllow,
+    HasElig,
+    InductElig,
+    GradOut,
+    GradQ,
+    GradKB,
+    GradWB,
+    GradWBNext,
+    GradCocktail,
+    GradCB,
+    GradKeyBias,
+    GradAdm,
+    GradScaleParts,
+    GradShortGainParts,
+    GradPadGainParts,
+    GradInductGainParts,
+    GradCocktailGainParts,
+    Scale,
+    ShortGain,
+    PadGain,
+    InductGain,
+    CocktailGain,
     T: tl.constexpr,
     N: tl.constexpr,
     H: tl.constexpr,
@@ -2266,7 +2928,9 @@ def _dabsn_admitted_three_way_bwd(
         wb = tl.load(WB + (bidx * N + j) * H + h, mask=hmask, other=0.0).to(tl.float32)
         wbn = tl.load(WBNext + (bidx * N + j) * H + h, mask=hmask, other=0.0).to(tl.float32)
         dot = tl.sum(q * k, axis=0) * scale
-        key_adm = tl.load(KeyBias + bidx * N + j).to(tl.float32) + tl.load(Adm + bidx * N + j).to(tl.float32)
+        key_adm = tl.load(KeyBias + bidx * N + j).to(tl.float32) + tl.load(Adm + bidx * N + j).to(
+            tl.float32
+        )
         short_score = dot + key_adm
         cb0 = tl.load(CB + (bidx * N + j) * 4 + 0).to(tl.float32)
         cb1 = tl.load(CB + (bidx * N + j) * 4 + 1).to(tl.float32)
@@ -2307,7 +2971,9 @@ def _dabsn_admitted_three_way_bwd(
 
     read_s = tl.where(has, acc_s / tl.maximum(l_s, 1.0e-12), tl.zeros((BLOCK_H,), tl.float32))
     read_p = tl.where(has, acc_p / tl.maximum(l_p, 1.0e-12), tl.zeros((BLOCK_H,), tl.float32))
-    read_i = tl.where(induct_has, acc_i / tl.maximum(l_i, 1.0e-12), tl.zeros((BLOCK_H,), tl.float32))
+    read_i = tl.where(
+        induct_has, acc_i / tl.maximum(l_i, 1.0e-12), tl.zeros((BLOCK_H,), tl.float32)
+    )
     gs = gout * short_gain
     gp = gout * pad_gain
     gi = gout * induct_gain
@@ -2329,7 +2995,11 @@ def _dabsn_admitted_three_way_bwd(
         wb = tl.load(WB + (bidx * N + j) * H + h, mask=hmask, other=0.0).to(tl.float32)
         wbn = tl.load(WBNext + (bidx * N + j) * H + h, mask=hmask, other=0.0).to(tl.float32)
         dot_raw = tl.sum(q * k, axis=0)
-        short_score = dot_raw * scale + tl.load(KeyBias + bidx * N + j).to(tl.float32) + tl.load(Adm + bidx * N + j).to(tl.float32)
+        short_score = (
+            dot_raw * scale
+            + tl.load(KeyBias + bidx * N + j).to(tl.float32)
+            + tl.load(Adm + bidx * N + j).to(tl.float32)
+        )
         cb0 = tl.load(CB + (bidx * N + j) * 4 + 0).to(tl.float32)
         cb1 = tl.load(CB + (bidx * N + j) * 4 + 1).to(tl.float32)
         cb2 = tl.load(CB + (bidx * N + j) * 4 + 2).to(tl.float32)
@@ -2350,7 +3020,9 @@ def _dabsn_admitted_three_way_bwd(
 
         tl.atomic_add(GradWB + (bidx * N + j) * H + h, ws * gs + wp * gp, sem="relaxed", mask=hmask)
         tl.atomic_add(GradWBNext + (bidx * N + j) * H + h, wi * gi, sem="relaxed", mask=hmask)
-        tl.atomic_add(GradKB + (bidx * N + j) * H + h, d_short_score * q * scale, sem="relaxed", mask=hmask)
+        tl.atomic_add(
+            GradKB + (bidx * N + j) * H + h, d_short_score * q * scale, sem="relaxed", mask=hmask
+        )
         gq += d_short_score * k * scale
         tl.atomic_add(GradKeyBias + bidx * N + j, d_short_score, sem="relaxed")
         tl.atomic_add(GradAdm + bidx * N + j, d_short_score, sem="relaxed")
@@ -2382,11 +3054,36 @@ def _dabsn_admitted_three_way_bwd(
 
 @triton.jit
 def _dabsn_admitted_three_way_compact_bwd(
-    Q, KB, WB, WBNext, Cocktail, CB, KeyBias, Adm,
-    BankIdx, BankValid, Count, GradOut,
-    GradQ, GradKB, GradWB, GradWBNext, GradCocktail, GradCB, GradKeyBias, GradAdm,
-    GradScaleParts, GradShortGainParts, GradPadGainParts, GradInductGainParts, GradCocktailGainParts,
-    Scale, ShortGain, PadGain, InductGain, CocktailGain,
+    Q,
+    KB,
+    WB,
+    WBNext,
+    Cocktail,
+    CB,
+    KeyBias,
+    Adm,
+    BankIdx,
+    BankValid,
+    Count,
+    GradOut,
+    GradQ,
+    GradKB,
+    GradWB,
+    GradWBNext,
+    GradCocktail,
+    GradCB,
+    GradKeyBias,
+    GradAdm,
+    GradScaleParts,
+    GradShortGainParts,
+    GradPadGainParts,
+    GradInductGainParts,
+    GradCocktailGainParts,
+    Scale,
+    ShortGain,
+    PadGain,
+    InductGain,
+    CocktailGain,
     T: tl.constexpr,
     N: tl.constexpr,
     H: tl.constexpr,
@@ -2441,7 +3138,9 @@ def _dabsn_admitted_three_way_compact_bwd(
         wb = tl.load(WB + (bidx * N + j) * H + h, mask=hmask, other=0.0).to(tl.float32)
         wbn = tl.load(WBNext + (bidx * N + j) * H + h, mask=hmask, other=0.0).to(tl.float32)
         dot = tl.sum(q * k, axis=0) * scale
-        key_adm = tl.load(KeyBias + bidx * N + j).to(tl.float32) + tl.load(Adm + bidx * N + j).to(tl.float32)
+        key_adm = tl.load(KeyBias + bidx * N + j).to(tl.float32) + tl.load(Adm + bidx * N + j).to(
+            tl.float32
+        )
         short_score = dot + key_adm
         cb0 = tl.load(CB + (bidx * N + j) * 4 + 0).to(tl.float32)
         cb1 = tl.load(CB + (bidx * N + j) * 4 + 1).to(tl.float32)
@@ -2480,7 +3179,9 @@ def _dabsn_admitted_three_way_compact_bwd(
 
     read_s = tl.where(has != 0, acc_s / tl.maximum(l_s, 1.0e-12), tl.zeros((BLOCK_H,), tl.float32))
     read_p = tl.where(has != 0, acc_p / tl.maximum(l_p, 1.0e-12), tl.zeros((BLOCK_H,), tl.float32))
-    read_i = tl.where(induct_has != 0, acc_i / tl.maximum(l_i, 1.0e-12), tl.zeros((BLOCK_H,), tl.float32))
+    read_i = tl.where(
+        induct_has != 0, acc_i / tl.maximum(l_i, 1.0e-12), tl.zeros((BLOCK_H,), tl.float32)
+    )
     gs = gout * short_gain
     gp = gout * pad_gain
     gi = gout * induct_gain
@@ -2510,7 +3211,11 @@ def _dabsn_admitted_three_way_compact_bwd(
         wb = tl.load(WB + (bidx * N + j) * H + h, mask=hmask, other=0.0).to(tl.float32)
         wbn = tl.load(WBNext + (bidx * N + j) * H + h, mask=hmask, other=0.0).to(tl.float32)
         dot_raw = tl.sum(q * k, axis=0)
-        short_score = dot_raw * scale + tl.load(KeyBias + bidx * N + j).to(tl.float32) + tl.load(Adm + bidx * N + j).to(tl.float32)
+        short_score = (
+            dot_raw * scale
+            + tl.load(KeyBias + bidx * N + j).to(tl.float32)
+            + tl.load(Adm + bidx * N + j).to(tl.float32)
+        )
         cb0 = tl.load(CB + (bidx * N + j) * 4 + 0).to(tl.float32)
         cb1 = tl.load(CB + (bidx * N + j) * 4 + 1).to(tl.float32)
         cb2 = tl.load(CB + (bidx * N + j) * 4 + 2).to(tl.float32)
@@ -2529,7 +3234,9 @@ def _dabsn_admitted_three_way_compact_bwd(
 
         tl.atomic_add(GradWB + (bidx * N + j) * H + h, ws * gs + wp * gp, sem="relaxed", mask=hmask)
         tl.atomic_add(GradWBNext + (bidx * N + j) * H + h, wi * gi, sem="relaxed", mask=hmask)
-        tl.atomic_add(GradKB + (bidx * N + j) * H + h, d_short_score * q * scale, sem="relaxed", mask=hmask)
+        tl.atomic_add(
+            GradKB + (bidx * N + j) * H + h, d_short_score * q * scale, sem="relaxed", mask=hmask
+        )
         gq += d_short_score * k * scale
         tl.atomic_add(GradKeyBias + bidx * N + j, d_short_score, sem="relaxed")
         tl.atomic_add(GradAdm + bidx * N + j, d_short_score, sem="relaxed")
@@ -2619,7 +3326,7 @@ def _admitted_three_way_eager(
 
 class AdmittedThreeWayReadTritonFunction(torch.autograd.Function):
     @staticmethod
-    def forward(  # type: ignore[override]
+    def forward(
         ctx,
         read_state: Tensor,
         memory_key: Tensor,
@@ -2649,30 +3356,73 @@ class AdmittedThreeWayReadTritonFunction(torch.autograd.Function):
         block = _block_h(H)
         out = torch.empty((B, T, H), device=read_state.device, dtype=read_state.dtype)
         _dabsn_admitted_three_way_fwd[(B * T,)](
-            read_state.contiguous(), memory_key.contiguous(), write_memory.contiguous(), next_write_memory.contiguous(),
-            read_cocktail.contiguous(), memory_cocktail.contiguous(), key_bias.contiguous(), admission_gate.contiguous(),
-            allow.contiguous(), induct_allow.contiguous(), has_elig.contiguous(), induct_elig.contiguous(),
+            read_state.contiguous(),
+            memory_key.contiguous(),
+            write_memory.contiguous(),
+            next_write_memory.contiguous(),
+            read_cocktail.contiguous(),
+            memory_cocktail.contiguous(),
+            key_bias.contiguous(),
+            admission_gate.contiguous(),
+            allow.contiguous(),
+            induct_allow.contiguous(),
+            has_elig.contiguous(),
+            induct_elig.contiguous(),
             out,
             scale.contiguous(),
             short_gain.contiguous(),
             pad_gain.contiguous(),
             induct_gain.contiguous(),
             cocktail_gain.contiguous(),
-            T, N, H,
+            T,
+            N,
+            H,
             BLOCK_H=block,
             num_warps=_fused_num_warps(block),
         )
         ctx.save_for_backward(
-            read_state, memory_key, write_memory, next_write_memory, read_cocktail, memory_cocktail, key_bias, admission_gate, scale,
-            allow, induct_allow, has_elig, induct_elig,
-            short_gain, pad_gain, induct_gain, cocktail_gain,
+            read_state,
+            memory_key,
+            write_memory,
+            next_write_memory,
+            read_cocktail,
+            memory_cocktail,
+            key_bias,
+            admission_gate,
+            scale,
+            allow,
+            induct_allow,
+            has_elig,
+            induct_elig,
+            short_gain,
+            pad_gain,
+            induct_gain,
+            cocktail_gain,
         )
         return out
 
     @staticmethod
-    def backward(ctx, grad_out):  # type: ignore[override]
+    def backward(ctx, grad_out):
         saved = ctx.saved_tensors
-        read_state, memory_key, write_memory, next_write_memory, read_cocktail, memory_cocktail, key_bias, admission_gate, scale, allow, induct_allow, has_elig, induct_elig, short_gain, pad_gain, induct_gain, cocktail_gain = saved
+        (
+            read_state,
+            memory_key,
+            write_memory,
+            next_write_memory,
+            read_cocktail,
+            memory_cocktail,
+            key_bias,
+            admission_gate,
+            scale,
+            allow,
+            induct_allow,
+            has_elig,
+            induct_elig,
+            short_gain,
+            pad_gain,
+            induct_gain,
+            cocktail_gain,
+        ) = saved
         if not grad_out.is_cuda:
             raise RuntimeError("admitted three-way Triton backward requires CUDA grad_out")
         B, T, H = read_state.shape
@@ -2681,49 +3431,95 @@ class AdmittedThreeWayReadTritonFunction(torch.autograd.Function):
         grad_read_state = torch.empty((B, T, H), device=read_state.device, dtype=torch.float32)
         grad_memory_key = torch.zeros((B, N, H), device=memory_key.device, dtype=torch.float32)
         grad_write_memory = torch.zeros((B, N, H), device=write_memory.device, dtype=torch.float32)
-        grad_next_write_memory = torch.zeros((B, N, H), device=next_write_memory.device, dtype=torch.float32)
-        grad_read_cocktail = torch.empty((B, T, read_cocktail.shape[-1]), device=read_cocktail.device, dtype=torch.float32)
-        grad_memory_cocktail = torch.zeros((B, N, memory_cocktail.shape[-1]), device=memory_cocktail.device, dtype=torch.float32)
+        grad_next_write_memory = torch.zeros(
+            (B, N, H), device=next_write_memory.device, dtype=torch.float32
+        )
+        grad_read_cocktail = torch.empty(
+            (B, T, read_cocktail.shape[-1]), device=read_cocktail.device, dtype=torch.float32
+        )
+        grad_memory_cocktail = torch.zeros(
+            (B, N, memory_cocktail.shape[-1]), device=memory_cocktail.device, dtype=torch.float32
+        )
         grad_key_bias = torch.zeros((B, N), device=key_bias.device, dtype=torch.float32)
         grad_admission_gate = torch.zeros((B, N), device=admission_gate.device, dtype=torch.float32)
         grad_scale_parts = torch.empty((B, T), device=read_state.device, dtype=torch.float32)
         grad_short_gain_parts = torch.empty((B, T), device=read_state.device, dtype=torch.float32)
         grad_pad_gain_parts = torch.empty((B, T), device=read_state.device, dtype=torch.float32)
         grad_induct_gain_parts = torch.empty((B, T), device=read_state.device, dtype=torch.float32)
-        grad_cocktail_gain_parts = torch.empty((B, T), device=read_state.device, dtype=torch.float32)
+        grad_cocktail_gain_parts = torch.empty(
+            (B, T), device=read_state.device, dtype=torch.float32
+        )
         _dabsn_admitted_three_way_bwd[(B * T,)](
-            read_state.contiguous(), memory_key.contiguous(), write_memory.contiguous(), next_write_memory.contiguous(),
-            read_cocktail.contiguous(), memory_cocktail.contiguous(), key_bias.contiguous(), admission_gate.contiguous(),
-            allow.contiguous(), induct_allow.contiguous(), has_elig.contiguous(), induct_elig.contiguous(),
+            read_state.contiguous(),
+            memory_key.contiguous(),
+            write_memory.contiguous(),
+            next_write_memory.contiguous(),
+            read_cocktail.contiguous(),
+            memory_cocktail.contiguous(),
+            key_bias.contiguous(),
+            admission_gate.contiguous(),
+            allow.contiguous(),
+            induct_allow.contiguous(),
+            has_elig.contiguous(),
+            induct_elig.contiguous(),
             grad_out.contiguous(),
-            grad_read_state, grad_memory_key, grad_write_memory, grad_next_write_memory, grad_read_cocktail, grad_memory_cocktail, grad_key_bias, grad_admission_gate,
-            grad_scale_parts, grad_short_gain_parts, grad_pad_gain_parts, grad_induct_gain_parts, grad_cocktail_gain_parts,
+            grad_read_state,
+            grad_memory_key,
+            grad_write_memory,
+            grad_next_write_memory,
+            grad_read_cocktail,
+            grad_memory_cocktail,
+            grad_key_bias,
+            grad_admission_gate,
+            grad_scale_parts,
+            grad_short_gain_parts,
+            grad_pad_gain_parts,
+            grad_induct_gain_parts,
+            grad_cocktail_gain_parts,
             scale.contiguous(),
             short_gain.contiguous(),
             pad_gain.contiguous(),
             induct_gain.contiguous(),
             cocktail_gain.contiguous(),
-            T, N, H,
+            T,
+            N,
+            H,
             BLOCK_H=block,
             num_warps=_fused_num_warps(block),
         )
         grad_scale = grad_scale_parts.sum().to(scale.dtype).reshape_as(scale)
         grad_short_gain = grad_short_gain_parts.sum().to(short_gain.dtype).reshape_as(short_gain)
         grad_pad_gain = grad_pad_gain_parts.sum().to(pad_gain.dtype).reshape_as(pad_gain)
-        grad_induct_gain = grad_induct_gain_parts.sum().to(induct_gain.dtype).reshape_as(induct_gain)
-        grad_cocktail_gain = grad_cocktail_gain_parts.sum().to(cocktail_gain.dtype).reshape_as(cocktail_gain)
+        grad_induct_gain = (
+            grad_induct_gain_parts.sum().to(induct_gain.dtype).reshape_as(induct_gain)
+        )
+        grad_cocktail_gain = (
+            grad_cocktail_gain_parts.sum().to(cocktail_gain.dtype).reshape_as(cocktail_gain)
+        )
         return (
-            grad_read_state.to(read_state.dtype), grad_memory_key.to(memory_key.dtype), grad_write_memory.to(write_memory.dtype), grad_next_write_memory.to(next_write_memory.dtype),
-            grad_read_cocktail.to(read_cocktail.dtype), grad_memory_cocktail.to(memory_cocktail.dtype),
-            grad_key_bias.to(key_bias.dtype), grad_admission_gate.to(admission_gate.dtype), grad_scale,
-            None, None, None, None,
-            grad_short_gain, grad_pad_gain, grad_induct_gain, grad_cocktail_gain,
+            grad_read_state.to(read_state.dtype),
+            grad_memory_key.to(memory_key.dtype),
+            grad_write_memory.to(write_memory.dtype),
+            grad_next_write_memory.to(next_write_memory.dtype),
+            grad_read_cocktail.to(read_cocktail.dtype),
+            grad_memory_cocktail.to(memory_cocktail.dtype),
+            grad_key_bias.to(key_bias.dtype),
+            grad_admission_gate.to(admission_gate.dtype),
+            grad_scale,
+            None,
+            None,
+            None,
+            None,
+            grad_short_gain,
+            grad_pad_gain,
+            grad_induct_gain,
+            grad_cocktail_gain,
         )
 
 
 class CompactAdmittedThreeWayReadTritonFunction(torch.autograd.Function):
     @staticmethod
-    def forward(  # type: ignore[override]
+    def forward(
         ctx,
         read_state: Tensor,
         memory_key: Tensor,
@@ -2753,32 +3549,74 @@ class CompactAdmittedThreeWayReadTritonFunction(torch.autograd.Function):
             raise ValueError("bank_idx/bank_valid must have shape [B,N]")
         block = _block_h(H)
         out = torch.empty((B, T, H), device=read_state.device, dtype=read_state.dtype)
-        bank_count = bank_valid.to(torch.int32).sum(dim=1).contiguous()  # Device count for the front-packed bank.
+        bank_count = (
+            bank_valid.to(torch.int32).sum(dim=1).contiguous()
+        )  # Device count for the front-packed bank.
         _dabsn_admitted_three_way_compact_fwd[(B * T,)](
-            read_state.contiguous(), memory_key.contiguous(), write_memory.contiguous(), next_write_memory.contiguous(),
-            read_cocktail.contiguous(), memory_cocktail.contiguous(), key_bias.contiguous(), admission_gate.contiguous(),
-            bank_idx.contiguous(), bank_valid.contiguous(), bank_count, out,
+            read_state.contiguous(),
+            memory_key.contiguous(),
+            write_memory.contiguous(),
+            next_write_memory.contiguous(),
+            read_cocktail.contiguous(),
+            memory_cocktail.contiguous(),
+            key_bias.contiguous(),
+            admission_gate.contiguous(),
+            bank_idx.contiguous(),
+            bank_valid.contiguous(),
+            bank_count,
+            out,
             scale.contiguous(),
             short_gain.contiguous(),
             pad_gain.contiguous(),
             induct_gain.contiguous(),
             cocktail_gain.contiguous(),
-            T, N, H,
+            T,
+            N,
+            H,
             MODE=int(mode),
             BLOCK_H=block,
             num_warps=_fused_num_warps(block),
         )
         ctx.save_for_backward(
-            read_state, memory_key, write_memory, next_write_memory, read_cocktail, memory_cocktail, key_bias, admission_gate,
-            scale, bank_idx, bank_valid, short_gain, pad_gain, induct_gain, cocktail_gain,
+            read_state,
+            memory_key,
+            write_memory,
+            next_write_memory,
+            read_cocktail,
+            memory_cocktail,
+            key_bias,
+            admission_gate,
+            scale,
+            bank_idx,
+            bank_valid,
+            short_gain,
+            pad_gain,
+            induct_gain,
+            cocktail_gain,
         )
         ctx.mode = int(mode)
         return out
 
     @staticmethod
-    def backward(ctx, grad_out):  # type: ignore[override]
+    def backward(ctx, grad_out):
         saved = ctx.saved_tensors
-        read_state, memory_key, write_memory, next_write_memory, read_cocktail, memory_cocktail, key_bias, admission_gate, scale, bank_idx, bank_valid, short_gain, pad_gain, induct_gain, cocktail_gain = saved
+        (
+            read_state,
+            memory_key,
+            write_memory,
+            next_write_memory,
+            read_cocktail,
+            memory_cocktail,
+            key_bias,
+            admission_gate,
+            scale,
+            bank_idx,
+            bank_valid,
+            short_gain,
+            pad_gain,
+            induct_gain,
+            cocktail_gain,
+        ) = saved
         if not grad_out.is_cuda:
             raise RuntimeError("compact admitted three-way Triton backward requires CUDA grad_out")
         B, T, H = read_state.shape
@@ -2787,29 +3625,61 @@ class CompactAdmittedThreeWayReadTritonFunction(torch.autograd.Function):
         grad_read_state = torch.empty((B, T, H), device=read_state.device, dtype=torch.float32)
         grad_memory_key = torch.zeros((B, N, H), device=memory_key.device, dtype=torch.float32)
         grad_write_memory = torch.zeros((B, N, H), device=write_memory.device, dtype=torch.float32)
-        grad_next_write_memory = torch.zeros((B, N, H), device=next_write_memory.device, dtype=torch.float32)
-        grad_read_cocktail = torch.empty((B, T, read_cocktail.shape[-1]), device=read_cocktail.device, dtype=torch.float32)
-        grad_memory_cocktail = torch.zeros((B, N, memory_cocktail.shape[-1]), device=memory_cocktail.device, dtype=torch.float32)
+        grad_next_write_memory = torch.zeros(
+            (B, N, H), device=next_write_memory.device, dtype=torch.float32
+        )
+        grad_read_cocktail = torch.empty(
+            (B, T, read_cocktail.shape[-1]), device=read_cocktail.device, dtype=torch.float32
+        )
+        grad_memory_cocktail = torch.zeros(
+            (B, N, memory_cocktail.shape[-1]), device=memory_cocktail.device, dtype=torch.float32
+        )
         grad_key_bias = torch.zeros((B, N), device=key_bias.device, dtype=torch.float32)
         grad_admission_gate = torch.zeros((B, N), device=admission_gate.device, dtype=torch.float32)
         grad_scale_parts = torch.empty((B, T), device=read_state.device, dtype=torch.float32)
         grad_short_gain_parts = torch.empty((B, T), device=read_state.device, dtype=torch.float32)
         grad_pad_gain_parts = torch.empty((B, T), device=read_state.device, dtype=torch.float32)
         grad_induct_gain_parts = torch.empty((B, T), device=read_state.device, dtype=torch.float32)
-        grad_cocktail_gain_parts = torch.empty((B, T), device=read_state.device, dtype=torch.float32)
-        bank_count = bank_valid.to(torch.int32).sum(dim=1).contiguous()  # Device count for the front-packed bank.
+        grad_cocktail_gain_parts = torch.empty(
+            (B, T), device=read_state.device, dtype=torch.float32
+        )
+        bank_count = (
+            bank_valid.to(torch.int32).sum(dim=1).contiguous()
+        )  # Device count for the front-packed bank.
         _dabsn_admitted_three_way_compact_bwd[(B * T,)](
-            read_state.contiguous(), memory_key.contiguous(), write_memory.contiguous(), next_write_memory.contiguous(),
-            read_cocktail.contiguous(), memory_cocktail.contiguous(), key_bias.contiguous(), admission_gate.contiguous(),
-            bank_idx.contiguous(), bank_valid.contiguous(), bank_count, grad_out.contiguous(),
-            grad_read_state, grad_memory_key, grad_write_memory, grad_next_write_memory, grad_read_cocktail, grad_memory_cocktail, grad_key_bias, grad_admission_gate,
-            grad_scale_parts, grad_short_gain_parts, grad_pad_gain_parts, grad_induct_gain_parts, grad_cocktail_gain_parts,
+            read_state.contiguous(),
+            memory_key.contiguous(),
+            write_memory.contiguous(),
+            next_write_memory.contiguous(),
+            read_cocktail.contiguous(),
+            memory_cocktail.contiguous(),
+            key_bias.contiguous(),
+            admission_gate.contiguous(),
+            bank_idx.contiguous(),
+            bank_valid.contiguous(),
+            bank_count,
+            grad_out.contiguous(),
+            grad_read_state,
+            grad_memory_key,
+            grad_write_memory,
+            grad_next_write_memory,
+            grad_read_cocktail,
+            grad_memory_cocktail,
+            grad_key_bias,
+            grad_admission_gate,
+            grad_scale_parts,
+            grad_short_gain_parts,
+            grad_pad_gain_parts,
+            grad_induct_gain_parts,
+            grad_cocktail_gain_parts,
             scale.contiguous(),
             short_gain.contiguous(),
             pad_gain.contiguous(),
             induct_gain.contiguous(),
             cocktail_gain.contiguous(),
-            T, N, H,
+            T,
+            N,
+            H,
             MODE=int(ctx.mode),
             BLOCK_H=block,
             num_warps=_fused_num_warps(block),
@@ -2817,20 +3687,35 @@ class CompactAdmittedThreeWayReadTritonFunction(torch.autograd.Function):
         grad_scale = grad_scale_parts.sum().to(scale.dtype).reshape_as(scale)
         grad_short_gain = grad_short_gain_parts.sum().to(short_gain.dtype).reshape_as(short_gain)
         grad_pad_gain = grad_pad_gain_parts.sum().to(pad_gain.dtype).reshape_as(pad_gain)
-        grad_induct_gain = grad_induct_gain_parts.sum().to(induct_gain.dtype).reshape_as(induct_gain)
-        grad_cocktail_gain = grad_cocktail_gain_parts.sum().to(cocktail_gain.dtype).reshape_as(cocktail_gain)
+        grad_induct_gain = (
+            grad_induct_gain_parts.sum().to(induct_gain.dtype).reshape_as(induct_gain)
+        )
+        grad_cocktail_gain = (
+            grad_cocktail_gain_parts.sum().to(cocktail_gain.dtype).reshape_as(cocktail_gain)
+        )
         return (
-            grad_read_state.to(read_state.dtype), grad_memory_key.to(memory_key.dtype), grad_write_memory.to(write_memory.dtype), grad_next_write_memory.to(next_write_memory.dtype),
-            grad_read_cocktail.to(read_cocktail.dtype), grad_memory_cocktail.to(memory_cocktail.dtype),
-            grad_key_bias.to(key_bias.dtype), grad_admission_gate.to(admission_gate.dtype), grad_scale,
-            None, None, None,
-            grad_short_gain, grad_pad_gain, grad_induct_gain, grad_cocktail_gain,
+            grad_read_state.to(read_state.dtype),
+            grad_memory_key.to(memory_key.dtype),
+            grad_write_memory.to(write_memory.dtype),
+            grad_next_write_memory.to(next_write_memory.dtype),
+            grad_read_cocktail.to(read_cocktail.dtype),
+            grad_memory_cocktail.to(memory_cocktail.dtype),
+            grad_key_bias.to(key_bias.dtype),
+            grad_admission_gate.to(admission_gate.dtype),
+            grad_scale,
+            None,
+            None,
+            None,
+            grad_short_gain,
+            grad_pad_gain,
+            grad_induct_gain,
+            grad_cocktail_gain,
         )
 
 
 class CompactFlashAdmittedThreeWayReadTritonFunction(torch.autograd.Function):
     @staticmethod
-    def forward(  # type: ignore[override]
+    def forward(
         ctx,
         read_state: Tensor,
         memory_key: Tensor,
@@ -2871,17 +3756,30 @@ class CompactFlashAdmittedThreeWayReadTritonFunction(torch.autograd.Function):
         prec = _os.environ.get("DABSN_FLASH_PREC", "tf32x3")
         out = torch.empty((B, T, H), device=read_state.device, dtype=read_state.dtype)
         grid = (triton.cdiv(T, block_m), triton.cdiv(H, block_v), B)
-        bank_count = bank_valid.to(torch.int32).sum(dim=1).contiguous()  # Device count for the front-packed bank.
+        bank_count = (
+            bank_valid.to(torch.int32).sum(dim=1).contiguous()
+        )  # Device count for the front-packed bank.
         _dabsn_admitted_three_way_compact_flash_fwd[grid](
-            read_state.contiguous(), memory_key.contiguous(), write_memory.contiguous(), next_write_memory.contiguous(),
-            read_cocktail.contiguous(), memory_cocktail.contiguous(), key_bias.contiguous(), admission_gate.contiguous(),
-            bank_idx.contiguous(), bank_valid.contiguous(), bank_count, out,
+            read_state.contiguous(),
+            memory_key.contiguous(),
+            write_memory.contiguous(),
+            next_write_memory.contiguous(),
+            read_cocktail.contiguous(),
+            memory_cocktail.contiguous(),
+            key_bias.contiguous(),
+            admission_gate.contiguous(),
+            bank_idx.contiguous(),
+            bank_valid.contiguous(),
+            bank_count,
+            out,
             scale.contiguous(),
             short_gain.contiguous(),
             pad_gain.contiguous(),
             induct_gain.contiguous(),
             cocktail_gain.contiguous(),
-            T, N, H,
+            T,
+            N,
+            H,
             MODE=int(mode),
             BLOCK_M=block_m,
             BLOCK_N=block_n,
@@ -2892,47 +3790,110 @@ class CompactFlashAdmittedThreeWayReadTritonFunction(torch.autograd.Function):
             num_stages=int(_os.environ.get("DABSN_FLASH_STAGES", "3")),
         )
         ctx.save_for_backward(
-            read_state, memory_key, write_memory, next_write_memory, read_cocktail, memory_cocktail, key_bias, admission_gate,
-            scale, bank_idx, bank_valid, short_gain, pad_gain, induct_gain, cocktail_gain,
+            read_state,
+            memory_key,
+            write_memory,
+            next_write_memory,
+            read_cocktail,
+            memory_cocktail,
+            key_bias,
+            admission_gate,
+            scale,
+            bank_idx,
+            bank_valid,
+            short_gain,
+            pad_gain,
+            induct_gain,
+            cocktail_gain,
         )
         ctx.mode = int(mode)
         return out
 
     @staticmethod
-    def backward(ctx, grad_out):  # type: ignore[override]
+    def backward(ctx, grad_out):
         saved = ctx.saved_tensors
-        read_state, memory_key, write_memory, next_write_memory, read_cocktail, memory_cocktail, key_bias, admission_gate, scale, bank_idx, bank_valid, short_gain, pad_gain, induct_gain, cocktail_gain = saved
+        (
+            read_state,
+            memory_key,
+            write_memory,
+            next_write_memory,
+            read_cocktail,
+            memory_cocktail,
+            key_bias,
+            admission_gate,
+            scale,
+            bank_idx,
+            bank_valid,
+            short_gain,
+            pad_gain,
+            induct_gain,
+            cocktail_gain,
+        ) = saved
         if not grad_out.is_cuda:
-            raise RuntimeError("compact flash admitted three-way Triton backward requires CUDA grad_out")
+            raise RuntimeError(
+                "compact flash admitted three-way Triton backward requires CUDA grad_out"
+            )
         B, T, H = read_state.shape
         N = memory_key.shape[1]
         block = _block_h(H)
         grad_read_state = torch.empty((B, T, H), device=read_state.device, dtype=torch.float32)
         grad_memory_key = torch.zeros((B, N, H), device=memory_key.device, dtype=torch.float32)
         grad_write_memory = torch.zeros((B, N, H), device=write_memory.device, dtype=torch.float32)
-        grad_next_write_memory = torch.zeros((B, N, H), device=next_write_memory.device, dtype=torch.float32)
-        grad_read_cocktail = torch.empty((B, T, read_cocktail.shape[-1]), device=read_cocktail.device, dtype=torch.float32)
-        grad_memory_cocktail = torch.zeros((B, N, memory_cocktail.shape[-1]), device=memory_cocktail.device, dtype=torch.float32)
+        grad_next_write_memory = torch.zeros(
+            (B, N, H), device=next_write_memory.device, dtype=torch.float32
+        )
+        grad_read_cocktail = torch.empty(
+            (B, T, read_cocktail.shape[-1]), device=read_cocktail.device, dtype=torch.float32
+        )
+        grad_memory_cocktail = torch.zeros(
+            (B, N, memory_cocktail.shape[-1]), device=memory_cocktail.device, dtype=torch.float32
+        )
         grad_key_bias = torch.zeros((B, N), device=key_bias.device, dtype=torch.float32)
         grad_admission_gate = torch.zeros((B, N), device=admission_gate.device, dtype=torch.float32)
         grad_scale_parts = torch.empty((B, T), device=read_state.device, dtype=torch.float32)
         grad_short_gain_parts = torch.empty((B, T), device=read_state.device, dtype=torch.float32)
         grad_pad_gain_parts = torch.empty((B, T), device=read_state.device, dtype=torch.float32)
         grad_induct_gain_parts = torch.empty((B, T), device=read_state.device, dtype=torch.float32)
-        grad_cocktail_gain_parts = torch.empty((B, T), device=read_state.device, dtype=torch.float32)
-        bank_count = bank_valid.to(torch.int32).sum(dim=1).contiguous()  # Device count for the front-packed bank.
+        grad_cocktail_gain_parts = torch.empty(
+            (B, T), device=read_state.device, dtype=torch.float32
+        )
+        bank_count = (
+            bank_valid.to(torch.int32).sum(dim=1).contiguous()
+        )  # Device count for the front-packed bank.
         _dabsn_admitted_three_way_compact_bwd[(B * T,)](
-            read_state.contiguous(), memory_key.contiguous(), write_memory.contiguous(), next_write_memory.contiguous(),
-            read_cocktail.contiguous(), memory_cocktail.contiguous(), key_bias.contiguous(), admission_gate.contiguous(),
-            bank_idx.contiguous(), bank_valid.contiguous(), bank_count, grad_out.contiguous(),
-            grad_read_state, grad_memory_key, grad_write_memory, grad_next_write_memory, grad_read_cocktail, grad_memory_cocktail, grad_key_bias, grad_admission_gate,
-            grad_scale_parts, grad_short_gain_parts, grad_pad_gain_parts, grad_induct_gain_parts, grad_cocktail_gain_parts,
+            read_state.contiguous(),
+            memory_key.contiguous(),
+            write_memory.contiguous(),
+            next_write_memory.contiguous(),
+            read_cocktail.contiguous(),
+            memory_cocktail.contiguous(),
+            key_bias.contiguous(),
+            admission_gate.contiguous(),
+            bank_idx.contiguous(),
+            bank_valid.contiguous(),
+            bank_count,
+            grad_out.contiguous(),
+            grad_read_state,
+            grad_memory_key,
+            grad_write_memory,
+            grad_next_write_memory,
+            grad_read_cocktail,
+            grad_memory_cocktail,
+            grad_key_bias,
+            grad_admission_gate,
+            grad_scale_parts,
+            grad_short_gain_parts,
+            grad_pad_gain_parts,
+            grad_induct_gain_parts,
+            grad_cocktail_gain_parts,
             scale.contiguous(),
             short_gain.contiguous(),
             pad_gain.contiguous(),
             induct_gain.contiguous(),
             cocktail_gain.contiguous(),
-            T, N, H,
+            T,
+            N,
+            H,
             MODE=int(ctx.mode),
             BLOCK_H=block,
             num_warps=_fused_num_warps(block),
@@ -2940,14 +3901,29 @@ class CompactFlashAdmittedThreeWayReadTritonFunction(torch.autograd.Function):
         grad_scale = grad_scale_parts.sum().to(scale.dtype).reshape_as(scale)
         grad_short_gain = grad_short_gain_parts.sum().to(short_gain.dtype).reshape_as(short_gain)
         grad_pad_gain = grad_pad_gain_parts.sum().to(pad_gain.dtype).reshape_as(pad_gain)
-        grad_induct_gain = grad_induct_gain_parts.sum().to(induct_gain.dtype).reshape_as(induct_gain)
-        grad_cocktail_gain = grad_cocktail_gain_parts.sum().to(cocktail_gain.dtype).reshape_as(cocktail_gain)
+        grad_induct_gain = (
+            grad_induct_gain_parts.sum().to(induct_gain.dtype).reshape_as(induct_gain)
+        )
+        grad_cocktail_gain = (
+            grad_cocktail_gain_parts.sum().to(cocktail_gain.dtype).reshape_as(cocktail_gain)
+        )
         return (
-            grad_read_state.to(read_state.dtype), grad_memory_key.to(memory_key.dtype), grad_write_memory.to(write_memory.dtype), grad_next_write_memory.to(next_write_memory.dtype),
-            grad_read_cocktail.to(read_cocktail.dtype), grad_memory_cocktail.to(memory_cocktail.dtype),
-            grad_key_bias.to(key_bias.dtype), grad_admission_gate.to(admission_gate.dtype), grad_scale,
-            None, None, None,
-            grad_short_gain, grad_pad_gain, grad_induct_gain, grad_cocktail_gain,
+            grad_read_state.to(read_state.dtype),
+            grad_memory_key.to(memory_key.dtype),
+            grad_write_memory.to(write_memory.dtype),
+            grad_next_write_memory.to(next_write_memory.dtype),
+            grad_read_cocktail.to(read_cocktail.dtype),
+            grad_memory_cocktail.to(memory_cocktail.dtype),
+            grad_key_bias.to(key_bias.dtype),
+            grad_admission_gate.to(admission_gate.dtype),
+            grad_scale,
+            None,
+            None,
+            None,
+            grad_short_gain,
+            grad_pad_gain,
+            grad_induct_gain,
+            grad_cocktail_gain,
         )
 
 
@@ -2972,14 +3948,36 @@ def admitted_three_way_read_trainable(
     cocktail_gain: Tensor,
 ) -> Tensor:
     return AdmittedThreeWayReadTritonFunction.apply(
-        read_state, memory_key, write_memory, next_write_memory, read_cocktail, memory_cocktail, key_bias, admission_gate, scale,
-        allow, induct_allow, has_elig, induct_elig,
-        short_gain, pad_gain, induct_gain, cocktail_gain,
+        read_state,
+        memory_key,
+        write_memory,
+        next_write_memory,
+        read_cocktail,
+        memory_cocktail,
+        key_bias,
+        admission_gate,
+        scale,
+        allow,
+        induct_allow,
+        has_elig,
+        induct_elig,
+        short_gain,
+        pad_gain,
+        induct_gain,
+        cocktail_gain,
     )
 
 
-def _frontpack_admitted_bank(memory_key, write_memory, next_write_memory, memory_cocktail,
-                             key_bias, admission_gate, bank_idx, bank_valid):
+def _frontpack_admitted_bank(
+    memory_key,
+    write_memory,
+    next_write_memory,
+    memory_cocktail,
+    key_bias,
+    admission_gate,
+    bank_idx,
+    bank_valid,
+):
     """Move live entries to the front for count-bounded kernel traversal.
 
     The order comes from a detached mask, while tensor gathers remain tracked by
@@ -3019,13 +4017,42 @@ def admitted_three_way_read_compact_trainable(
     cocktail_gain: Tensor,
 ) -> Tensor:
     mode_id = 0 if mode == "seq" else 1
-    memory_key, write_memory, next_write_memory, memory_cocktail, key_bias, admission_gate, bank_idx, bank_valid = \
-        _frontpack_admitted_bank(memory_key, write_memory, next_write_memory, memory_cocktail,
-                                 key_bias, admission_gate, bank_idx, bank_valid)
+    (
+        memory_key,
+        write_memory,
+        next_write_memory,
+        memory_cocktail,
+        key_bias,
+        admission_gate,
+        bank_idx,
+        bank_valid,
+    ) = _frontpack_admitted_bank(
+        memory_key,
+        write_memory,
+        next_write_memory,
+        memory_cocktail,
+        key_bias,
+        admission_gate,
+        bank_idx,
+        bank_valid,
+    )
     return CompactAdmittedThreeWayReadTritonFunction.apply(
-        read_state, memory_key, write_memory, next_write_memory, read_cocktail, memory_cocktail,
-        key_bias, admission_gate, scale, bank_idx, bank_valid, mode_id,
-        short_gain, pad_gain, induct_gain, cocktail_gain,
+        read_state,
+        memory_key,
+        write_memory,
+        next_write_memory,
+        read_cocktail,
+        memory_cocktail,
+        key_bias,
+        admission_gate,
+        scale,
+        bank_idx,
+        bank_valid,
+        mode_id,
+        short_gain,
+        pad_gain,
+        induct_gain,
+        cocktail_gain,
     )
 
 
@@ -3056,13 +4083,42 @@ def admitted_three_way_read_compact_flash_trainable(
     programs over the bank, so reports must not claim it is flash-tiled backward.
     """
     mode_id = 0 if mode == "seq" else 1
-    memory_key, write_memory, next_write_memory, memory_cocktail, key_bias, admission_gate, bank_idx, bank_valid = \
-        _frontpack_admitted_bank(memory_key, write_memory, next_write_memory, memory_cocktail,
-                                 key_bias, admission_gate, bank_idx, bank_valid)
+    (
+        memory_key,
+        write_memory,
+        next_write_memory,
+        memory_cocktail,
+        key_bias,
+        admission_gate,
+        bank_idx,
+        bank_valid,
+    ) = _frontpack_admitted_bank(
+        memory_key,
+        write_memory,
+        next_write_memory,
+        memory_cocktail,
+        key_bias,
+        admission_gate,
+        bank_idx,
+        bank_valid,
+    )
     return CompactFlashAdmittedThreeWayReadTritonFunction.apply(
-        read_state, memory_key, write_memory, next_write_memory, read_cocktail, memory_cocktail,
-        key_bias, admission_gate, scale, bank_idx, bank_valid, mode_id,
-        short_gain, pad_gain, induct_gain, cocktail_gain,
+        read_state,
+        memory_key,
+        write_memory,
+        next_write_memory,
+        read_cocktail,
+        memory_cocktail,
+        key_bias,
+        admission_gate,
+        scale,
+        bank_idx,
+        bank_valid,
+        mode_id,
+        short_gain,
+        pad_gain,
+        induct_gain,
+        cocktail_gain,
     )
 
 
@@ -3115,20 +4171,49 @@ def admitted_three_way_read_compact_infer(
     out = torch.empty((B, T, H), device=read_state.device, dtype=read_state.dtype)
     grid = (triton.cdiv(T, block_m), triton.cdiv(H, block_v), B)
     # Front-pack live entries for count-bounded traversal of any bank mask.
-    memory_key, write_memory, next_write_memory, memory_cocktail, key_bias, admission_gate, bank_idx, bank_valid = \
-        _frontpack_admitted_bank(memory_key, write_memory, next_write_memory, memory_cocktail,
-                                 key_bias, admission_gate, bank_idx, bank_valid)
-    bank_count = bank_valid.to(torch.int32).sum(dim=1).contiguous()  # Device count for the front-packed bank.
+    (
+        memory_key,
+        write_memory,
+        next_write_memory,
+        memory_cocktail,
+        key_bias,
+        admission_gate,
+        bank_idx,
+        bank_valid,
+    ) = _frontpack_admitted_bank(
+        memory_key,
+        write_memory,
+        next_write_memory,
+        memory_cocktail,
+        key_bias,
+        admission_gate,
+        bank_idx,
+        bank_valid,
+    )
+    bank_count = (
+        bank_valid.to(torch.int32).sum(dim=1).contiguous()
+    )  # Device count for the front-packed bank.
     _dabsn_admitted_three_way_compact_flash_fwd[grid](
-        read_state.contiguous(), memory_key.contiguous(), write_memory.contiguous(), next_write_memory.contiguous(),
-        read_cocktail.contiguous(), memory_cocktail.contiguous(), key_bias.contiguous(), admission_gate.contiguous(),
-        bank_idx.contiguous(), bank_valid.contiguous(), bank_count, out,
+        read_state.contiguous(),
+        memory_key.contiguous(),
+        write_memory.contiguous(),
+        next_write_memory.contiguous(),
+        read_cocktail.contiguous(),
+        memory_cocktail.contiguous(),
+        key_bias.contiguous(),
+        admission_gate.contiguous(),
+        bank_idx.contiguous(),
+        bank_valid.contiguous(),
+        bank_count,
+        out,
         scale.contiguous(),
         short_gain.contiguous(),
         pad_gain.contiguous(),
         induct_gain.contiguous(),
         cocktail_gain.contiguous(),
-        T, N, H,
+        T,
+        N,
+        H,
         MODE=mode_id,
         BLOCK_M=block_m,
         BLOCK_N=block_n,
@@ -3175,65 +4260,31 @@ def dense_bmm_three_way_read(
     changing the math. ``total_T`` is the full sequence length (defaults to this
     tile's ``T``) and only matters for the field-geometry induction horizon.
     """
-    B, T, H = read_state.shape
-    N = memory_key.shape[1]
-    full_T = int(total_T) if total_T is not None else T
-    scale_f = scale.to(torch.float32)
-    # Keep contractions in the caller's compute dtype so BF16/FP16 tensor
-    # cores are actually used. Scores/nonlinearities and recurrent state still
-    # accumulate in FP32. Float32 callers retain the reference path unchanged.
-    q = read_state
-    kb = memory_key.to(read_state.dtype)
-    compat = torch.bmm(q, kb.transpose(1, 2)).float() * scale_f               # [B,T,N]
-    key_adm = (key_bias.to(torch.float32) + admission_gate.to(torch.float32)).unsqueeze(1)  # [B,1,N]
-    short_scores = compat + key_adm
-    cc = torch.bmm(
-        read_cocktail.to(read_state.dtype),
-        memory_cocktail.to(read_state.dtype).transpose(1, 2),
-    ).float()
-    perm_scores = short_scores + cc * cocktail_gain.to(torch.float32)
-    valid = bank_valid.unsqueeze(1)                                           # [B,1,N]
-    bank_pos = bank_idx.unsqueeze(1)                                          # [B,1,N]
-    if mode == "seq":
-        qpos = (torch.arange(T, device=read_state.device) + query_offset).view(1, T, 1)
-        allow = valid & (bank_pos <= qpos)
-        induct_allow = valid & (bank_pos < qpos)
-    else:
-        allow = valid.expand(B, T, N)
-        induct_allow = valid & (bank_pos < (full_T - 1))
+    # Keep one source of truth for the deployed equations. The stable registered
+    # operator and this compatibility entry point both execute this helper, so
+    # crossing the dispatcher boundary cannot silently change read numerics.
+    from .compact_admitted import dense_bmm_three_way_read_exact
 
-    def rd(scores: Tensor, values: Tensor, mask: Tensor) -> Tensor:
-        # The weight tensor is [B,T,N] -- the largest thing in the read. Building
-        # it as `where(elig, nan_to_num(w), zeros_like(w))` allocated three more
-        # of them on top of the masked-fill copy and the softmax output: five
-        # live [B,T,N] buffers for one read, three reads per call.
-        #
-        # The economy is kept without touching the softmax output, which must
-        # never be written in place: SoftmaxBackward0 saves it, so mutating it
-        # bumps its version counter and backward dies with "a variable needed
-        # for gradient computation has been modified by an inplace operation".
-        # Two changes buy the same buffer count and stay differentiable:
-        #
-        #   * mask with the dtype's finite minimum instead of -inf, so a row
-        #     with no eligible key softmaxes to a harmless uniform rather than
-        #     NaN. exp(finfo.min - row_max) underflows to exactly zero, so every
-        #     eligible row is bit-identical to the -inf form and no repair pass
-        #     is needed at all.
-        #   * zero the ineligible rows on the read vector ([B,T,H]) instead of
-        #     the weights ([B,T,N]). It is the smaller tensor, and bmm saves its
-        #     inputs rather than its output, so this multiply is legal in place.
-        elig = mask.any(dim=-1, keepdim=True)                                # [B,T,1]
-        neg = torch.finfo(scores.dtype).min
-        w = torch.softmax(scores.masked_fill(~mask, neg), dim=-1)
-        return torch.bmm(w.to(values.dtype), values).float().mul_(elig)
-
-    short = rd(short_scores, write_memory, allow)
-    perm = rd(perm_scores, write_memory, allow)
-    induct = rd(short_scores, next_write_memory, induct_allow)
-    out = (short_gain.to(torch.float32) * short
-           + pad_gain.to(torch.float32) * perm
-           + induct_gain.to(torch.float32) * induct)
-    return out.to(read_state.dtype)
+    return dense_bmm_three_way_read_exact(
+        read_state,
+        memory_key,
+        write_memory,
+        next_write_memory,
+        read_cocktail,
+        memory_cocktail,
+        key_bias,
+        admission_gate,
+        scale,
+        bank_idx,
+        bank_valid,
+        mode=mode,
+        short_gain=short_gain,
+        pad_gain=pad_gain,
+        induct_gain=induct_gain,
+        cocktail_gain=cocktail_gain,
+        query_offset=query_offset,
+        total_steps=total_T,
+    )
 
 
 # Per-device and shape crossover-density cache. The dispatcher measures where
@@ -3306,12 +4357,31 @@ def measure_read_crossover(
         with torch.no_grad():
             for d in densities:
                 bank_valid = torch.rand(B, N, device=dev) < d
-                ms_flash = _time(lambda bv=bank_valid: admitted_three_way_read_compact_infer(
-                    q, kb, wb, wbn, rc, cb, kbias, adm, scale, bank_idx, bv,
-                    mode=mode, **gains))
-                ms_dense = _time(lambda bv=bank_valid: dense_bmm_three_way_read(
-                    q, kb, wb, wbn, rc, cb, kbias, adm, scale, bank_idx, bv,
-                    mode=mode, **gains))
+                ms_flash = _time(
+                    lambda bv=bank_valid: admitted_three_way_read_compact_infer(
+                        q, kb, wb, wbn, rc, cb, kbias, adm, scale, bank_idx, bv, mode=mode, **gains
+                    )
+                )
+                ms_dense = _time(
+                    lambda bv=bank_valid: dense_bmm_three_way_read(
+                        q,
+                        kb,
+                        wb,
+                        wbn,
+                        rc,
+                        cb,
+                        kbias,
+                        adm,
+                        scale,
+                        bank_idx,
+                        bv,
+                        mode=mode,
+                        short_gain=gains["short_gain"],
+                        pad_gain=gains["pad_gain"],
+                        induct_gain=gains["induct_gain"],
+                        cocktail_gain=gains["cocktail_gain"],
+                    )
+                )
                 if ms_dense < ms_flash:
                     crossover = float(d)  # first density where dense wins -> switch here
                     break
@@ -3325,8 +4395,9 @@ def measure_read_crossover(
     return crossover
 
 
-def _read_crossover_for(dev: torch.device, dtype: torch.dtype, N: int, H: int,
-                        prec: str, mode: str) -> float:
+def _read_crossover_for(
+    dev: torch.device, dtype: torch.dtype, N: int, H: int, prec: str, mode: str
+) -> float:
     """Return a cached on-device crossover, or a pinned environment value."""
     pin = _os.environ.get("DABSN_DENSE_CROSSOVER")
     if pin is not None:
@@ -3374,28 +4445,55 @@ def admitted_three_way_read_dispatch(
     else:
         density = float(bank_valid.to(torch.float32).mean().item())
     prec = _os.environ.get("DABSN_FLASH_PREC", "tf32x3")
-    crossover = _read_crossover_for(read_state.device, read_state.dtype,
-                                    N, read_state.shape[-1], prec, mode)
+    crossover = _read_crossover_for(
+        read_state.device, read_state.dtype, N, read_state.shape[-1], prec, mode
+    )
     if density >= crossover:
         output = dense_bmm_three_way_read(
-            read_state, memory_key, write_memory, next_write_memory, read_cocktail,
-            memory_cocktail, key_bias, admission_gate, scale, bank_idx, bank_valid,
-            mode=mode, short_gain=short_gain, pad_gain=pad_gain,
-            induct_gain=induct_gain, cocktail_gain=cocktail_gain,
+            read_state,
+            memory_key,
+            write_memory,
+            next_write_memory,
+            read_cocktail,
+            memory_cocktail,
+            key_bias,
+            admission_gate,
+            scale,
+            bank_idx,
+            bank_valid,
+            mode=mode,
+            short_gain=short_gain,
+            pad_gain=pad_gain,
+            induct_gain=induct_gain,
+            cocktail_gain=cocktail_gain,
         )
         backend = "dense_bmm_cuda"
     else:
         output = admitted_three_way_read_compact_infer(
-            read_state, memory_key, write_memory, next_write_memory, read_cocktail,
-            memory_cocktail, key_bias, admission_gate, scale, bank_idx, bank_valid,
-            mode=mode, short_gain=short_gain, pad_gain=pad_gain,
-            induct_gain=induct_gain, cocktail_gain=cocktail_gain,
+            read_state,
+            memory_key,
+            write_memory,
+            next_write_memory,
+            read_cocktail,
+            memory_cocktail,
+            key_bias,
+            admission_gate,
+            scale,
+            bank_idx,
+            bank_valid,
+            mode=mode,
+            short_gain=short_gain,
+            pad_gain=pad_gain,
+            induct_gain=induct_gain,
+            cocktail_gain=cocktail_gain,
         )
         backend = "compact_flash_infer"
     return (output, backend) if return_backend else output
 
 
-def dabsn_core_scan_triton_from_core(core, e_in: Tensor) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+def dabsn_core_scan_triton_from_core(
+    core, e_in: Tensor
+) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
     """Adapter for `DABSNCore` / dabsn_core core objects.
 
     This does not mutate or monkeypatch the core. It only reads parameters.
@@ -3409,30 +4507,33 @@ def dabsn_core_scan_triton_from_core(core, e_in: Tensor) -> Tuple[Tensor, Tensor
     r_c = core.r_saturation.contiguous()
     logit_c_suppress = core.logit_saturation_suppress.reshape(())
 
-    return dabsn_core_scan_triton(
-        core.W(e_in).contiguous(),
-        core.Wg(e_in).contiguous(),
-        core.Ug.weight.contiguous(),
-        core.A.weight.contiguous(),
-        core.beta.contiguous(),
-        core.log_kappa.contiguous(),
-        core.logit_recover.contiguous(),
-        core.k_s.contiguous(),
-        core.k_y.contiguous(),
-        core.k_b.contiguous(),
-        core.k_n.contiguous(),
-        core.k_bias.contiguous(),
-        core.r_s.contiguous(),
-        core.r_y.contiguous(),
-        core.r_b.contiguous(),
-        core.r_n.contiguous(),
-        core.r_bias.contiguous(),
-        logit_c_decay,
-        k_c,
-        r_c,
-        logit_alpha=core.logit_alpha.reshape(()),
-        log_lambda=core.log_lambda.reshape(()),
-        logit_c_suppress=logit_c_suppress,
+    return cast(
+        Tuple[Tensor, Tensor, Tensor, Tensor, Tensor],
+        dabsn_core_scan_triton(
+            core.W(e_in).contiguous(),
+            core.Wg(e_in).contiguous(),
+            core.Ug.weight.contiguous(),
+            core.A.weight.contiguous(),
+            core.beta.contiguous(),
+            core.log_kappa.contiguous(),
+            core.logit_recover.contiguous(),
+            core.k_s.contiguous(),
+            core.k_y.contiguous(),
+            core.k_b.contiguous(),
+            core.k_n.contiguous(),
+            core.k_bias.contiguous(),
+            core.r_s.contiguous(),
+            core.r_y.contiguous(),
+            core.r_b.contiguous(),
+            core.r_n.contiguous(),
+            core.r_bias.contiguous(),
+            logit_c_decay,
+            k_c,
+            r_c,
+            logit_alpha=core.logit_alpha.reshape(()),
+            log_lambda=core.log_lambda.reshape(()),
+            logit_c_suppress=logit_c_suppress,
+        ),
     )
 
 
@@ -3473,7 +4574,9 @@ def dabsn_core_scan_triton_tape_from_core(core, e_in: Tensor) -> Tuple[Tensor, .
     )
 
 
-def dabsn_core_scan_trainable_from_core(core, e_in: Tensor) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+def dabsn_core_scan_trainable_from_core(
+    core, e_in: Tensor
+) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
     """Run Triton forward with the fused reverse-scan backward.
 
     Widths above the single-tile limit use chunked backward. Gradients flow
@@ -3489,28 +4592,31 @@ def dabsn_core_scan_trainable_from_core(core, e_in: Tensor) -> Tuple[Tensor, Ten
     r_c = core.r_saturation.contiguous()
     logit_c_suppress = core.logit_saturation_suppress.reshape(())
 
-    return dabsn_core_scan_trainable_fused(
-        core.W(e_in).contiguous(),
-        core.Wg(e_in).contiguous(),
-        core.Ug.weight.contiguous(),
-        core.A.weight.contiguous(),
-        core.beta.contiguous(),
-        core.log_kappa.contiguous(),
-        core.logit_recover.contiguous(),
-        core.k_s.contiguous(),
-        core.k_y.contiguous(),
-        core.k_b.contiguous(),
-        core.k_n.contiguous(),
-        core.k_bias.contiguous(),
-        core.r_s.contiguous(),
-        core.r_y.contiguous(),
-        core.r_b.contiguous(),
-        core.r_n.contiguous(),
-        core.r_bias.contiguous(),
-        logit_c_decay,
-        k_c,
-        r_c,
-        core.logit_alpha.reshape(()),
-        core.log_lambda.reshape(()),
-        logit_c_suppress,
+    return cast(
+        Tuple[Tensor, Tensor, Tensor, Tensor, Tensor],
+        dabsn_core_scan_trainable_fused(
+            core.W(e_in).contiguous(),
+            core.Wg(e_in).contiguous(),
+            core.Ug.weight.contiguous(),
+            core.A.weight.contiguous(),
+            core.beta.contiguous(),
+            core.log_kappa.contiguous(),
+            core.logit_recover.contiguous(),
+            core.k_s.contiguous(),
+            core.k_y.contiguous(),
+            core.k_b.contiguous(),
+            core.k_n.contiguous(),
+            core.k_bias.contiguous(),
+            core.r_s.contiguous(),
+            core.r_y.contiguous(),
+            core.r_b.contiguous(),
+            core.r_n.contiguous(),
+            core.r_bias.contiguous(),
+            logit_c_decay,
+            k_c,
+            r_c,
+            core.logit_alpha.reshape(()),
+            core.log_lambda.reshape(()),
+            logit_c_suppress,
+        ),
     )

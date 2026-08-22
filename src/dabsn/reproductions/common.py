@@ -76,14 +76,26 @@ def mqar_batch(batch: int, length: int, keys_n: int, values_n: int, pairs: int, 
 
 
 @torch.no_grad()
-def keyvalue_batch(batch: int, length: int, keys_n: int, values_n: int, pairs: int,
-                   filler_prob: float, ordered: bool, device):
+def keyvalue_batch(
+    batch: int,
+    length: int,
+    keys_n: int,
+    values_n: int,
+    pairs: int,
+    filler_prob: float,
+    ordered: bool,
+    device,
+):
     if length < pairs + 1:
         raise ValueError("key-value length must be at least n_pairs + 1")
     x = torch.zeros(batch, length, 3 + keys_n + values_n, device=device)
     targets = torch.zeros(batch, dtype=torch.long, device=device)
     for row in range(batch):
-        keys = torch.arange(pairs, device=device) if ordered else torch.randperm(keys_n, device=device)[:pairs]
+        keys = (
+            torch.arange(pairs, device=device)
+            if ordered
+            else torch.randperm(keys_n, device=device)[:pairs]
+        )
         values = torch.randint(0, values_n, (pairs,), device=device)
         query_index = int(torch.randint(0, pairs, (1,), device=device))
         targets[row] = values[query_index]
@@ -130,7 +142,9 @@ def a5_batch(batch: int, length: int, table: torch.Tensor, identity: int, device
 
 def _loss(logits, targets, mask=None):
     if mask is None:
-        return F.cross_entropy(logits.reshape(-1, logits.shape[-1]), targets.reshape(-1), ignore_index=-100)
+        return F.cross_entropy(
+            logits.reshape(-1, logits.shape[-1]), targets.reshape(-1), ignore_index=-100
+        )
     return F.cross_entropy(logits[mask], targets[mask])
 
 
@@ -147,7 +161,9 @@ def run(args: argparse.Namespace) -> list[dict[str, object]]:
         if args.task == "copy":
             net = model(args.vocab + 1, args.vocab, args.hidden, args.geometry, device)
         elif args.task in {"mqar", "keyvalue"}:
-            net = model(3 + args.n_keys + args.n_values, args.n_values, args.hidden, args.geometry, device)
+            net = model(
+                3 + args.n_keys + args.n_values, args.n_values, args.hidden, args.geometry, device
+            )
         else:
             net = model(60, 60, args.hidden, args.geometry, device)
             table, identity = a5_table()
@@ -159,21 +175,48 @@ def run(args: argparse.Namespace) -> list[dict[str, object]]:
         lengths = sorted(set(length for length in lengths if length <= args.train_length))
         for step in range(1, args.steps + 1):
             if args.task == "copy":
-                x, target = copy_batch(args.batch_size, args.train_length, args.vocab, device); mask = None
+                x, target = copy_batch(args.batch_size, args.train_length, args.vocab, device)
+                mask = None
             elif args.task == "mqar":
-                x, target, mask = mqar_batch(args.batch_size, args.train_length, args.n_keys, args.n_values, args.n_pairs, device)
+                x, target, mask = mqar_batch(
+                    args.batch_size,
+                    args.train_length,
+                    args.n_keys,
+                    args.n_values,
+                    args.n_pairs,
+                    device,
+                )
             elif args.task == "keyvalue":
-                x, target = keyvalue_batch(args.batch_size, args.train_length, args.n_keys, args.n_values, args.n_pairs, args.filler_prob, args.ordered_pairs, device); mask = None
+                x, target = keyvalue_batch(
+                    args.batch_size,
+                    args.train_length,
+                    args.n_keys,
+                    args.n_values,
+                    args.n_pairs,
+                    args.filler_prob,
+                    args.ordered_pairs,
+                    device,
+                )
+                mask = None
             else:
-                unlocked = max(1, min(len(lengths), 1 + int((len(lengths) - 1) * min(1.0, step / args.curriculum_steps))))
+                unlocked = max(
+                    1,
+                    min(
+                        len(lengths),
+                        1 + int((len(lengths) - 1) * min(1.0, step / args.curriculum_steps)),
+                    ),
+                )
                 length = random.choice(lengths[:unlocked])
-                x, target = a5_batch(args.batch_size, length, table, identity, device); mask = None
+                x, target = a5_batch(args.batch_size, length, table, identity, device)
+                mask = None
             logits = net.forward_sequence(x)
             if args.task == "keyvalue":
                 logits = logits[:, -1]
             loss = _loss(logits, target, mask)
-            optimizer.zero_grad(set_to_none=True); loss.backward()
-            torch.nn.utils.clip_grad_norm_(net.parameters(), args.clip); optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(net.parameters(), args.clip)
+            optimizer.step()
             train_loss = float(loss.detach())
         trained_seconds = time.time() - started
         net.eval()
@@ -182,47 +225,87 @@ def run(args: argparse.Namespace) -> list[dict[str, object]]:
             with torch.no_grad():
                 for _ in range(args.val_batches):
                     if args.task == "copy":
-                        x, target = copy_batch(args.eval_batch_size, length, args.vocab, device); mask = None
+                        x, target = copy_batch(args.eval_batch_size, length, args.vocab, device)
+                        mask = None
                     elif args.task == "mqar":
-                        x, target, mask = mqar_batch(args.eval_batch_size, length, args.n_keys, args.n_values, args.n_pairs, device)
+                        x, target, mask = mqar_batch(
+                            args.eval_batch_size,
+                            length,
+                            args.n_keys,
+                            args.n_values,
+                            args.n_pairs,
+                            device,
+                        )
                     elif args.task == "keyvalue":
-                        x, target = keyvalue_batch(args.eval_batch_size, length, args.n_keys, args.n_values, args.n_pairs, args.filler_prob, args.ordered_pairs, device); mask = None
+                        x, target = keyvalue_batch(
+                            args.eval_batch_size,
+                            length,
+                            args.n_keys,
+                            args.n_values,
+                            args.n_pairs,
+                            args.filler_prob,
+                            args.ordered_pairs,
+                            device,
+                        )
+                        mask = None
                     else:
-                        x, target = a5_batch(args.eval_batch_size, length, table, identity, device); mask = None
+                        x, target = a5_batch(args.eval_batch_size, length, table, identity, device)
+                        mask = None
                     logits = net.forward_sequence(x)
-                    if args.task == "keyvalue": logits = logits[:, -1]
+                    if args.task == "keyvalue":
+                        logits = logits[:, -1]
                     losses.append(float(_loss(logits, target, mask)))
                     accuracies.append(_accuracy(logits, target, mask))
-            results.append({
-                "task": args.task, "model": f"dabsn_{args.geometry}", "seed": seed,
-                "hidden": args.hidden, "train_length": args.train_length, "eval_length": length,
-                "steps": args.steps, "batch_size": args.batch_size, "lr": args.lr,
-                "params": sum(p.numel() for p in net.parameters()), "train_loss_last": train_loss,
-                "eval_loss": sum(losses) / len(losses), "eval_acc": sum(accuracies) / len(accuracies),
-                "seconds_train": trained_seconds,
-            })
+            results.append(
+                {
+                    "task": args.task,
+                    "model": f"dabsn_{args.geometry}",
+                    "seed": seed,
+                    "hidden": args.hidden,
+                    "train_length": args.train_length,
+                    "eval_length": length,
+                    "steps": args.steps,
+                    "batch_size": args.batch_size,
+                    "lr": args.lr,
+                    "params": sum(p.numel() for p in net.parameters()),
+                    "train_loss_last": train_loss,
+                    "eval_loss": sum(losses) / len(losses),
+                    "eval_acc": sum(accuracies) / len(accuracies),
+                    "seconds_train": trained_seconds,
+                }
+            )
     return results
 
 
 def parser(task: str) -> argparse.ArgumentParser:
     defaults = {
-        "copy": (48, 64, [64,128,256,512,1024,2048,3200], 1000, 48, .01),
-        "mqar": (48, 64, [64,128,256,512,1024,2048,3200], 1000, 64, .006),
-        "keyvalue": (48, 64, [64,128,256,512,1024,2000,3200], 2000, 64, .006),
-        "a5": (256, 256, [128,256,512,1024,2048,4096,8192,16384], 60000, 64, .003),
+        "copy": (48, 64, [64, 128, 256, 512, 1024, 2048, 3200], 1000, 48, 0.01),
+        "mqar": (48, 64, [64, 128, 256, 512, 1024, 2048, 3200], 1000, 64, 0.006),
+        "keyvalue": (48, 64, [64, 128, 256, 512, 1024, 2000, 3200], 2000, 64, 0.006),
+        "a5": (256, 256, [128, 256, 512, 1024, 2048, 4096, 8192, 16384], 60000, 64, 0.003),
     }[task]
     p = argparse.ArgumentParser(description=f"Canonical DABSN paper-1 {task} reproduction")
     p.set_defaults(task=task)
-    p.add_argument("--hidden", type=int, default=defaults[0]); p.add_argument("--train-length", type=int, default=defaults[1])
-    p.add_argument("--eval-lengths", nargs="+", type=int, default=defaults[2]); p.add_argument("--steps", type=int, default=defaults[3])
-    p.add_argument("--batch-size", type=int, default=defaults[4]); p.add_argument("--eval-batch-size", type=int, default=16)
-    p.add_argument("--lr", type=float, default=defaults[5]); p.add_argument("--clip", type=float, default=1.0)
-    p.add_argument("--seeds", nargs="+", type=int, default=[0,1,2] if task != "a5" else [0,1])
-    p.add_argument("--geometry", choices=["seq","field","hybrid"], default="seq")
-    p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu"); p.add_argument("--val-batches", type=int, default=10 if task != "a5" else 3)
-    p.add_argument("--vocab", type=int, default=64); p.add_argument("--n-keys", type=int, default=16); p.add_argument("--n-values", type=int, default=16); p.add_argument("--n-pairs", type=int, default=8)
-    p.add_argument("--filler-prob", type=float, default=.25); p.add_argument("--ordered-pairs", action="store_true")
-    p.add_argument("--curriculum-steps", type=int, default=4000); p.add_argument("--csv", type=Path)
+    p.add_argument("--hidden", type=int, default=defaults[0])
+    p.add_argument("--train-length", type=int, default=defaults[1])
+    p.add_argument("--eval-lengths", nargs="+", type=int, default=defaults[2])
+    p.add_argument("--steps", type=int, default=defaults[3])
+    p.add_argument("--batch-size", type=int, default=defaults[4])
+    p.add_argument("--eval-batch-size", type=int, default=16)
+    p.add_argument("--lr", type=float, default=defaults[5])
+    p.add_argument("--clip", type=float, default=1.0)
+    p.add_argument("--seeds", nargs="+", type=int, default=[0, 1, 2] if task != "a5" else [0, 1])
+    p.add_argument("--geometry", choices=["seq", "field", "hybrid"], default="seq")
+    p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    p.add_argument("--val-batches", type=int, default=10 if task != "a5" else 3)
+    p.add_argument("--vocab", type=int, default=64)
+    p.add_argument("--n-keys", type=int, default=16)
+    p.add_argument("--n-values", type=int, default=16)
+    p.add_argument("--n-pairs", type=int, default=8)
+    p.add_argument("--filler-prob", type=float, default=0.25)
+    p.add_argument("--ordered-pairs", action="store_true")
+    p.add_argument("--curriculum-steps", type=int, default=4000)
+    p.add_argument("--csv", type=Path)
     return p
 
 
@@ -232,5 +315,12 @@ def main(task: str) -> None:
     if args.csv:
         args.csv.parent.mkdir(parents=True, exist_ok=True)
         with args.csv.open("w", newline="", encoding="utf-8") as handle:
-            writer = csv.DictWriter(handle, fieldnames=list(rows[0])); writer.writeheader(); writer.writerows(rows)
-    print(json.dumps({"config": vars(args) | {"csv": str(args.csv) if args.csv else None}, "results": rows}, default=str))
+            writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
+            writer.writeheader()
+            writer.writerows(rows)
+    print(
+        json.dumps(
+            {"config": vars(args) | {"csv": str(args.csv) if args.csv else None}, "results": rows},
+            default=str,
+        )
+    )

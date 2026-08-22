@@ -16,8 +16,23 @@ import os
 import torch
 import torch.nn.functional as F
 from torch import Tensor
+from torch._subclasses.fake_tensor import is_fake
 
 from ..read import _stream_is_capturing
+
+CoreScanOutputs = tuple[
+    Tensor,
+    Tensor,
+    Tensor,
+    Tensor,
+    Tensor,
+    Tensor,
+    Tensor,
+    Tensor,
+    Tensor,
+    Tensor,
+    Tensor,
+]
 
 
 def _forward_step(
@@ -47,6 +62,7 @@ def _forward_step(
     log_lambda: Tensor,
     logit_saturation_suppress: Tensor,
     y_full: Tensor | None = None,
+    recurrent_out: Tensor | None = None,
 ):
     """One recurrence step over the complete device batch.
 
@@ -57,6 +73,13 @@ def _forward_step(
     it here, so the sharded and unsharded paths remain the same function and the
     recurrence has exactly one definition. Left ``None`` (every single-device
     path) the locally computed ``y`` is used and nothing changes.
+
+    ``recurrent_out`` is the same product supplied ready-made. The gather and
+    the GEMM that consumes it are the entire per-step cost of a sharded
+    recurrence, and ``y_full`` feeds nothing else in this function, so a caller
+    that can do both at once (see ``_GatherHiddenRecurrent``) hands the result
+    in here rather than re-running the GEMM. Passing it is arithmetically
+    identical to passing ``y_full``; it only moves where the product is formed.
     """
 
     # The recurrence runs in the STATE's dtype, which the caller chooses -- not a
@@ -71,8 +94,11 @@ def _forward_step(
     # behaviour, so this is a caller policy, not a change of arithmetic here.
     dt = budget.dtype
     y = torch.tanh(wx.to(dt) + budget)
-    y_in = y if y_full is None else y_full
-    recurrent_out = F.linear(y_in.to(recurrent.dtype), recurrent).to(dt)
+    if recurrent_out is None:
+        y_in = y if y_full is None else y_full
+        recurrent_out = F.linear(y_in.to(recurrent.dtype), recurrent).to(dt)
+    else:
+        recurrent_out = recurrent_out.to(dt)
     gate_recurrence, expression = recurrent_out.chunk(2, dim=-1)
     gate = F.hardsigmoid(wgx.to(dt) + gate_recurrence)
     novelty = torch.tanh((expression - budget).abs())
@@ -181,6 +207,7 @@ def _raise_recompile_budget() -> None:
     budget = int(os.environ.get("DABSN_STEP_RECOMPILE_LIMIT", "128"))
     try:
         from torch._dynamo import config as _dynamo_config
+
         for field in ("recompile_limit", "cache_size_limit"):
             if hasattr(_dynamo_config, field):
                 setattr(_dynamo_config, field, max(getattr(_dynamo_config, field), budget))
@@ -191,7 +218,34 @@ def _raise_recompile_budget() -> None:
         pass
 
 
+def _being_traced(tensor: Tensor) -> bool:
+    """True whenever this code is being traced rather than executed.
+
+    Two signals, because neither covers the other. ``is_compiling()`` is set
+    while Dynamo walks the function, but it is **not** set while AOTAutograd
+    traces the backward -- and the backward is where this bites, because the
+    step compile is applied to the backward step too. Conversely a fake tensor
+    identifies AOT, ``make_fx``, meta construction, and export, but Dynamo can
+    trace with real tensors.
+
+    Checking only the first is what an earlier attempt at this did, and it left
+    ``aot_eager`` failing on exactly the same nested compile. Note that a fake
+    CUDA tensor reports ``is_cuda`` as True on a machine with no GPU at all, so
+    a device test is not a substitute for either signal.
+    """
+    return torch.compiler.is_compiling() or is_fake(tensor)
+
+
 def _step_compile_enabled(tensor: Tensor) -> bool:
+    # Never compile the step while something is already tracing this code.
+    # Nesting is not merely redundant, it is refused outright -- "Detected that
+    # you are using FX to symbolically trace a dynamo-optimized function" -- so
+    # a caller compiling the whole model would fail on the inner compile that
+    # exists only to speed up the *eager* path. The outer graph subsumes it:
+    # whatever the step compile would have fused, the enclosing compilation
+    # fuses anyway.
+    if _being_traced(tensor):
+        return False
     return tensor.is_cuda and os.environ.get("DABSN_BATCHED_STEP_COMPILE", "1") == "1"
 
 
@@ -307,14 +361,8 @@ def _backward_step(
     recover = torch.sigmoid(logit_recover)
     tanh_b = torch.tanh(b_prev)
     novelty_effective = novelty * (1.0 - suppress * c_t)
-    k_signal = (
-        k_s * gate + k_y * y + k_b * tanh_b
-        + k_n * novelty_effective + k_bias + k_c * c_t
-    )
-    r_signal = (
-        r_s * gate + r_y * y + r_b * tanh_b
-        + r_n * novelty_effective + r_bias + r_c * c_t
-    )
+    k_signal = k_s * gate + k_y * y + k_b * tanh_b + k_n * novelty_effective + k_bias + k_c * c_t
+    r_signal = r_s * gate + r_y * y + r_b * tanh_b + r_n * novelty_effective + r_bias + r_c * c_t
     tanh_k, tanh_r = torch.tanh(k_signal), torch.tanh(r_signal)
     exp_k, exp_r = torch.exp(0.5 * tanh_k), torch.exp(0.5 * tanh_r)
     write_cost = kappa * exp_k
@@ -341,20 +389,14 @@ def _backward_step(
     gnov_effective = g_k_signal * k_n + g_r_signal * r_n
     gc_energy = g_k_signal * k_c + g_r_signal * r_c
 
-    dgate_pre = (
-        (gp * e_prev + g_gate_energy)
-        * (((gate > 0.0) & (gate < 1.0)).float() / 6.0)
-    )
+    dgate_pre = (gp * e_prev + g_gate_energy) * (((gate > 0.0) & (gate < 1.0)).float() / 6.0)
     ge_gate = gp * gate
 
     stress = novelty * (1.0 - e_prev)
     c_new = decay * c_prev + (1.0 - decay) * stress
     g_c_new = gc_new + gc_energy - gnov_effective * novelty * suppress
     g_stress = g_c_new * (1.0 - decay)
-    g_novelty = (
-        gnov_effective * (1.0 - suppress * c_new)
-        + g_stress * (1.0 - e_prev)
-    )
+    g_novelty = gnov_effective * (1.0 - suppress * c_new) + g_stress * (1.0 - e_prev)
     g_e_prev_cort = -g_stress * novelty
     g_c_prev = g_c_new * decay
     diff = expression - b_prev
@@ -445,8 +487,7 @@ class _ReverseCarry:
 
     __slots__ = ("gb", "ge", "gc", "param_acc", "scalar_acc")
 
-    def __init__(self, gb: Tensor, ge: Tensor, gc: Tensor,
-                 param_acc: list, scalar_acc: list):
+    def __init__(self, gb: Tensor, ge: Tensor, gc: Tensor, param_acc: list, scalar_acc: list):
         self.gb = gb.clone()
         self.ge = ge.clone()
         self.gc = gc.clone()
@@ -458,9 +499,16 @@ class _ReverseCarry:
 
 
 def _backward_chunk(
-    reads: tuple, grads: tuple, outs: tuple, prev: tuple,
-    carry: _ReverseCarry, recurrent: Tensor, consts: tuple,
-    H: int, count: int, offset: int = 0,
+    reads: tuple,
+    grads: tuple,
+    outs: tuple,
+    prev: tuple,
+    carry: _ReverseCarry,
+    recurrent: Tensor,
+    consts: tuple,
+    H: int,
+    count: int,
+    offset: int = 0,
 ) -> None:
     """Run ``count`` reverse steps over locally-indexed slices.
 
@@ -502,12 +550,28 @@ def _backward_chunk(
         gb_new = gU[:, slot, H:] + gbn
         gc_new = gcn + gc_out[:, slot]
         step_outputs = _run_backward_step(
-            y, b_prev, e_prev, c_prev, gate, nov, p, ay, c_t,
-            gU[:, slot, :H], gb_new, gen, gc_new,
-            gnov[:, slot], gp_out[:, slot], gay_out[:, slot],
-            gwrite[:, slot], ge_out[:, slot],
-            recurrent, *consts,
-            *param_acc, *scalar_acc,
+            y,
+            b_prev,
+            e_prev,
+            c_prev,
+            gate,
+            nov,
+            p,
+            ay,
+            c_t,
+            gU[:, slot, :H],
+            gb_new,
+            gen,
+            gc_new,
+            gnov[:, slot],
+            gp_out[:, slot],
+            gay_out[:, slot],
+            gwrite[:, slot],
+            ge_out[:, slot],
+            recurrent,
+            *consts,
+            *param_acc,
+            *scalar_acc,
         )
         gpre, dpre, d_ay, gbn, gen, gcn = step_outputs[:6]
         gWx[:, slot] = gpre
@@ -535,22 +599,26 @@ def _prev_slices(U, c_tape, initial_b, initial_c, H, start, count, out=None):
     """
     budget = U[:, :, H:]
     if start >= 1:
-        b_src = budget[:, start - 1:start + count - 1]
-        c_src = c_tape[:, start - 1:start + count - 1]
+        b_src = budget[:, start - 1 : start + count - 1]
+        c_src = c_tape[:, start - 1 : start + count - 1]
         if out is None:
             return b_src, c_src
         out[0].copy_(b_src)
         out[1].copy_(c_src)
         return out
-    b_dst, c_dst = out if out is not None else (
-        torch.empty((U.shape[0], count, H), device=U.device, dtype=U.dtype),
-        torch.empty((U.shape[0], count, H), device=U.device, dtype=c_tape.dtype),
+    b_dst, c_dst = (
+        out
+        if out is not None
+        else (
+            torch.empty((U.shape[0], count, H), device=U.device, dtype=U.dtype),
+            torch.empty((U.shape[0], count, H), device=U.device, dtype=c_tape.dtype),
+        )
     )
     b_dst[:, 0].copy_(initial_b)
     c_dst[:, 0].copy_(initial_c)
     if count > 1:
-        b_dst[:, 1:].copy_(budget[:, :count - 1])
-        c_dst[:, 1:].copy_(c_tape[:, :count - 1])
+        b_dst[:, 1:].copy_(budget[:, : count - 1])
+        c_dst[:, 1:].copy_(c_tape[:, : count - 1])
     return b_dst, c_dst
 
 
@@ -583,8 +651,9 @@ def _reverse_capture_width(B: int, T: int, H: int, elem: int, device=None) -> in
     return min(_reverse_chunk_width(B, T, H, elem, device), T - 1)
 
 
-def _reverse_into_grads(*, reads, grads, outs, initial, carry, recurrent,
-                        consts, B, T, H, dtype, device) -> None:
+def _reverse_into_grads(
+    *, reads, grads, outs, initial, carry, recurrent, consts, B, T, H, dtype, device
+) -> None:
     """Run the whole reverse scan, replaying a captured chunk when possible.
 
     Mirrors ``_scan_into_tapes``: the reverse loop issues one launch per timestep
@@ -598,11 +667,18 @@ def _reverse_into_grads(*, reads, grads, outs, initial, carry, recurrent,
 
     def run_eager() -> None:
         prev = _prev_slices(U, c_tape, initial_b, initial_c, H, 0, T)
-        _backward_chunk(reads, grads, outs, prev, carry, recurrent, consts,
-                        H, T, 0)
+        _backward_chunk(reads, grads, outs, prev, carry, recurrent, consts, H, T, 0)
 
     if (
-        not U.is_cuda
+        # FIRST, before anything else in this condition. `or` short-circuits
+        # left to right, and every clause below compares a tensor SHAPE against
+        # a constant. Under tracing those shapes are symbolic, so evaluating one
+        # raises out of the symbolic-shape machinery long before a later guard
+        # could stop it. On CPU `not is_cuda` short-circuited first and hid
+        # this; on CUDA it did not, which is precisely the divergence that made
+        # the failure look untraceable and unreproducible.
+        _being_traced(U)
+        or not U.is_cuda
         or T < _SCAN_GRAPH_MIN_STEPS
         or torch.is_grad_enabled()
         or _stream_is_capturing()
@@ -618,8 +694,9 @@ def _reverse_into_grads(*, reads, grads, outs, initial, carry, recurrent,
         return
 
     try:
-        entry = _reverse_graph_entry(B, chunk, H, U, c_tape, recurrent,
-                                     consts, carry, reads, grads, outs, dtype, device)
+        entry = _reverse_graph_entry(
+            B, chunk, H, U, c_tape, recurrent, consts, carry, reads, grads, outs, dtype, device
+        )
     except Exception as exc:  # noqa: BLE001 - identical math runs below
         _disable_scan_graph(exc)
         run_eager()
@@ -634,14 +711,13 @@ def _reverse_into_grads(*, reads, grads, outs, initial, carry, recurrent,
     start = T - chunk
     while start >= 1:
         for dst, src in zip(entry["reads"], reads):
-            dst.copy_(src[:, start:start + chunk])
+            dst.copy_(src[:, start : start + chunk])
         for dst, src in zip(entry["grads"], grads):
-            dst.copy_(src[:, start:start + chunk])
-        _prev_slices(U, c_tape, initial_b, initial_c, H, start, chunk,
-                     out=entry["prev"])
+            dst.copy_(src[:, start : start + chunk])
+        _prev_slices(U, c_tape, initial_b, initial_c, H, start, chunk, out=entry["prev"])
         entry["graph"].replay()
         for real, staged in zip(outs, entry["outs"]):
-            real[:, start:start + chunk].copy_(staged)
+            real[:, start : start + chunk].copy_(staged)
         start -= chunk
 
     for dst, src in zip(carry.tensors(), entry["carry"]):
@@ -649,12 +725,12 @@ def _reverse_into_grads(*, reads, grads, outs, initial, carry, recurrent,
     remaining = start + chunk
     if remaining > 0:
         prev = _prev_slices(U, c_tape, initial_b, initial_c, H, 0, remaining)
-        _backward_chunk(reads, grads, outs, prev, carry, recurrent, consts,
-                        H, remaining, 0)
+        _backward_chunk(reads, grads, outs, prev, carry, recurrent, consts, H, remaining, 0)
 
 
-def _reverse_graph_entry(B, chunk, H, U, c_tape, recurrent, consts, carry,
-                         reads, grads, outs, dtype, device) -> dict:
+def _reverse_graph_entry(
+    B, chunk, H, U, c_tape, recurrent, consts, carry, reads, grads, outs, dtype, device
+) -> dict:
     """Static buffers plus the captured reverse chunk, built once per shape."""
     key = (B, chunk, H, dtype, device.index, len(consts))
     entry = _REVERSE_GRAPHS.get(key)
@@ -681,15 +757,26 @@ def _reverse_graph_entry(B, chunk, H, U, c_tape, recurrent, consts, carry,
         dst.copy_(src)
 
     staged_carry = _ReverseCarry(
-        entry["carry"][0], entry["carry"][1], entry["carry"][2],
-        entry["carry"][3:19], entry["carry"][19:22],
+        entry["carry"][0],
+        entry["carry"][1],
+        entry["carry"][2],
+        entry["carry"][3:19],
+        entry["carry"][19:22],
     )
     entry["carry"] = staged_carry.tensors()
 
     def body() -> None:
         _backward_chunk(
-            entry["reads"], entry["grads"], entry["outs"], entry["prev"],
-            staged_carry, entry["recurrent"], entry["consts"], H, chunk, 0,
+            entry["reads"],
+            entry["grads"],
+            entry["outs"],
+            entry["prev"],
+            staged_carry,
+            entry["recurrent"],
+            entry["consts"],
+            H,
+            chunk,
+            0,
         )
 
     side = torch.cuda.Stream()
@@ -723,9 +810,17 @@ class _ScanState:
 
 
 def _forward_chunk(
-    Wx_c: Tensor, Wgx_c: Tensor, recurrent: Tensor,
-    b_io: Tensor, e_io: Tensor, c_io: Tensor,
-    tapes: tuple, params: tuple, H: int, count: int, offset: int = 0,
+    Wx_c: Tensor,
+    Wgx_c: Tensor,
+    recurrent: Tensor,
+    b_io: Tensor,
+    e_io: Tensor,
+    c_io: Tensor,
+    tapes: tuple,
+    params: tuple,
+    H: int,
+    count: int,
+    offset: int = 0,
 ) -> None:
     """Advance ``count`` steps, writing tapes at ``offset .. offset+count``.
 
@@ -741,11 +836,24 @@ def _forward_chunk(
     budget, energy, saturation = b_io, e_io, c_io
     for step in range(count):
         (
-            y, budget, next_energy, saturation,
-            novelty, plasticity, expression, write, energy_before, gate,
+            y,
+            budget,
+            next_energy,
+            saturation,
+            novelty,
+            plasticity,
+            expression,
+            write,
+            energy_before,
+            gate,
         ) = _run_forward_step(
-            Wx_c[:, step], Wgx_c[:, step], recurrent,
-            budget, energy, saturation, *params,
+            Wx_c[:, step],
+            Wgx_c[:, step],
+            recurrent,
+            budget,
+            energy,
+            saturation,
+            *params,
         )
         energy = next_energy
         slot = offset + step
@@ -833,11 +941,28 @@ def _scan_into_tapes(Wx, Wgx, recurrent, state, tapes, params, H) -> None:
     """
     B, T, _ = Wx.shape
     eager = lambda: _forward_chunk(  # noqa: E731
-        Wx, Wgx, recurrent, state.budget, state.energy, state.saturation,
-        tapes, params, H, T, 0,
+        Wx,
+        Wgx,
+        recurrent,
+        state.budget,
+        state.energy,
+        state.saturation,
+        tapes,
+        params,
+        H,
+        T,
+        0,
     )
     if (
-        not Wx.is_cuda
+        # FIRST, before anything else in this condition. `or` short-circuits
+        # left to right, and every clause below compares a tensor SHAPE against
+        # a constant. Under tracing those shapes are symbolic, so evaluating one
+        # raises out of the symbolic-shape machinery long before a later guard
+        # could stop it. On CPU `not is_cuda` short-circuited first and hid
+        # this; on CUDA it did not, which is precisely the divergence that made
+        # the failure look untraceable and unreproducible.
+        _being_traced(Wx)
+        or not Wx.is_cuda
         or T < _SCAN_GRAPH_MIN_STEPS
         or torch.is_grad_enabled()
         or _stream_is_capturing()
@@ -869,11 +994,11 @@ def _scan_into_tapes(Wx, Wgx, recurrent, state, tapes, params, H) -> None:
 
     done = 0
     while T - done >= chunk:
-        entry["wx"].copy_(Wx[:, done:done + chunk])
-        entry["wgx"].copy_(Wgx[:, done:done + chunk])
+        entry["wx"].copy_(Wx[:, done : done + chunk])
+        entry["wgx"].copy_(Wgx[:, done : done + chunk])
         entry["graph"].replay()
         for real, staged in zip(tapes, entry["tapes"]):
-            real[:, done:done + chunk].copy_(staged)
+            real[:, done : done + chunk].copy_(staged)
         done += chunk
 
     state.budget = entry["b"].clone()
@@ -882,9 +1007,17 @@ def _scan_into_tapes(Wx, Wgx, recurrent, state, tapes, params, H) -> None:
     if done < T:
         # Tail shorter than one capture: same function, uncaptured.
         _forward_chunk(
-            Wx[:, done:], Wgx[:, done:], recurrent,
-            state.budget, state.energy, state.saturation,
-            tapes, params, H, T - done, done,
+            Wx[:, done:],
+            Wgx[:, done:],
+            recurrent,
+            state.budget,
+            state.energy,
+            state.saturation,
+            tapes,
+            params,
+            H,
+            T - done,
+            done,
         )
 
 
@@ -901,8 +1034,9 @@ def _disable_scan_graph(exc: BaseException) -> None:
     )
 
 
-def _scan_graph_entry(B: int, chunk: int, H: int, Wx: Tensor,
-                      recurrent: Tensor, params: tuple) -> dict:
+def _scan_graph_entry(
+    B: int, chunk: int, H: int, Wx: Tensor, recurrent: Tensor, params: tuple
+) -> dict:
     """Build (once per shape) the static buffers and the captured chunk."""
     key = (B, chunk, H, Wx.dtype, Wx.device.index, len(params))
     entry = _SCAN_GRAPHS.get(key)
@@ -930,9 +1064,17 @@ def _scan_graph_entry(B: int, chunk: int, H: int, Wx: Tensor,
 
     def body() -> None:
         _forward_chunk(
-            entry["wx"], entry["wgx"], entry["recurrent"],
-            entry["b"], entry["e"], entry["c"],
-            entry["tapes"], entry["params"], H, chunk, 0,
+            entry["wx"],
+            entry["wgx"],
+            entry["recurrent"],
+            entry["b"],
+            entry["e"],
+            entry["c"],
+            entry["tapes"],
+            entry["params"],
+            H,
+            chunk,
+            0,
         )
 
     # Warm up on a side stream so the capture records steady-state work only:
@@ -954,14 +1096,33 @@ def _scan_graph_entry(B: int, chunk: int, H: int, Wx: Tensor,
 
 
 def _batched_forward_tapes(
-    Wx, Wgx, Ug, A,
-    beta, log_kappa, logit_recover,
-    k_s, k_y, k_b, k_n, k_bias,
-    r_s, r_y, r_b, r_n, r_bias,
-    logit_c_decay, k_c, r_c,
-    logit_alpha, log_lambda, logit_c_suppress,
-    initial_b, initial_e, initial_c,
-) -> tuple[Tensor, ...]:
+    Wx,
+    Wgx,
+    Ug,
+    A,
+    beta,
+    log_kappa,
+    logit_recover,
+    k_s,
+    k_y,
+    k_b,
+    k_n,
+    k_bias,
+    r_s,
+    r_y,
+    r_b,
+    r_n,
+    r_bias,
+    logit_c_decay,
+    k_c,
+    r_c,
+    logit_alpha,
+    log_lambda,
+    logit_c_suppress,
+    initial_b,
+    initial_e,
+    initial_c,
+) -> CoreScanOutputs:
     """Advance the whole batch through T with per-step tensor-core GEMMs.
 
     Returns exactly the tapes the reverse recurrence consumes, in the order
@@ -1003,14 +1164,27 @@ def _batched_forward_tapes(
     saturation_t = torch.empty_like(novelty_t)
     gate_t = torch.empty_like(novelty_t)
 
-    tapes = (U, novelty_t, plasticity_t, expression_t, write_t,
-             energy_t, saturation_t, gate_t)
+    tapes = (U, novelty_t, plasticity_t, expression_t, write_t, energy_t, saturation_t, gate_t)
     params = (
-        beta, log_kappa, logit_recover,
-        k_s, k_y, k_b, k_n, k_bias,
-        r_s, r_y, r_b, r_n, r_bias,
-        logit_c_decay, k_c, r_c,
-        logit_alpha, log_lambda, logit_c_suppress,
+        beta,
+        log_kappa,
+        logit_recover,
+        k_s,
+        k_y,
+        k_b,
+        k_n,
+        k_bias,
+        r_s,
+        r_y,
+        r_b,
+        r_n,
+        r_bias,
+        logit_c_decay,
+        k_c,
+        r_c,
+        logit_alpha,
+        log_lambda,
+        logit_c_suppress,
     )
     state = _ScanState(budget, energy, saturation)
     _scan_into_tapes(Wx, Wgx, recurrent, state, tapes, params, H)
@@ -1035,7 +1209,7 @@ class DABSNCoreScanBatched(torch.autograd.Function):
     """Memory-bounded batched-GEMM scan with an explicit reverse recurrence."""
 
     @staticmethod
-    def forward(  # type: ignore[override]
+    def forward(
         ctx,
         Wx: Tensor,
         Wgx: Tensor,
@@ -1072,28 +1246,81 @@ class DABSNCoreScanBatched(torch.autograd.Function):
         ctx.return_tape = bool(return_tape)
         ctx.return_final_state = bool(return_final_state)
         (
-            U, novelty, plasticity, expression, write,
-            e_tape, c_tape, s_tape, final_b, final_e, final_c,
+            U,
+            novelty,
+            plasticity,
+            expression,
+            write,
+            e_tape,
+            c_tape,
+            s_tape,
+            final_b,
+            final_e,
+            final_c,
         ) = _batched_forward_tapes(
-            Wx, Wgx, Ug, A,
-            beta, log_kappa, logit_recover,
-            k_s, k_y, k_b, k_n, k_bias,
-            r_s, r_y, r_b, r_n, r_bias,
-            logit_c_decay, k_c, r_c,
-            logit_alpha, log_lambda, logit_c_suppress,
-            initial_b, initial_e, initial_c,
+            Wx,
+            Wgx,
+            Ug,
+            A,
+            beta,
+            log_kappa,
+            logit_recover,
+            k_s,
+            k_y,
+            k_b,
+            k_n,
+            k_bias,
+            r_s,
+            r_y,
+            r_b,
+            r_n,
+            r_bias,
+            logit_c_decay,
+            k_c,
+            r_c,
+            logit_alpha,
+            log_lambda,
+            logit_c_suppress,
+            initial_b,
+            initial_e,
+            initial_c,
         )
         ctx.save_for_backward(
-            Wx, Wgx, Ug, A,
-            beta, log_kappa, logit_recover,
-            k_s, k_y, k_b, k_n, k_bias,
-            r_s, r_y, r_b, r_n, r_bias,
-            logit_c_decay, k_c, r_c,
-            logit_alpha, log_lambda, logit_c_suppress,
-            initial_b, initial_e, initial_c,
-            U, plasticity, expression,
-            e_tape, c_tape, s_tape,
-            final_b, final_e, final_c,
+            Wx,
+            Wgx,
+            Ug,
+            A,
+            beta,
+            log_kappa,
+            logit_recover,
+            k_s,
+            k_y,
+            k_b,
+            k_n,
+            k_bias,
+            r_s,
+            r_y,
+            r_b,
+            r_n,
+            r_bias,
+            logit_c_decay,
+            k_c,
+            r_c,
+            logit_alpha,
+            log_lambda,
+            logit_c_suppress,
+            initial_b,
+            initial_e,
+            initial_c,
+            U,
+            plasticity,
+            expression,
+            e_tape,
+            c_tape,
+            s_tape,
+            final_b,
+            final_e,
+            final_c,
         )
         public = [U, novelty, plasticity, expression, write]
         if ctx.return_tape:
@@ -1103,18 +1330,43 @@ class DABSNCoreScanBatched(torch.autograd.Function):
         return tuple(public)
 
     @staticmethod
-    def backward(ctx, *grad_outputs):  # type: ignore[override]
+    def backward(ctx, *grad_outputs):
         (
-            Wx, Wgx, Ug, A,
-            beta, log_kappa, logit_recover,
-            k_s, k_y, k_b, k_n, k_bias,
-            r_s, r_y, r_b, r_n, r_bias,
-            logit_c_decay, k_c, r_c,
-            logit_alpha, log_lambda, logit_c_suppress,
-            initial_b, initial_e, initial_c,
-            U, plasticity, expression,
-            e_tape, c_tape, s_tape,
-            final_b, final_e, final_c,
+            Wx,
+            Wgx,
+            Ug,
+            A,
+            beta,
+            log_kappa,
+            logit_recover,
+            k_s,
+            k_y,
+            k_b,
+            k_n,
+            k_bias,
+            r_s,
+            r_y,
+            r_b,
+            r_n,
+            r_bias,
+            logit_c_decay,
+            k_c,
+            r_c,
+            logit_alpha,
+            log_lambda,
+            logit_c_suppress,
+            initial_b,
+            initial_e,
+            initial_c,
+            U,
+            plasticity,
+            expression,
+            e_tape,
+            c_tape,
+            s_tape,
+            final_b,
+            final_e,
+            final_c,
         ) = ctx.saved_tensors
         # novelty and write are no longer saved (Phase 5 / 2d); plasticity has
         # the same [B,T,H] shape and serves as the zeros_like template.
@@ -1190,9 +1442,32 @@ class DABSNCoreScanBatched(torch.autograd.Function):
             initial=(initial_b, initial_c),
             carry=carry,
             recurrent=recurrent_backward,
-            consts=(lk, lr, ks, ky, kb, kn, kbias, rs, ry, rb, rn, rbias,
-                    decay, kc, rc, alpha, lam, sig_lam, suppress),
-            B=B, T=T, H=H, dtype=Wx.dtype, device=Wx.device,
+            consts=(
+                lk,
+                lr,
+                ks,
+                ky,
+                kb,
+                kn,
+                kbias,
+                rs,
+                ry,
+                rb,
+                rn,
+                rbias,
+                decay,
+                kc,
+                rc,
+                alpha,
+                lam,
+                sig_lam,
+                suppress,
+            ),
+            B=B,
+            T=T,
+            H=H,
+            dtype=Wx.dtype,
+            device=Wx.device,
         )
         gbn, gen, gcn = carry.gb, carry.ge, carry.gc
         param_acc, scalar_acc = carry.param_acc, carry.scalar_acc
@@ -1202,26 +1477,175 @@ class DABSNCoreScanBatched(torch.autograd.Function):
         # expression grad (d_ay, the A half). Both are already Wx.dtype, so the
         # cat feeds the contraction with no extra cast.
         grad_recurrent = (
-            torch.cat((gWgx, day_tape), dim=-1)
-            .reshape(B * T, 2 * H)
-            .T
-            @ y_flat
+            torch.cat((gWgx, day_tape), dim=-1).reshape(B * T, 2 * H).T @ y_flat
         ).float()
         grad_Ug, grad_A = grad_recurrent.split(H, dim=0)
         return (
-            gWx.to(Wx.dtype), gWgx.to(Wgx.dtype), grad_Ug.to(Ug.dtype), grad_A.to(A.dtype),
+            gWx.to(Wx.dtype),
+            gWgx.to(Wgx.dtype),
+            grad_Ug.to(Ug.dtype),
+            grad_A.to(A.dtype),
             *(value.to(beta.dtype) for value in param_acc[:1]),
-            param_acc[1].to(log_kappa.dtype), param_acc[2].to(logit_recover.dtype),
+            param_acc[1].to(log_kappa.dtype),
+            param_acc[2].to(logit_recover.dtype),
             *(value.to(k_s.dtype) for value in param_acc[3:8]),
             *(value.to(r_s.dtype) for value in param_acc[8:13]),
             param_acc[13].to(logit_c_decay.dtype),
-            param_acc[14].to(k_c.dtype), param_acc[15].to(r_c.dtype),
+            param_acc[14].to(k_c.dtype),
+            param_acc[15].to(r_c.dtype),
             scalar_acc[0].reshape_as(logit_alpha).to(logit_alpha.dtype),
             scalar_acc[1].reshape_as(log_lambda).to(log_lambda.dtype),
             scalar_acc[2].reshape_as(logit_c_suppress).to(logit_c_suppress.dtype),
-            gbn.to(initial_b.dtype), gen.to(initial_e.dtype), gcn.to(initial_c.dtype),
-            None, None,
+            gbn.to(initial_b.dtype),
+            gen.to(initial_e.dtype),
+            gcn.to(initial_c.dtype),
+            None,
+            None,
         )
+
+
+@torch.library.custom_op("dabsn::core_scan_batched", mutates_args=())
+def _core_scan_batched_op(
+    Wx: Tensor,
+    Wgx: Tensor,
+    Ug: Tensor,
+    A: Tensor,
+    beta: Tensor,
+    log_kappa: Tensor,
+    logit_recover: Tensor,
+    k_s: Tensor,
+    k_y: Tensor,
+    k_b: Tensor,
+    k_n: Tensor,
+    k_bias: Tensor,
+    r_s: Tensor,
+    r_y: Tensor,
+    r_b: Tensor,
+    r_n: Tensor,
+    r_bias: Tensor,
+    logit_c_decay: Tensor,
+    k_c: Tensor,
+    r_c: Tensor,
+    logit_alpha: Tensor,
+    log_lambda: Tensor,
+    logit_c_suppress: Tensor,
+    initial_b: Tensor,
+    initial_e: Tensor,
+    initial_c: Tensor,
+) -> CoreScanOutputs:
+    """Fixed-output operator form of the canonical batched core scan."""
+
+    return _batched_forward_tapes(
+        Wx,
+        Wgx,
+        Ug,
+        A,
+        beta,
+        log_kappa,
+        logit_recover,
+        k_s,
+        k_y,
+        k_b,
+        k_n,
+        k_bias,
+        r_s,
+        r_y,
+        r_b,
+        r_n,
+        r_bias,
+        logit_c_decay,
+        k_c,
+        r_c,
+        logit_alpha,
+        log_lambda,
+        logit_c_suppress,
+        initial_b,
+        initial_e,
+        initial_c,
+    )
+
+
+@_core_scan_batched_op.register_fake
+def _core_scan_batched_fake(*inputs: Tensor) -> tuple[Tensor, ...]:
+    Wx = inputs[0]
+    initial_b, initial_e, initial_c = inputs[-3:]
+    batch, steps, hidden = Wx.shape
+    signal = Wx.new_empty((batch, steps, hidden))
+    return (
+        Wx.new_empty((batch, steps, hidden * 2)),
+        signal,
+        signal.clone(),
+        signal.clone(),
+        signal.clone(),
+        signal.clone(),
+        signal.clone(),
+        signal.clone(),
+        initial_b.new_empty(initial_b.shape),
+        initial_e.new_empty(initial_e.shape),
+        initial_c.new_empty(initial_c.shape),
+    )
+
+
+def _core_scan_batched_setup(ctx, inputs, output) -> None:
+    (
+        trajectory,
+        _novelty,
+        plasticity,
+        expression,
+        _write,
+        energy_tape,
+        saturation_tape,
+        gate_tape,
+        final_b,
+        final_e,
+        final_c,
+    ) = output
+    ctx.save_for_backward(
+        *inputs,
+        trajectory,
+        plasticity,
+        expression,
+        energy_tape,
+        saturation_tape,
+        gate_tape,
+        final_b,
+        final_e,
+        final_c,
+    )
+    ctx.return_tape = True
+    ctx.return_final_state = True
+
+
+def _core_scan_batched_backward(ctx, *grad_outputs):
+    public_grads = (
+        *grad_outputs[:7],
+        *grad_outputs[8:11],
+    )
+    # The existing analytic reverse expects two trailing non-tensor controls.
+    # The registered schema is fixed, so those controls are always true and
+    # their two None gradients are removed from the operator result.
+    return DABSNCoreScanBatched.backward(ctx, *public_grads)[:-2]
+
+
+torch.library.register_autograd(
+    _core_scan_batched_op,
+    _core_scan_batched_backward,
+    setup_context=_core_scan_batched_setup,
+)
+
+core_scan_batched = _core_scan_batched_op
+
+
+@torch.library.register_vmap(_core_scan_batched_op)
+def _core_scan_batched_vmap(info, in_dims, *inputs):
+    def select(value, dim, index):
+        return value if dim is None else value.movedim(dim, 0)[index]
+
+    outputs = [
+        _core_scan_batched_op(*(select(value, dim, index) for value, dim in zip(inputs, in_dims)))
+        for index in range(info.batch_size)
+    ]
+    return tuple(torch.stack(items) for items in zip(*outputs)), (0,) * 11
 
 
 def dabsn_core_scan_batched(
@@ -1268,16 +1692,40 @@ def dabsn_core_scan_batched(
     initial_b, initial_e, initial_c = (
         value.to(device=Wx.device).contiguous() for value in initial_state
     )
-    return DABSNCoreScanBatched.apply(
-        Wx, Wgx, Ug, A,
-        beta, log_kappa, logit_recover,
-        k_s, k_y, k_b, k_n, k_bias,
-        r_s, r_y, r_b, r_n, r_bias,
-        logit_c_decay, k_c, r_c,
-        logit_alpha, log_lambda, logit_c_suppress,
-        initial_b, initial_e, initial_c,
-        bool(return_tape), bool(return_final_state),
+    full = _core_scan_batched_op(
+        Wx,
+        Wgx,
+        Ug,
+        A,
+        beta,
+        log_kappa,
+        logit_recover,
+        k_s,
+        k_y,
+        k_b,
+        k_n,
+        k_bias,
+        r_s,
+        r_y,
+        r_b,
+        r_n,
+        r_bias,
+        logit_c_decay,
+        k_c,
+        r_c,
+        logit_alpha,
+        log_lambda,
+        logit_c_suppress,
+        initial_b,
+        initial_e,
+        initial_c,
     )
+    public = list(full[:5])
+    if return_tape:
+        public.extend(full[5:7])
+    if return_final_state:
+        public.extend(full[8:11])
+    return tuple(public)
 
 
 # ---------------------------------------------------------------------------
@@ -1332,9 +1780,10 @@ def _fused_forward_available(Wx: Tensor) -> bool:
     if not Wx.is_cuda or os.environ.get("DABSN_FUSED_CORE_DISABLE", "0") == "1":
         return False
     try:
-        import triton  # noqa: F401
+        import triton
     except Exception:
         return False
+    del triton
     return int(Wx.shape[-1]) <= _fused_max_h(Wx.device, int(Wx.shape[0]))
 
 
@@ -1342,16 +1791,36 @@ class DABSNCoreScanBatchedFused(torch.autograd.Function):
     """Single-launch fused-forward scan; shares the batched reverse recurrence."""
 
     @staticmethod
-    def forward(  # type: ignore[override]
+    def forward(
         ctx,
-        Wx, Wgx, Ug, A,
-        beta, log_kappa, logit_recover,
-        k_s, k_y, k_b, k_n, k_bias,
-        r_s, r_y, r_b, r_n, r_bias,
-        logit_c_decay, k_c, r_c,
-        logit_alpha, log_lambda, logit_c_suppress,
-        initial_b, initial_e, initial_c,
-        return_tape, return_final_state,
+        Wx,
+        Wgx,
+        Ug,
+        A,
+        beta,
+        log_kappa,
+        logit_recover,
+        k_s,
+        k_y,
+        k_b,
+        k_n,
+        k_bias,
+        r_s,
+        r_y,
+        r_b,
+        r_n,
+        r_bias,
+        logit_c_decay,
+        k_c,
+        r_c,
+        logit_alpha,
+        log_lambda,
+        logit_c_suppress,
+        initial_b,
+        initial_e,
+        initial_c,
+        return_tape,
+        return_final_state,
     ) -> tuple[Tensor, ...]:
         B, T, H = Wx.shape
         if Wgx.shape != Wx.shape or Ug.shape != (H, H) or A.shape != (H, H):
@@ -1396,13 +1865,32 @@ class DABSNCoreScanBatchedFused(torch.autograd.Function):
 
             try:
                 tapes = dabsn_core_scan_batched_fused_forward(
-                    Wx, Wgx, Ug, A,
-                    beta, log_kappa, logit_recover,
-                    k_s, k_y, k_b, k_n, k_bias,
-                    r_s, r_y, r_b, r_n, r_bias,
-                    logit_c_decay, k_c, r_c,
-                    logit_alpha, log_lambda, logit_c_suppress,
-                    initial_b, initial_e, initial_c,
+                    Wx,
+                    Wgx,
+                    Ug,
+                    A,
+                    beta,
+                    log_kappa,
+                    logit_recover,
+                    k_s,
+                    k_y,
+                    k_b,
+                    k_n,
+                    k_bias,
+                    r_s,
+                    r_y,
+                    r_b,
+                    r_n,
+                    r_bias,
+                    logit_c_decay,
+                    k_c,
+                    r_c,
+                    logit_alpha,
+                    log_lambda,
+                    logit_c_suppress,
+                    initial_b,
+                    initial_e,
+                    initial_c,
                 )
             except Exception as exc:
                 if not is_triton_out_of_resources(exc):
@@ -1417,37 +1905,111 @@ class DABSNCoreScanBatchedFused(torch.autograd.Function):
                     hidden=int(Wx.shape[-1]),
                 )
                 tapes = _batched_forward_tapes(
-                    Wx, Wgx, Ug, A,
-                    beta, log_kappa, logit_recover,
-                    k_s, k_y, k_b, k_n, k_bias,
-                    r_s, r_y, r_b, r_n, r_bias,
-                    logit_c_decay, k_c, r_c,
-                    logit_alpha, log_lambda, logit_c_suppress,
-                    initial_b, initial_e, initial_c,
+                    Wx,
+                    Wgx,
+                    Ug,
+                    A,
+                    beta,
+                    log_kappa,
+                    logit_recover,
+                    k_s,
+                    k_y,
+                    k_b,
+                    k_n,
+                    k_bias,
+                    r_s,
+                    r_y,
+                    r_b,
+                    r_n,
+                    r_bias,
+                    logit_c_decay,
+                    k_c,
+                    r_c,
+                    logit_alpha,
+                    log_lambda,
+                    logit_c_suppress,
+                    initial_b,
+                    initial_e,
+                    initial_c,
                 )
         else:
             tapes = _batched_forward_tapes(
-                Wx, Wgx, Ug, A,
-                beta, log_kappa, logit_recover,
-                k_s, k_y, k_b, k_n, k_bias,
-                r_s, r_y, r_b, r_n, r_bias,
-                logit_c_decay, k_c, r_c,
-                logit_alpha, log_lambda, logit_c_suppress,
-                initial_b, initial_e, initial_c,
+                Wx,
+                Wgx,
+                Ug,
+                A,
+                beta,
+                log_kappa,
+                logit_recover,
+                k_s,
+                k_y,
+                k_b,
+                k_n,
+                k_bias,
+                r_s,
+                r_y,
+                r_b,
+                r_n,
+                r_bias,
+                logit_c_decay,
+                k_c,
+                r_c,
+                logit_alpha,
+                log_lambda,
+                logit_c_suppress,
+                initial_b,
+                initial_e,
+                initial_c,
             )
-        (U, novelty, plasticity, expression, write,
-         e_tape, c_tape, s_tape, final_b, final_e, final_c) = tapes
+        (
+            U,
+            novelty,
+            plasticity,
+            expression,
+            write,
+            e_tape,
+            c_tape,
+            s_tape,
+            final_b,
+            final_e,
+            final_c,
+        ) = tapes
         ctx.save_for_backward(
-            Wx, Wgx, Ug, A,
-            beta, log_kappa, logit_recover,
-            k_s, k_y, k_b, k_n, k_bias,
-            r_s, r_y, r_b, r_n, r_bias,
-            logit_c_decay, k_c, r_c,
-            logit_alpha, log_lambda, logit_c_suppress,
-            initial_b, initial_e, initial_c,
-            U, plasticity, expression,
-            e_tape, c_tape, s_tape,
-            final_b, final_e, final_c,
+            Wx,
+            Wgx,
+            Ug,
+            A,
+            beta,
+            log_kappa,
+            logit_recover,
+            k_s,
+            k_y,
+            k_b,
+            k_n,
+            k_bias,
+            r_s,
+            r_y,
+            r_b,
+            r_n,
+            r_bias,
+            logit_c_decay,
+            k_c,
+            r_c,
+            logit_alpha,
+            log_lambda,
+            logit_c_suppress,
+            initial_b,
+            initial_e,
+            initial_c,
+            U,
+            plasticity,
+            expression,
+            e_tape,
+            c_tape,
+            s_tape,
+            final_b,
+            final_e,
+            final_c,
         )
         public = [U, novelty, plasticity, expression, write]
         if ctx.return_tape:
@@ -1457,7 +2019,7 @@ class DABSNCoreScanBatchedFused(torch.autograd.Function):
         return tuple(public)
 
     @staticmethod
-    def backward(ctx, *grad_outputs):  # type: ignore[override]
+    def backward(ctx, *grad_outputs):
         # Off the GPU/Triton path (CPU, large H, resource fallback, or Triton
         # disabled) the tapes came from the eager forward, so use the certified
         # eager reverse. The single-launch Triton reverse remains opt-in until
@@ -1488,16 +2050,41 @@ class DABSNCoreScanBatchedFused(torch.autograd.Function):
         from .triton_runtime import _dabsn_core_fused_backward
 
         (
-            Wx, Wgx, Ug, A,
-            beta, log_kappa, logit_recover,
-            k_s, k_y, k_b, k_n, k_bias,
-            r_s, r_y, r_b, r_n, r_bias,
-            logit_c_decay, k_c, r_c,
-            logit_alpha, log_lambda, logit_c_suppress,
-            initial_b, initial_e, initial_c,
-            U, plasticity, expression,
-            e_tape, c_tape, s_tape,
-            final_b, final_e, final_c,
+            Wx,
+            Wgx,
+            Ug,
+            A,
+            beta,
+            log_kappa,
+            logit_recover,
+            k_s,
+            k_y,
+            k_b,
+            k_n,
+            k_bias,
+            r_s,
+            r_y,
+            r_b,
+            r_n,
+            r_bias,
+            logit_c_decay,
+            k_c,
+            r_c,
+            logit_alpha,
+            log_lambda,
+            logit_c_suppress,
+            initial_b,
+            initial_e,
+            initial_c,
+            U,
+            plasticity,
+            expression,
+            e_tape,
+            c_tape,
+            s_tape,
+            final_b,
+            final_e,
+            final_c,
         ) = ctx.saved_tensors
 
         gU, gnov_out, gp_out, gay_out, gwrite_out = (
@@ -1539,23 +2126,61 @@ class DABSNCoreScanBatchedFused(torch.autograd.Function):
             gfinal_c = torch.zeros_like(final_c)
 
         (
-            gWx, gWgx, grad_A, grad_Ug, gparam, gscal,
-            ginitial_b, ginitial_e, ginitial_c,
+            gWx,
+            gWgx,
+            grad_A,
+            grad_Ug,
+            gparam,
+            gscal,
+            ginitial_b,
+            ginitial_e,
+            ginitial_c,
         ) = _dabsn_core_fused_backward(
-            U, plasticity, expression, e_tape, c_tape, s_tape,
-            initial_b, initial_c,
-            A, Ug,
-            beta, log_kappa, logit_recover,
-            k_s, k_y, k_b, k_n, k_bias,
-            r_s, r_y, r_b, r_n, r_bias,
-            logit_c_decay, k_c, r_c,
-            logit_alpha, log_lambda, logit_c_suppress,
-            gU, gnov_out, gp_out, gay_out, gwrite_out, ge_out, gc_out,
-            gfinal_b, gfinal_e, gfinal_c,
+            U,
+            plasticity,
+            expression,
+            e_tape,
+            c_tape,
+            s_tape,
+            initial_b,
+            initial_c,
+            A,
+            Ug,
+            beta,
+            log_kappa,
+            logit_recover,
+            k_s,
+            k_y,
+            k_b,
+            k_n,
+            k_bias,
+            r_s,
+            r_y,
+            r_b,
+            r_n,
+            r_bias,
+            logit_c_decay,
+            k_c,
+            r_c,
+            logit_alpha,
+            log_lambda,
+            logit_c_suppress,
+            gU,
+            gnov_out,
+            gp_out,
+            gay_out,
+            gwrite_out,
+            ge_out,
+            gc_out,
+            gfinal_b,
+            gfinal_e,
+            gfinal_c,
         )
         return (
-            gWx.to(Wx.dtype), gWgx.to(Wgx.dtype),
-            grad_Ug.to(Ug.dtype), grad_A.to(A.dtype),
+            gWx.to(Wx.dtype),
+            gWgx.to(Wgx.dtype),
+            grad_Ug.to(Ug.dtype),
+            grad_A.to(A.dtype),
             gparam[0].to(beta.dtype),
             gparam[1].to(log_kappa.dtype),
             gparam[2].to(logit_recover.dtype),
@@ -1578,7 +2203,8 @@ class DABSNCoreScanBatchedFused(torch.autograd.Function):
             ginitial_b.to(initial_b.dtype),
             ginitial_e.to(initial_e.dtype),
             ginitial_c.to(initial_c.dtype),
-            None, None,
+            None,
+            None,
         )
 
 
@@ -1627,12 +2253,32 @@ def dabsn_core_scan_batched_fused(
         value.to(device=Wx.device).contiguous() for value in initial_state
     )
     return DABSNCoreScanBatchedFused.apply(
-        Wx, Wgx, Ug, A,
-        beta, log_kappa, logit_recover,
-        k_s, k_y, k_b, k_n, k_bias,
-        r_s, r_y, r_b, r_n, r_bias,
-        logit_c_decay, k_c, r_c,
-        logit_alpha, log_lambda, logit_c_suppress,
-        initial_b, initial_e, initial_c,
-        bool(return_tape), bool(return_final_state),
+        Wx,
+        Wgx,
+        Ug,
+        A,
+        beta,
+        log_kappa,
+        logit_recover,
+        k_s,
+        k_y,
+        k_b,
+        k_n,
+        k_bias,
+        r_s,
+        r_y,
+        r_b,
+        r_n,
+        r_bias,
+        logit_c_decay,
+        k_c,
+        r_c,
+        logit_alpha,
+        log_lambda,
+        logit_c_suppress,
+        initial_b,
+        initial_e,
+        initial_c,
+        bool(return_tape),
+        bool(return_final_state),
     )

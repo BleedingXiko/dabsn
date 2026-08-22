@@ -14,13 +14,28 @@ from dabsn.read import DABSNRead
 def _scan(fn, core, inputs):
     hidden = core.hidden_dim
     return fn(
-        core.W(inputs), core.Wg(inputs), core.Ug.weight, core.A.weight,
-        core.beta, core.log_kappa, core.logit_recover,
-        core.k_s, core.k_y, core.k_b, core.k_n, core.k_bias,
-        core.r_s, core.r_y, core.r_b, core.r_n, core.r_bias,
+        core.W(inputs),
+        core.Wg(inputs),
+        core.Ug.weight,
+        core.A.weight,
+        core.beta,
+        core.log_kappa,
+        core.logit_recover,
+        core.k_s,
+        core.k_y,
+        core.k_b,
+        core.k_n,
+        core.k_bias,
+        core.r_s,
+        core.r_y,
+        core.r_b,
+        core.r_n,
+        core.r_bias,
         core.logit_saturation_decay.expand(hidden).contiguous(),
-        core.k_saturation, core.r_saturation,
-        core.logit_alpha.reshape(()), core.log_lambda.reshape(()),
+        core.k_saturation,
+        core.r_saturation,
+        core.logit_alpha.reshape(()),
+        core.log_lambda.reshape(()),
         core.logit_saturation_suppress.reshape(()),
         return_tape=True,
     )
@@ -76,13 +91,28 @@ def _scan_cast(fn, core, inputs, dtype, *, wgx_dtype=None):
     wx = core.W(inputs).to(dtype)
     wgx = core.Wg(inputs).to(wgx_dtype or dtype)
     return fn(
-        wx, wgx, core.Ug.weight.to(dtype), core.A.weight.to(dtype),
-        core.beta, core.log_kappa, core.logit_recover,
-        core.k_s, core.k_y, core.k_b, core.k_n, core.k_bias,
-        core.r_s, core.r_y, core.r_b, core.r_n, core.r_bias,
+        wx,
+        wgx,
+        core.Ug.weight.to(dtype),
+        core.A.weight.to(dtype),
+        core.beta,
+        core.log_kappa,
+        core.logit_recover,
+        core.k_s,
+        core.k_y,
+        core.k_b,
+        core.k_n,
+        core.k_bias,
+        core.r_s,
+        core.r_y,
+        core.r_b,
+        core.r_n,
+        core.r_bias,
         core.logit_saturation_decay.expand(hidden).contiguous(),
-        core.k_saturation, core.r_saturation,
-        core.logit_alpha.reshape(()), core.log_lambda.reshape(()),
+        core.k_saturation,
+        core.r_saturation,
+        core.logit_alpha.reshape(()),
+        core.log_lambda.reshape(()),
         core.logit_saturation_suppress.reshape(()),
         return_tape=True,
     )
@@ -96,9 +126,7 @@ def test_batched_backward_requires_matching_wx_wgx_dtype(monkeypatch):
     torch.manual_seed(3)
     core = DABSNCore(input_dim=6, hidden_dim=7)
     x = torch.randn(2, 4, 6, requires_grad=True)
-    out = _scan_cast(
-        dabsn_core_scan_batched, core, x, torch.bfloat16, wgx_dtype=torch.float32
-    )
+    out = _scan_cast(dabsn_core_scan_batched, core, x, torch.bfloat16, wgx_dtype=torch.float32)
     with pytest.raises(RuntimeError, match="share a\n?.*dtype|share a dtype|Wx and Wgx"):
         out[0].sum().backward()
 
@@ -122,13 +150,14 @@ def test_batched_bf16_scratch_matches_fp32_eager(monkeypatch):
     sum((value.float() * weight).sum() for value, weight in zip(observed, weights)).backward()
     # bf16 GEMM + cast tolerance; the point is faithfulness, not bit-identity.
     torch.testing.assert_close(x_actual.grad, x_reference.grad, rtol=5e-2, atol=5e-2)
-    for (_, ref_p), (name, act_p) in zip(
-        reference.named_parameters(), actual.named_parameters()
-    ):
+    for (_, ref_p), (name, act_p) in zip(reference.named_parameters(), actual.named_parameters()):
         if ref_p.grad is None:
             continue
         torch.testing.assert_close(
-            act_p.grad, ref_p.grad, rtol=5e-2, atol=5e-2,
+            act_p.grad,
+            ref_p.grad,
+            rtol=5e-2,
+            atol=5e-2,
             msg=lambda m, n=name: f"{n}: {m}",
         )
 
@@ -159,7 +188,10 @@ def test_fused_core_fallback_matches_eager_forward_and_backward(monkeypatch):
         reference.named_parameters(), actual.named_parameters()
     ):
         torch.testing.assert_close(
-            actual_parameter.grad, reference_parameter.grad, rtol=2e-5, atol=2e-5,
+            actual_parameter.grad,
+            reference_parameter.grad,
+            rtol=2e-5,
+            atol=2e-5,
             msg=lambda message, name=name: f"{name}: {message}",
         )
 
@@ -231,13 +263,28 @@ def test_fused_forward_stores_tapes_in_activation_dtype(hidden_dim):
 
     def run():
         args = (
-            core.W(x), core.Wg(x), core.Ug.weight, core.A.weight,
-            core.beta, core.log_kappa, core.logit_recover,
-            core.k_s, core.k_y, core.k_b, core.k_n, core.k_bias,
-            core.r_s, core.r_y, core.r_b, core.r_n, core.r_bias,
+            core.W(x),
+            core.Wg(x),
+            core.Ug.weight,
+            core.A.weight,
+            core.beta,
+            core.log_kappa,
+            core.logit_recover,
+            core.k_s,
+            core.k_y,
+            core.k_b,
+            core.k_n,
+            core.k_bias,
+            core.r_s,
+            core.r_y,
+            core.r_b,
+            core.r_n,
+            core.r_bias,
             core.logit_saturation_decay.expand(hidden_dim).contiguous(),
-            core.k_saturation, core.r_saturation,
-            core.logit_alpha.reshape(()), core.log_lambda.reshape(()),
+            core.k_saturation,
+            core.r_saturation,
+            core.logit_alpha.reshape(()),
+            core.log_lambda.reshape(()),
             core.logit_saturation_suppress.reshape(()),
             core.initial_state(32, device=x.device)[0],
             core.initial_state(32, device=x.device)[1],
@@ -294,21 +341,51 @@ def test_dense_bmm_read_query_chunking_matches_full(mode):
     bank_idx = torch.randint(0, T, (B, N), device=dev).sort(dim=-1).values.to(torch.long)
     bank_valid = torch.rand(B, N, device=dev) > 0.3
     gains = dict(
-        short_gain=torch.tensor(0.8, device=dev), pad_gain=torch.tensor(0.6, device=dev),
-        induct_gain=torch.tensor(0.4, device=dev), cocktail_gain=torch.tensor(1.1, device=dev),
+        short_gain=torch.tensor(0.8, device=dev),
+        pad_gain=torch.tensor(0.6, device=dev),
+        induct_gain=torch.tensor(0.4, device=dev),
+        cocktail_gain=torch.tensor(1.1, device=dev),
     )
     full = dense_bmm_three_way_read(
-        q, mk, wm, nwm, rc, mc, kbias, adm, scale, bank_idx, bank_valid,
-        mode=mode, query_offset=0, total_T=T, **gains,
+        q,
+        mk,
+        wm,
+        nwm,
+        rc,
+        mc,
+        kbias,
+        adm,
+        scale,
+        bank_idx,
+        bank_valid,
+        mode=mode,
+        query_offset=0,
+        total_T=T,
+        **gains,
     )
     for chunk in (1, 5, 8):
         pieces = []
         for t0 in range(0, T, chunk):
             t1 = min(T, t0 + chunk)
-            pieces.append(dense_bmm_three_way_read(
-                q[:, t0:t1], mk, wm, nwm, rc[:, t0:t1], mc, kbias, adm, scale,
-                bank_idx, bank_valid, mode=mode, query_offset=t0, total_T=T, **gains,
-            ))
+            pieces.append(
+                dense_bmm_three_way_read(
+                    q[:, t0:t1],
+                    mk,
+                    wm,
+                    nwm,
+                    rc[:, t0:t1],
+                    mc,
+                    kbias,
+                    adm,
+                    scale,
+                    bank_idx,
+                    bank_valid,
+                    mode=mode,
+                    query_offset=t0,
+                    total_T=T,
+                    **gains,
+                )
+            )
         # Exact math; only float rounding differs across tile shapes.
         torch.testing.assert_close(torch.cat(pieces, dim=1), full, rtol=1e-5, atol=1e-6)
 
@@ -331,22 +408,47 @@ def test_dense_trainable_read_matches_reference_equations():
     scale = torch.tensor(1.3)
     bank_idx = torch.tensor([[0, 1, 3, 4, 5], [0, 2, 3, 4, 5], [0, 1, 2, 4, 5]])
     bank_valid = torch.tensor(
-        [[True, True, False, True, True], [True, True, True, False, True], [True, False, True, True, True]]
+        [
+            [True, True, False, True, True],
+            [True, True, True, False, True],
+            [True, False, True, True, True],
+        ]
     )
     qpos = torch.arange(steps).view(1, steps, 1)
     allow = bank_valid.unsqueeze(1) & (bank_idx.unsqueeze(1) <= qpos)
     induct_allow = bank_valid.unsqueeze(1) & (bank_idx.unsqueeze(1) < qpos)
     expected = read._three_way_read(
-        query, memory_key, write_memory, next_write_memory,
-        read_cocktail, memory_cocktail, key_bias, admission, scale,
-        allow, induct_allow, allow.any(dim=-1), induct_allow.any(dim=-1),
+        query,
+        memory_key,
+        write_memory,
+        next_write_memory,
+        read_cocktail,
+        memory_cocktail,
+        key_bias,
+        admission,
+        scale,
+        allow,
+        induct_allow,
+        allow.any(dim=-1),
+        induct_allow.any(dim=-1),
     )
     actual = dense_bmm_three_way_read(
-        query, memory_key, write_memory, next_write_memory,
-        read_cocktail, memory_cocktail, key_bias, admission, scale,
-        bank_idx, bank_valid, mode="seq",
-        short_gain=read.short_gain, pad_gain=read.pad_gain,
-        induct_gain=read.induct_gain, cocktail_gain=read.cocktail_gain,
+        query,
+        memory_key,
+        write_memory,
+        next_write_memory,
+        read_cocktail,
+        memory_cocktail,
+        key_bias,
+        admission,
+        scale,
+        bank_idx,
+        bank_valid,
+        mode="seq",
+        short_gain=read.short_gain,
+        pad_gain=read.pad_gain,
+        induct_gain=read.induct_gain,
+        cocktail_gain=read.cocktail_gain,
     )
     torch.testing.assert_close(actual, expected, rtol=1e-6, atol=1e-6)
 
@@ -376,20 +478,26 @@ def test_dense_trainable_read_backward_matches_reference_gradients():
     def leaves():
         torch.manual_seed(9)
         made = [
-            torch.randn(batch, steps, hidden), torch.randn(batch, bank, hidden),
-            torch.randn(batch, bank, hidden), torch.randn(batch, bank, hidden),
-            torch.randn(batch, steps, 4), torch.randn(batch, bank, 4),
-            torch.randn(batch, bank), torch.randn(batch, bank),
+            torch.randn(batch, steps, hidden),
+            torch.randn(batch, bank, hidden),
+            torch.randn(batch, bank, hidden),
+            torch.randn(batch, bank, hidden),
+            torch.randn(batch, steps, 4),
+            torch.randn(batch, bank, 4),
+            torch.randn(batch, bank),
+            torch.randn(batch, bank),
         ]
         return [t.requires_grad_(True) for t in made]
 
     scale = torch.tensor(1.3)
     bank_idx = torch.tensor([[0, 1, 3, 4, 5], [0, 2, 3, 4, 5], [0, 1, 2, 4, 5]])
-    bank_valid = torch.tensor([
-        [False, False, False, False, False],   # no eligible key anywhere
-        [True, True, True, False, True],
-        [True, False, True, True, True],
-    ])
+    bank_valid = torch.tensor(
+        [
+            [False, False, False, False, False],  # no eligible key anywhere
+            [True, True, True, False, True],
+            [True, False, True, True, True],
+        ]
+    )
     qpos = torch.arange(steps).view(1, steps, 1)
     allow = bank_valid.unsqueeze(1) & (bank_idx.unsqueeze(1) <= qpos)
     induct_allow = bank_valid.unsqueeze(1) & (bank_idx.unsqueeze(1) < qpos)
@@ -397,18 +505,28 @@ def test_dense_trainable_read_backward_matches_reference_gradients():
 
     ref_leaves = leaves()
     expected = read._three_way_read(
-        *ref_leaves, scale, allow, induct_allow,
-        allow.any(dim=-1), induct_allow.any(dim=-1),
+        *ref_leaves,
+        scale,
+        allow,
+        induct_allow,
+        allow.any(dim=-1),
+        induct_allow.any(dim=-1),
     )
     expected.backward(cotangent)
 
     act_leaves = leaves()
     actual = dense_bmm_three_way_read(
-        *act_leaves, scale, bank_idx, bank_valid, mode="seq",
-        short_gain=read.short_gain, pad_gain=read.pad_gain,
-        induct_gain=read.induct_gain, cocktail_gain=read.cocktail_gain,
+        *act_leaves,
+        scale,
+        bank_idx,
+        bank_valid,
+        mode="seq",
+        short_gain=read.short_gain,
+        pad_gain=read.pad_gain,
+        induct_gain=read.induct_gain,
+        cocktail_gain=read.cocktail_gain,
     )
-    actual.backward(cotangent)   # the in-place bug raised RuntimeError right here
+    actual.backward(cotangent)  # the in-place bug raised RuntimeError right here
 
     torch.testing.assert_close(actual, expected, rtol=1e-6, atol=1e-6)
     for got, want in zip(act_leaves, ref_leaves):
@@ -452,8 +570,7 @@ def test_no_read_path_writes_a_softmax_output_in_place():
         exempt = [
             (node.lineno, node.end_lineno or node.lineno)
             for node in ast.walk(tree)
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-            and node.name == "backward"
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == "backward"
         ]
 
         def graph_live(node, _exempt=exempt) -> bool:
@@ -465,9 +582,11 @@ def test_no_read_path_writes_a_softmax_output_in_place():
         softmax_outputs = {
             node.targets[0].id
             for node in ast.walk(tree)
-            if isinstance(node, ast.Assign) and len(node.targets) == 1
+            if isinstance(node, ast.Assign)
+            and len(node.targets) == 1
             and isinstance(node.targets[0], ast.Name)
-            and isinstance(node.value, ast.Call) and call_name(node.value) == "softmax"
+            and isinstance(node.value, ast.Call)
+            and call_name(node.value) == "softmax"
             and graph_live(node)
         }
         seen_any_softmax |= bool(softmax_outputs)
@@ -513,7 +632,9 @@ def test_no_read_path_writes_a_softmax_output_in_place():
 @pytest.mark.parametrize("count", [1, 3, 4, 5, 12])
 def test_forward_chunk_sequence_matches_one_pass(count):
     from dabsn.kernels.batched_runtime import (
-        _batched_forward_tapes, _forward_chunk, _ScanState,
+        _batched_forward_tapes,
+        _forward_chunk,
+        _ScanState,
     )
 
     torch.manual_seed(11)
@@ -525,15 +646,32 @@ def test_forward_chunk_sequence_matches_one_pass(count):
     init = core.initial_state(B, device=x.device)
 
     full = _batched_forward_tapes(
-        Wx, Wgx, core.Ug.weight, core.A.weight,
-        core.beta, core.log_kappa, core.logit_recover,
-        core.k_s, core.k_y, core.k_b, core.k_n, core.k_bias,
-        core.r_s, core.r_y, core.r_b, core.r_n, core.r_bias,
+        Wx,
+        Wgx,
+        core.Ug.weight,
+        core.A.weight,
+        core.beta,
+        core.log_kappa,
+        core.logit_recover,
+        core.k_s,
+        core.k_y,
+        core.k_b,
+        core.k_n,
+        core.k_bias,
+        core.r_s,
+        core.r_y,
+        core.r_b,
+        core.r_n,
+        core.r_bias,
         core.logit_saturation_decay.expand(H).contiguous(),
-        core.k_saturation, core.r_saturation,
-        core.logit_alpha.reshape(()), core.log_lambda.reshape(()),
+        core.k_saturation,
+        core.r_saturation,
+        core.logit_alpha.reshape(()),
+        core.log_lambda.reshape(()),
         core.logit_saturation_suppress.reshape(()),
-        init[0], init[1], init[2],
+        init[0],
+        init[1],
+        init[2],
     )
 
     # Same scan, driven as a sequence of `count`-step chunks through the fixed
@@ -545,12 +683,24 @@ def test_forward_chunk_sequence_matches_one_pass(count):
     )
     recurrent = torch.cat((core.Ug.weight, core.A.weight), dim=0).to(dt).contiguous()
     params = (
-        core.beta, core.log_kappa, core.logit_recover,
-        core.k_s, core.k_y, core.k_b, core.k_n, core.k_bias,
-        core.r_s, core.r_y, core.r_b, core.r_n, core.r_bias,
+        core.beta,
+        core.log_kappa,
+        core.logit_recover,
+        core.k_s,
+        core.k_y,
+        core.k_b,
+        core.k_n,
+        core.k_bias,
+        core.r_s,
+        core.r_y,
+        core.r_b,
+        core.r_n,
+        core.r_bias,
         core.logit_saturation_decay.expand(H).contiguous(),
-        core.k_saturation, core.r_saturation,
-        core.logit_alpha.reshape(()), core.log_lambda.reshape(()),
+        core.k_saturation,
+        core.r_saturation,
+        core.logit_alpha.reshape(()),
+        core.log_lambda.reshape(()),
         core.logit_saturation_suppress.reshape(()),
     )
     state = _ScanState(init[0].float(), init[1].float(), init[2].float())
@@ -558,17 +708,23 @@ def test_forward_chunk_sequence_matches_one_pass(count):
     while done < T:
         n = min(count, T - done)
         _forward_chunk(
-            Wx[:, done:done + n], Wgx[:, done:done + n], recurrent,
-            state.budget, state.energy, state.saturation,
-            tapes, params, H, n, done,
+            Wx[:, done : done + n],
+            Wgx[:, done : done + n],
+            recurrent,
+            state.budget,
+            state.energy,
+            state.saturation,
+            tapes,
+            params,
+            H,
+            n,
+            done,
         )
         done += n
 
     for chunked, reference in zip(tapes, full[:8]):
         torch.testing.assert_close(chunked, reference, rtol=0, atol=0)
-    for got, want in zip(
-        (state.budget, state.energy, state.saturation), full[8:11]
-    ):
+    for got, want in zip((state.budget, state.energy, state.saturation), full[8:11]):
         torch.testing.assert_close(got.to(want.dtype), want, rtol=0, atol=0)
 
 
@@ -606,7 +762,10 @@ def test_backward_chunk_sequence_matches_one_pass(count):
     bit, replay would silently produce wrong gradients.
     """
     from dabsn.kernels.batched_runtime import (
-        _backward_chunk, _batched_forward_tapes, _prev_slices, _ReverseCarry,
+        _backward_chunk,
+        _batched_forward_tapes,
+        _prev_slices,
+        _ReverseCarry,
     )
 
     torch.manual_seed(19)
@@ -618,16 +777,35 @@ def test_backward_chunk_sequence_matches_one_pass(count):
     init = core.initial_state(B, device=x.device)
     decay_vec = core.logit_saturation_decay.expand(H).contiguous()
 
-    (U, _nov, plasticity, expression, _w, e_tape, c_tape, s_tape,
-     _fb, _fe, _fc) = _batched_forward_tapes(
-        Wx, Wgx, core.Ug.weight, core.A.weight,
-        core.beta, core.log_kappa, core.logit_recover,
-        core.k_s, core.k_y, core.k_b, core.k_n, core.k_bias,
-        core.r_s, core.r_y, core.r_b, core.r_n, core.r_bias,
-        decay_vec, core.k_saturation, core.r_saturation,
-        core.logit_alpha.reshape(()), core.log_lambda.reshape(()),
-        core.logit_saturation_suppress.reshape(()),
-        init[0], init[1], init[2],
+    (U, _nov, plasticity, expression, _w, e_tape, c_tape, s_tape, _fb, _fe, _fc) = (
+        _batched_forward_tapes(
+            Wx,
+            Wgx,
+            core.Ug.weight,
+            core.A.weight,
+            core.beta,
+            core.log_kappa,
+            core.logit_recover,
+            core.k_s,
+            core.k_y,
+            core.k_b,
+            core.k_n,
+            core.k_bias,
+            core.r_s,
+            core.r_y,
+            core.r_b,
+            core.r_n,
+            core.r_bias,
+            decay_vec,
+            core.k_saturation,
+            core.r_saturation,
+            core.logit_alpha.reshape(()),
+            core.log_lambda.reshape(()),
+            core.logit_saturation_suppress.reshape(()),
+            init[0],
+            init[1],
+            init[2],
+        )
     )
 
     reads = (U, e_tape, c_tape, s_tape, plasticity, expression)
@@ -638,12 +816,20 @@ def test_backward_chunk_sequence_matches_one_pass(count):
     )
     recurrent = torch.cat((core.Ug.weight, core.A.weight), dim=0).to(U.dtype).contiguous()
     consts = (
-        core.log_kappa.double(), core.logit_recover.double(),
-        core.k_s.double(), core.k_y.double(), core.k_b.double(),
-        core.k_n.double(), core.k_bias.double(),
-        core.r_s.double(), core.r_y.double(), core.r_b.double(),
-        core.r_n.double(), core.r_bias.double(),
-        torch.sigmoid(decay_vec.double()), core.k_saturation.double(),
+        core.log_kappa.double(),
+        core.logit_recover.double(),
+        core.k_s.double(),
+        core.k_y.double(),
+        core.k_b.double(),
+        core.k_n.double(),
+        core.k_bias.double(),
+        core.r_s.double(),
+        core.r_y.double(),
+        core.r_b.double(),
+        core.r_n.double(),
+        core.r_bias.double(),
+        torch.sigmoid(decay_vec.double()),
+        core.k_saturation.double(),
         core.r_saturation.double(),
         torch.sigmoid(core.logit_alpha.double().reshape(())),
         torch.nn.functional.softplus(core.log_lambda.double().reshape(())),
@@ -653,7 +839,8 @@ def test_backward_chunk_sequence_matches_one_pass(count):
 
     def fresh_carry():
         return _ReverseCarry(
-            torch.zeros(B, H, dtype=f64), torch.zeros(B, H, dtype=f64),
+            torch.zeros(B, H, dtype=f64),
+            torch.zeros(B, H, dtype=f64),
             torch.zeros(B, H, dtype=f64),
             [torch.zeros(H, dtype=f64) for _ in range(16)],
             [torch.zeros((), dtype=f64) for _ in range(3)],
@@ -665,14 +852,14 @@ def test_backward_chunk_sequence_matches_one_pass(count):
         start = T - chunk_size
         while start >= 1:
             prev = _prev_slices(U, c_tape, init[0], init[2], H, start, chunk_size)
-            _backward_chunk(reads, grads, outs, prev, carry, recurrent, consts,
-                            H, chunk_size, start)
+            _backward_chunk(
+                reads, grads, outs, prev, carry, recurrent, consts, H, chunk_size, start
+            )
             start -= chunk_size
         remaining = start + chunk_size
         if remaining > 0:
             prev = _prev_slices(U, c_tape, init[0], init[2], H, 0, remaining)
-            _backward_chunk(reads, grads, outs, prev, carry, recurrent, consts,
-                            H, remaining, 0)
+            _backward_chunk(reads, grads, outs, prev, carry, recurrent, consts, H, remaining, 0)
         return outs, carry
 
     ref_outs, ref_carry = run(T)
@@ -744,7 +931,9 @@ def test_chunk_widths_hold_their_invariants_at_every_shape():
     scan uncaptured instead of capturing something useless.
     """
     from dabsn.kernels.batched_runtime import (
-        _reverse_chunk_width, _scan_chunk_width, _scan_stage_bytes,
+        _reverse_chunk_width,
+        _scan_chunk_width,
+        _scan_stage_bytes,
     )
 
     budget = _scan_stage_bytes()
@@ -761,9 +950,7 @@ def test_chunk_widths_hold_their_invariants_at_every_shape():
                     ):
                         assert 1 <= width <= T, (B, H, T, elem, width)
                         if width > 1:
-                            assert width * per_step <= budget, (
-                                B, H, T, elem, width
-                            )
+                            assert width * per_step <= budget, (B, H, T, elem, width)
 
 
 def test_capture_survives_the_batch_that_makes_the_step_compute_bound():
@@ -781,8 +968,10 @@ def test_capture_survives_the_batch_that_makes_the_step_compute_bound():
     stays above the floor across the whole range a real sweep visits.
     """
     from dabsn.kernels.batched_runtime import (
-        _reverse_chunk_width, _scan_chunk_width, _scan_stage_bytes,
         _SCAN_GRAPH_MIN_STEPS,
+        _reverse_chunk_width,
+        _scan_chunk_width,
+        _scan_stage_bytes,
     )
 
     # The A100-80GB the regression was measured on; asserted independently of
@@ -808,5 +997,5 @@ def test_capture_survives_the_batch_that_makes_the_step_compute_bound():
 
     # And the widths still shrink with batch -- the budget is a bound, not a
     # licence to stage without limit.
-    assert (_reverse_chunk_width(256, T, H, elem) <= _reverse_chunk_width(128, T, H, elem))
-    assert (_scan_chunk_width(256, T, H, elem) <= _scan_chunk_width(128, T, H, elem))
+    assert _reverse_chunk_width(256, T, H, elem) <= _reverse_chunk_width(128, T, H, elem)
+    assert _scan_chunk_width(256, T, H, elem) <= _scan_chunk_width(128, T, H, elem)

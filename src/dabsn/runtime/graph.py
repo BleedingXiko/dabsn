@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import os
 from collections.abc import Callable, Sequence
+from typing import cast
 
 import torch
 from torch import Tensor, nn
@@ -56,7 +57,7 @@ def _default_reduce(output: object) -> Tensor:
     """Collapse arbitrary module output to a scalar for gradient checking."""
 
     if torch.is_tensor(output):
-        return output.float().square().mean()
+        return cast(Tensor, output).float().square().mean()
     if isinstance(output, (list, tuple)):
         tensors = [value for value in output if torch.is_tensor(value)]
     elif isinstance(output, dict):
@@ -65,7 +66,10 @@ def _default_reduce(output: object) -> Tensor:
         raise TypeError(f"cannot reduce module output of type {type(output)!r}")
     if not tensors:
         raise ValueError("module output contained no tensors to reduce")
-    return sum(tensor.float().square().mean() for tensor in tensors)
+    return sum(
+        (tensor.float().square().mean() for tensor in tensors),
+        tensors[0].new_zeros(()),
+    )
 
 
 def _read_submodules(module: nn.Module) -> list[nn.Module]:
@@ -92,23 +96,23 @@ def _pin_capture_safe_recompute(module: nn.Module):
 
     backbones = [m for m in module.modules() if hasattr(m, "grad_checkpoint")]
     blocks = [m for m in module.modules() if hasattr(m, "_resolve_block_chunk_t")]
-    saved_ckpt = [(m, m.grad_checkpoint) for m in backbones]
+    saved_ckpt = [(m, getattr(m, "grad_checkpoint")) for m in backbones]
     saved_chunk = [(m, getattr(m, "_capture_no_chunk", None)) for m in blocks]
 
     for m in backbones:
-        m.grad_checkpoint = False
+        setattr(m, "grad_checkpoint", False)
     for m in blocks:
-        m._capture_no_chunk = True
+        setattr(m, "_capture_no_chunk", True)
 
     def restore() -> None:
         for m, prev in saved_ckpt:
-            m.grad_checkpoint = prev
+            setattr(m, "grad_checkpoint", prev)
         for m, prev in saved_chunk:
             if prev is None:
                 if hasattr(m, "_capture_no_chunk"):
                     delattr(m, "_capture_no_chunk")
             else:
-                m._capture_no_chunk = prev
+                setattr(m, "_capture_no_chunk", prev)
 
     return restore
 
@@ -150,9 +154,9 @@ def _pin_capture_safe_reads(module: nn.Module, sample_args: Sequence[Tensor]):
     # observed==0 (measurement failed) safely falls back to the full width.
     cap = observed * 2 + 64 if observed > 0 else None
     for m in reads:
-        m._capture_safe_bank = True
+        setattr(m, "_capture_safe_bank", True)
         if cap is not None:
-            m._capture_bank_width = cap
+            setattr(m, "_capture_bank_width", cap)
 
     def restore() -> None:
         for m, prev_flag, prev_width in saved:
@@ -160,12 +164,12 @@ def _pin_capture_safe_reads(module: nn.Module, sample_args: Sequence[Tensor]):
                 if hasattr(m, "_capture_safe_bank"):
                     delattr(m, "_capture_safe_bank")
             else:
-                m._capture_safe_bank = prev_flag
+                setattr(m, "_capture_safe_bank", prev_flag)
             if prev_width is None:
                 if hasattr(m, "_capture_bank_width"):
                     delattr(m, "_capture_bank_width")
             else:
-                m._capture_bank_width = prev_width
+                setattr(m, "_capture_bank_width", prev_width)
 
     return restore
 
@@ -379,6 +383,7 @@ def make_graphed_train_callable(
         module.zero_grad(set_to_none=True)
 
         if verify:
+            assert eager_loss is not None
             graph_loss = float(reduce(graphed(*sample_args)).detach())
             reduce(graphed(*sample_args)).backward()
             graph_signature = _block_grad_signature(module)
@@ -395,7 +400,7 @@ def make_graphed_train_callable(
             restore_recompute()
         restore_scan_graphs()
 
-    return graphed
+    return cast(nn.Module, graphed)
 
 
 __all__ = ["make_graphed_train_callable"]

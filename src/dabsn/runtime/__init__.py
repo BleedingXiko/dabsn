@@ -11,17 +11,20 @@ from ..distributed import (
     load_sharded_training_checkpoint,
     make_grad_scaler,
     no_sync_context,
+    parse_parallel_topology,
     prepare_distributed_model,
+    prepare_distributed_module,
     resolve_precision,
     save_distributed_dabsn,
     save_sharded_training_checkpoint,
     setup_distributed,
     shard_batch,
+    unwrap_dabsn_artifact,
     unwrap_dabsn_model,
     wrap_distributed,
 )
-
 from .api import (
+    apply_optimizer_step,
     evaluate,
     export_dabsn,
     infer,
@@ -29,9 +32,9 @@ from .api import (
     train_step,
     verify_gradients,
 )
-from .graph import make_graphed_train_callable
-from .grad_accum import ManualGradientAccumulator
 from .dispatch import log_routing_once, reset_routing_log, warn_routing_once
+from .grad_accum import ManualGradientAccumulator
+from .graph import make_graphed_train_callable
 from .loss import (
     ChunkedLinearCrossEntropy,
     chunked_cross_entropy_from_logits,
@@ -42,6 +45,7 @@ __all__ = [
     "DABSNSequenceModule",
     "DistributedState",
     "autocast_context",
+    "apply_optimizer_step",
     "cleanup_distributed",
     "ChunkedLinearCrossEntropy",
     "chunked_cross_entropy_from_logits",
@@ -60,7 +64,9 @@ __all__ = [
     "make_graphed_train_callable",
     "ManualGradientAccumulator",
     "no_sync_context",
+    "parse_parallel_topology",
     "prepare_distributed_model",
+    "prepare_distributed_module",
     "resolve_precision",
     "save_distributed_dabsn",
     "save_sharded_training_checkpoint",
@@ -69,6 +75,7 @@ __all__ = [
     "train",
     "train_step",
     "unwrap_dabsn_model",
+    "unwrap_dabsn_artifact",
     "verify_gradients",
     "wrap_distributed",
 ]

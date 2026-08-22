@@ -109,7 +109,9 @@ def _environment(backend: str) -> dict[str, object]:
 
 def _model_reference(
     device: torch.device,
-) -> tuple[DABSNModel, DABSNModel, torch.Tensor, torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
+) -> tuple[
+    DABSNModel, DABSNModel, torch.Tensor, torch.Tensor, torch.Tensor, dict[str, torch.Tensor]
+]:
     torch.manual_seed(20260715)
     layers = [DABSNLayerSpec(8, 8, geometry) for geometry in ("seq", "field", "hybrid")]
     reference = DABSNModel(
@@ -227,10 +229,11 @@ def _core_state_native_parity(backend: str, captured: dict[str, object]) -> dict
         captured["chunk_native"], captured["base"], captured["initial"], chunked=True
     )
     reference = captured["reference"]
-    expected_backend = "cuda_triton" if backend == "cuda" else "cpu_native_cpp"
+    expected_backend = "cuda_registered" if backend == "cuda" else "cpu_native_cpp"
     if full["backend"] != expected_backend or chunk["backend"] != expected_backend:
         raise AssertionError(
-            f"core state route was full={full['backend']} chunk={chunk['backend']}, expected {expected_backend}"
+            f"core state route was full={full['backend']} chunk={chunk['backend']}, "
+            f"expected {expected_backend}"
         )
     for label, actual, expected in (
         ("full outputs", full["outputs"], reference["outputs"]),
@@ -268,7 +271,7 @@ def _core_state_native_parity(backend: str, captured: dict[str, object]) -> dict
                 os.environ.pop("DABSN_CORE_BACKEND", None)
             else:
                 os.environ["DABSN_CORE_BACKEND"] = previous
-        if batched["backend"] != "cuda_batched_gemm":
+        if batched["backend"] != "cuda_registered":
             raise AssertionError(f"batched core route was {batched['backend']}")
         for index, (actual_tensor, expected_tensor) in enumerate(
             zip(batched["outputs"], reference["outputs"])
@@ -280,13 +283,17 @@ def _core_state_native_parity(backend: str, captured: dict[str, object]) -> dict
                 label=f"batched outputs {index}",
             )
         _assert_close(
-            batched["input_grad"], reference["input_grad"],
-            backend=backend, label="batched input gradient",
+            batched["input_grad"],
+            reference["input_grad"],
+            backend=backend,
+            label="batched input gradient",
         )
         for name, actual in batched["parameter_grads"].items():
             _assert_close(
-                actual, reference["parameter_grads"][name],
-                backend=backend, label=f"batched parameter gradient {name}",
+                actual,
+                reference["parameter_grads"][name],
+                backend=backend,
+                label=f"batched parameter gradient {name}",
             )
         batched_max_abs = max(
             _max_abs(actual, expected)
@@ -320,7 +327,12 @@ def _backend_status(backend: str) -> dict[str, object]:
             raise AssertionError(report["local_field"])
     else:
         cuda = report["cuda"]
-        required = ("cuda_available", "triton_available", "core_scan_enabled", "admitted_three_way_read_enabled")
+        required = (
+            "cuda_available",
+            "triton_available",
+            "core_scan_enabled",
+            "admitted_three_way_read_enabled",
+        )
         if not all(bool(cuda.get(key)) for key in required):
             raise AssertionError(cuda)
         if not bool(report["long_memory"].get("enabled")):
@@ -329,6 +341,18 @@ def _backend_status(backend: str) -> dict[str, object]:
             raise AssertionError(report["permanent"])
         if not bool(report["local_field"].get("triton_available")):
             raise AssertionError(report["local_field"])
+    dispatch_key = "CUDA" if backend == "cuda" else "CPU"
+    if not torch._C._dispatch_has_kernel_for_dispatch_key("dabsn::core_scan_batched", dispatch_key):
+        raise AssertionError(
+            f"dabsn::core_scan_batched has no registered {dispatch_key} implementation"
+        )
+    if backend == "cpu":
+        for operator in (
+            "dabsn::admitted_three_way_read_native",
+            "dabsn::_admitted_three_way_read_backward",
+        ):
+            if not torch._C._dispatch_has_kernel_for_dispatch_key(operator, dispatch_key):
+                raise AssertionError(f"{operator} has no registered {dispatch_key} implementation")
     return report
 
 
@@ -355,22 +379,28 @@ def _model_native_parity(
     }
     if set(native_grads) != set(reference_grads):
         raise AssertionError(
-            f"parameter-gradient coverage differs: native-only={sorted(set(native_grads) - set(reference_grads))}, "
+            "parameter-gradient coverage differs: "
+            f"native-only={sorted(set(native_grads) - set(reference_grads))}, "
             f"reference-only={sorted(set(reference_grads) - set(native_grads))}"
         )
     for name, expected in reference_grads.items():
-        _assert_close(native_grads[name], expected, backend=backend, label=f"parameter gradient {name}")
+        _assert_close(
+            native_grads[name], expected, backend=backend, label=f"parameter gradient {name}"
+        )
 
     traces = native.read_traces()
     for index, block in enumerate(native.backbone.blocks):
-        expected = "cuda_triton" if backend == "cuda" else "cpu_native_cpp"
-        if getattr(block.core, "_last_core_backend", None) != expected:
-            raise AssertionError(f"block {index} core did not route through {expected}")
-        if getattr(block.read, "_last_long_backend", None) != expected:
-            raise AssertionError(f"block {index} long read did not route through {expected}")
+        expected_core = "cuda_registered" if backend == "cuda" else "cpu_native_cpp"
+        expected_long = "cuda_triton" if backend == "cuda" else "cpu_native_cpp"
+        if getattr(block.core, "_last_core_backend", None) != expected_core:
+            raise AssertionError(f"block {index} core did not route through {expected_core}")
+        if getattr(block.read, "_last_long_backend", None) != expected_long:
+            raise AssertionError(f"block {index} long read did not route through {expected_long}")
         read_backend = traces[index]["read_contract"]["kernel_backend"]
         if backend == "cuda" and read_backend not in {
-            "dense_bmm_trainable", "compact_flash_trainable", "dense_mask_triton_trainable"
+            "dense_bmm_trainable",
+            "compact_flash_trainable",
+            "dense_mask_triton_trainable",
         }:
             raise AssertionError(f"block {index} admitted read backend: {read_backend}")
         if backend == "cpu" and read_backend != "cpu_native_cpp":
@@ -413,7 +443,9 @@ def _primitive_parity(backend: str, device: torch.device) -> dict[str, float]:
     y_dev = y_cpu.detach().to(device).requires_grad_(True)
     recurrence_dev = linear_recurrence(a_dev, g_dev, y_dev)
     (recurrence_dev * upstream.to(device)).sum().backward()
-    _assert_close(recurrence_dev.cpu(), recurrence_cpu.detach(), backend=backend, label="long recurrence")
+    _assert_close(
+        recurrence_dev.cpu(), recurrence_cpu.detach(), backend=backend, label="long recurrence"
+    )
     for label, actual, expected in (
         ("long a gradient", a_dev.grad.cpu(), a_cpu.grad),
         ("long g gradient", g_dev.grad.cpu(), g_cpu.grad),
@@ -431,7 +463,9 @@ def _primitive_parity(backend: str, device: torch.device) -> dict[str, float]:
     beta_dev = beta_cpu.detach().to(device).requires_grad_(True)
     permanent_dev = permanent_delta_scan(key_dev, value_dev, beta_dev)
     (permanent_dev * upstream.to(device)).sum().backward()
-    _assert_close(permanent_dev.cpu(), permanent_cpu.detach(), backend=backend, label="permanent scan")
+    _assert_close(
+        permanent_dev.cpu(), permanent_cpu.detach(), backend=backend, label="permanent scan"
+    )
     for label, actual, expected in (
         ("permanent key gradient", key_dev.grad.cpu(), key_cpu.grad),
         ("permanent value gradient", value_dev.grad.cpu(), value_cpu.grad),
@@ -455,7 +489,9 @@ def _primitive_parity(backend: str, device: torch.device) -> dict[str, float]:
     if backend == "cpu" and label != "cpu_native_cpp_patch_gather_then_shared_core":
         raise AssertionError(f"local-field gather fell back: {label}")
     _assert_close(gathered.cpu(), field_reference.detach(), backend=backend, label="local gather")
-    _assert_close(field_dev.grad.cpu(), field_cpu.grad, backend=backend, label="local gather gradient")
+    _assert_close(
+        field_dev.grad.cpu(), field_cpu.grad, backend=backend, label="local gather gradient"
+    )
 
     return {
         "long_max_abs": _max_abs(recurrence_dev.cpu(), recurrence_cpu.detach()),
@@ -515,10 +551,22 @@ def main() -> int:
             lambda: _checkpoint_roundtrip(captured["native"], captured["base"]),
         )
     else:
-        gate.check("native-model-forward-backward-parity", lambda: (_ for _ in ()).throw(RuntimeError("reference setup failed")))
-        gate.check("native-carried-core-state-forward-backward-parity", lambda: (_ for _ in ()).throw(RuntimeError("reference setup failed")))
-        gate.check("checkpoint-roundtrip", lambda: (_ for _ in ()).throw(RuntimeError("reference setup failed")))
-    gate.check("standalone-primitive-forward-backward-parity", lambda: _primitive_parity(args.backend, device))
+        gate.check(
+            "native-model-forward-backward-parity",
+            lambda: (_ for _ in ()).throw(RuntimeError("reference setup failed")),
+        )
+        gate.check(
+            "native-carried-core-state-forward-backward-parity",
+            lambda: (_ for _ in ()).throw(RuntimeError("reference setup failed")),
+        )
+        gate.check(
+            "checkpoint-roundtrip",
+            lambda: (_ for _ in ()).throw(RuntimeError("reference setup failed")),
+        )
+    gate.check(
+        "standalone-primitive-forward-backward-parity",
+        lambda: _primitive_parity(args.backend, device),
+    )
 
     final_status = status()
     report = {

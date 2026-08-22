@@ -43,9 +43,7 @@ def local_field_gather_stats() -> dict[str, object]:
         "cpu_hits": int(_CPU_GATHER_HITS),
         "hits": int(_GATHER_HITS),
         "fallbacks": int(_GATHER_FALLBACKS),
-        "import_error": (
-            None if _TRITON_IMPORT_ERROR is None else repr(_TRITON_IMPORT_ERROR)
-        ),
+        "import_error": (None if _TRITON_IMPORT_ERROR is None else repr(_TRITON_IMPORT_ERROR)),
     }
 
 
@@ -126,9 +124,7 @@ class _LocalFieldGather(torch.autograd.Function):
         batch, cells, dim = inputs.shape
         patch_cells, neighbors = patch.shape
         if int(patch_cells) != int(cells):
-            raise ValueError(
-                f"patch index N={patch_cells} does not match input N={cells}"
-            )
+            raise ValueError(f"patch index N={patch_cells} does not match input N={cells}")
         contiguous_inputs = inputs.contiguous()
         contiguous_patch = patch.to(
             device=inputs.device,
@@ -195,9 +191,9 @@ class _LocalFieldGatherCPU(torch.autograd.Function):
         ctx.save_for_backward(contiguous_patch)
         ctx.cells = int(inputs.shape[1])
         ctx.input_dtype = inputs.dtype
-        return extension.local_field_gather_cpu(
-            contiguous_inputs, contiguous_patch
-        ).to(inputs.dtype)
+        return extension.local_field_gather_cpu(contiguous_inputs, contiguous_patch).to(
+            inputs.dtype
+        )
 
     @staticmethod
     def backward(ctx, grad_out: Tensor):
@@ -205,10 +201,57 @@ class _LocalFieldGatherCPU(torch.autograd.Function):
 
         (patch,) = ctx.saved_tensors
         extension = _load_ext(required=True)
-        grad = extension.local_field_gather_bwd_cpu(
-            grad_out.float().contiguous(), patch, ctx.cells
-        )
+        grad = extension.local_field_gather_bwd_cpu(grad_out.float().contiguous(), patch, ctx.cells)
         return grad.to(ctx.input_dtype), None
+
+
+@torch.library.custom_op("dabsn::local_field_gather", mutates_args=())
+def _local_field_gather_op(inputs: Tensor, patch: Tensor) -> Tensor:
+    if _HAS_TRITON and inputs.is_cuda:
+        return _LocalFieldGather.apply(inputs, patch)
+    if _CPU_NATIVE_ENABLED and not inputs.is_cuda:
+        return _LocalFieldGatherCPU.apply(inputs, patch)
+    return inputs[:, patch]
+
+
+@_local_field_gather_op.register_fake
+def _local_field_gather_fake(inputs: Tensor, patch: Tensor) -> Tensor:
+    if inputs.dim() != 3 or patch.dim() != 2:
+        raise ValueError("expected inputs [B,N,D] and patch [N,K]")
+    return inputs.new_empty((inputs.shape[0], patch.shape[0], patch.shape[1], inputs.shape[2]))
+
+
+def _local_field_gather_setup(ctx, inputs, output) -> None:
+    values, patch = inputs
+    ctx.save_for_backward(patch)
+    ctx.cells = values.shape[1]
+
+
+def _local_field_gather_registered_backward(ctx, grad_out: Tensor):
+    (patch,) = ctx.saved_tensors
+    batch, patch_cells, neighbors, dim = grad_out.shape
+    grad_inputs = grad_out.new_zeros((batch, ctx.cells, dim))
+    indices = patch.reshape(1, patch_cells * neighbors, 1).expand(batch, -1, dim)
+    grad_inputs.scatter_add_(1, indices, grad_out.reshape(batch, -1, dim))
+    return grad_inputs, None
+
+
+torch.library.register_autograd(
+    _local_field_gather_op,
+    _local_field_gather_registered_backward,
+    setup_context=_local_field_gather_setup,
+)
+
+
+@torch.library.register_vmap(_local_field_gather_op)
+def _local_field_gather_vmap(info, in_dims, inputs, patch):
+    input_dim, patch_dim = in_dims
+    outputs = []
+    for index in range(info.batch_size):
+        selected_inputs = inputs if input_dim is None else inputs.movedim(input_dim, 0)[index]
+        selected_patch = patch if patch_dim is None else patch.movedim(patch_dim, 0)[index]
+        outputs.append(_local_field_gather_op(selected_inputs, selected_patch))
+    return torch.stack(outputs), 0
 
 
 def local_field_gather(inputs: Tensor, patch: Tensor) -> tuple[Tensor, str]:
@@ -218,14 +261,14 @@ def local_field_gather(inputs: Tensor, patch: Tensor) -> tuple[Tensor, str]:
     if _HAS_TRITON and inputs.is_cuda:
         _GATHER_HITS += 1
         return (
-            _LocalFieldGather.apply(inputs, patch),
+            _local_field_gather_op(inputs, patch),
             "triton_patch_gather_then_shared_core",
         )
     if _CPU_NATIVE_ENABLED and not inputs.is_cuda:
         _CPU_GATHER_HITS += 1
         return (
-            _LocalFieldGatherCPU.apply(inputs, patch),
+            _local_field_gather_op(inputs, patch),
             "cpu_native_cpp_patch_gather_then_shared_core",
         )
     _GATHER_FALLBACKS += 1
-    return inputs[:, patch], "torch_indexing_then_shared_core"
+    return _local_field_gather_op(inputs, patch), "torch_indexing_then_shared_core"

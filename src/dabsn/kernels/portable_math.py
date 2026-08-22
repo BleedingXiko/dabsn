@@ -21,10 +21,10 @@ import torch
 from torch import Tensor
 
 # ln(2) and 1/ln(2) as exact fp64 constants (identical on every IEEE-754 platform).
-_LN2 = 0.6931471805599453      # nearest double to ln 2
+_LN2 = 0.6931471805599453  # nearest double to ln 2
 _INV_LN2 = 1.4426950408889634  # nearest double to 1/ln 2
 # Two-part ln2 (Cody-Waite) for an accurate r = x - k*ln2 with no catastrophic cancel.
-_LN2_HI = 0.6931471803691238   # high bits of ln2
+_LN2_HI = 0.6931471803691238  # high bits of ln2
 _LN2_LO = 1.9082149292705877e-10  # ln2 - _LN2_HI
 
 # exp(r) minimax-ish: plain Taylor to order 13 on |r| <= ln2/2 ~ 0.347 -> < 1e-17.
@@ -64,8 +64,18 @@ def pexp(x: Tensor) -> Tensor:
 
 
 # log(m) for m in [2/3, 4/3): t=(m-1)/(m+1) in (-0.2,0.2), log(m)=2*(t+t^3/3+t^5/5+...).
-_LOG_RECIP = [1.0, 1.0 / 3.0, 1.0 / 5.0, 1.0 / 7.0, 1.0 / 9.0, 1.0 / 11.0,
-              1.0 / 13.0, 1.0 / 15.0, 1.0 / 17.0, 1.0 / 19.0]
+_LOG_RECIP = [
+    1.0,
+    1.0 / 3.0,
+    1.0 / 5.0,
+    1.0 / 7.0,
+    1.0 / 9.0,
+    1.0 / 11.0,
+    1.0 / 13.0,
+    1.0 / 15.0,
+    1.0 / 17.0,
+    1.0 / 19.0,
+]
 
 
 def plog(x: Tensor) -> Tensor:
@@ -73,7 +83,7 @@ def plog(x: Tensor) -> Tensor:
     [2/3,4/3) so the atanh series converges fast; log = (e+adj)*ln2 + 2*atanh((m-1)/(m+1))."""
     dt = x.dtype
     xf = x.to(torch.float64).clamp_min(2.2250738585072014e-308)
-    m, e = torch.frexp(xf)          # x = m * 2^e, m in [0.5, 1)
+    m, e = torch.frexp(xf)  # x = m * 2^e, m in [0.5, 1)
     e = e.to(torch.float64)
     # rebase: if m < 2/3 push into [2/3,4/3) by doubling and dropping one from e.
     low = m < 0.6666666666666666
@@ -106,9 +116,9 @@ def psigmoid(x: Tensor) -> Tensor:
     dt = x.dtype
     xf = x.to(torch.float64)
     neg = xf < 0.0
-    z = pexp(-xf.abs())               # in (0,1]
-    pos_branch = 1.0 / (1.0 + z)      # for x>=0
-    neg_branch = z / (1.0 + z)        # for x<0
+    z = pexp(-xf.abs())  # in (0,1]
+    pos_branch = 1.0 / (1.0 + z)  # for x>=0
+    neg_branch = z / (1.0 + z)  # for x<0
     out = torch.where(neg, neg_branch, pos_branch)
     return out.to(dt)
 
@@ -117,7 +127,7 @@ def ptanh(x: Tensor) -> Tensor:
     """tanh(x) = sign(x)*(1 - 2/(exp(2|x|)+1)), saturates for large |x|; portable."""
     dt = x.dtype
     xf = x.to(torch.float64)
-    a = xf.abs().clamp_max(40.0)      # exp(80) overflows; tanh already ==1 well before
+    a = xf.abs().clamp_max(40.0)  # exp(80) overflows; tanh already ==1 well before
     z = pexp(2.0 * a)
     mag = 1.0 - 2.0 / (z + 1.0)
     out = torch.sign(xf) * mag
@@ -135,6 +145,7 @@ def psoftplus(x: Tensor) -> Tensor:
 def _selftest() -> None:
     """Compare the portable functions with the platform math library on CPU."""
     import torch.nn.functional as F
+
     x = torch.linspace(-40, 40, 200001, dtype=torch.float64)
     # (name, portable, libm, mode): 'abs' for bounded outputs, 'rel' for wide-magnitude.
     checks = [
@@ -147,16 +158,20 @@ def _selftest() -> None:
     ok = True
     for name, a, b, mode in checks:
         if mode == "abs":
-            d = (a - b).abs().max().item(); tol = 1e-12
+            d = (a - b).abs().max().item()
+            tol = 1e-12
         else:
             # relative error only where the value is in a meaningful range (deep tail is
             # last-bit: at x=-23 softplus~1e-10 so abs err ~1e-20 -- irrelevant to ratio).
             keep = b.abs() > 1e-6
             # The relative tolerance protects the wide-magnitude functions while
             # exactness comes from the fixed IEEE-only construction.
-            d = ((a[keep] - b[keep]).abs() / b[keep].abs()).max().item(); tol = 2e-10
+            d = ((a[keep] - b[keep]).abs() / b[keep].abs()).max().item()
+            tol = 2e-10
         ok = ok and d < tol
-        print(f"  {name:10s} max {mode} err = {d:.2e}  (tol {tol:.0e})  {'OK' if d < tol else 'FAIL'}")
+        print(
+            f"  {name:10s} max {mode} err = {d:.2e}  (tol {tol:.0e})  {'OK' if d < tol else 'FAIL'}"
+        )
     print(f"PORTABLE MATH bit-exact-construction + ratio-preserving: {ok}")
 
 

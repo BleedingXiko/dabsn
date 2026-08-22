@@ -8,12 +8,36 @@ state while its read system combines admitted short memory, successor
 induction, permanent associative memory, and a recurrent long-memory channel.
 The same block design is used across all three geometries.
 
-The framework includes native C++/OpenMP CPU kernels and Triton/CUDA kernels
-for forward and backward execution, task-owned input and output adapters,
-structured checkpoints, training and inference helpers, and the complete
-source and result tables for the accompanying paper. Multi-GPU training uses
-PyTorch DDP or block-wrapped FSDP with full parameter, gradient, and optimizer
-sharding.
+The library includes native C++/OpenMP CPU kernels and Triton/CUDA kernels for
+forward and backward execution, task-owned input and output adapters, structured
+checkpoints, distributed execution, inference and gradient-verification
+utilities, and the complete source and result tables for the accompanying paper.
+
+DABSN is also a **composition framework**. A model is an ordered graph of
+components with declared contracts, and DABSN is one component in it — so a
+sparse mixture of experts, attention, a transformer, a CNN, or an architecture
+nobody has written yet composes with DABSN through a registered provider,
+without a core edit or a special loader, and saves and reloads through the
+ordinary checkpoint path. See [Composing architectures](#composing-architectures).
+
+Multi-GPU execution offers DDP and block-wrapped FSDP with full parameter,
+gradient, and optimizer sharding, plus tensor parallelism over the recurrent
+hidden dimension and expert parallelism over MoE experts.
+
+### What this is, and what it is not
+
+DABSN is a **model and runtime library, not a training framework.** Every model
+is an ordinary `torch.nn.Module`: put it in your own loop, or in torchtitan,
+Lightning, or whatever you already use. The library owns the architecture, the
+kernels, the component ABI, checkpoints, and distributed execution — the parts
+that are specific to DABSN and that you cannot reasonably write yourself.
+
+It deliberately does not own your training loop. Data format, schedule,
+optimizer choice, logging cadence, and checkpoint policy are yours. The `train`,
+`pretrain`, and `finetune` entry points below are **convenience examples for the
+plain dense path**, kept because they are useful and tested — not a supported
+training product, and not the way to train a composed architecture. Reach past
+them the moment your run needs something they do not do.
 
 ## Paper
 
@@ -262,6 +286,124 @@ includes synthetic data, the joint classification/distribution loss, and an
 optimizer step. A separate [local 2D field adapter](https://github.com/BleedingXiko/dabsn/blob/main/examples/field2d_local_adapter.py)
 demonstrates native neighborhood gather/scatter for spatial models.
 
+## Composing architectures
+
+The layer stack above builds "DABSN blocks, optionally with the same dense MLP
+after each one." That is the convenience path. Anything else — a sparse mixture
+of experts, an attention block, a transformer, a CNN, an SSM, several of them
+mixed — is an **ordered graph of components**, and DABSN is one component in it.
+
+Adding an architecture requires no core edit, no DABSN kernel, no `if attention`
+branch in the framework, and no special model loader. Components declare what
+they accept and produce, the graph validates every edge when the model is built,
+and the checkpoint carries enough to rebuild the whole thing.
+
+```python
+import torch
+
+from dabsn.checkpoint import save_graph, load_graph
+from dabsn.components import BuildContext, ComponentSpec, component_registry
+from dabsn.graph import DABSNGraph
+
+component_registry.discover()
+context = BuildContext(device=torch.device("cuda"), dtype=torch.bfloat16)
+
+dabsn = component_registry.build(
+    ComponentSpec("dabsn.0", "dabsn:block", {
+        "input_dim": 768, "hidden_dim": 768, "state_dim": 768,
+        "read_geometry": "seq", "residual": True,
+    }),
+    context,
+)
+experts = component_registry.build(
+    ComponentSpec("moe.0", "dabsn:sparse_moe", {
+        "hidden_dim": 768, "experts": 24, "top_k": 4, "inner_dim": 3072,
+        "router": "switch", "balance_coefficient": 0.01,
+    }),
+    context,
+)
+
+graph = DABSNGraph([dabsn, experts], require_world_builder=True)
+save_graph(graph, "arch.safetensors")
+restored = load_graph("arch.safetensors")
+```
+
+### Mixture of experts
+
+`dabsn:sparse_moe` routes each item to `top_k` of `experts` and is **dropless**:
+exactly `N x K` assignments are produced for `N` items, so the assignment buffer
+is a static shape even though per-expert counts vary. No capacity factor and no
+token dropping on the default path.
+
+Two routers are selectable, and neither is imposed: `"switch"` carries an
+explicit load-balance loss, `"aux_loss_free"` updates a per-expert selection
+bias after real optimizer steps. Routing returns expert counts and shares,
+balance entropy, cold-expert count, busiest and quietest share, selected
+confidence, and output-norm differentiation.
+
+The built-in `inner_dim` experts are grouped ReLU-squared MLPs. **An expert does
+not have to be an MLP.** Replace `inner_dim` with `expert_specs` — one provider
+spec per expert — and an expert becomes any registered component: an attention
+block, a whole transformer, a CNN, another MoE, or your own module. Mixing kinds
+within one group is just mixing entries in the list.
+
+```python
+attention = {
+    "provider_key": "yourpkg.attention", "provider_distribution": "yourpkg",
+    "provider_version": "1.0.0", "component_abi_version": 2,
+    "config_schema_version": 1,
+    "config": {"width": 768, "heads": 12},
+}
+mlp = {
+    "provider_key": "dabsn:residual_mlp", "provider_distribution": "dabsn",
+    "provider_version": dabsn_version, "component_abi_version": 2,
+    "config_schema_version": 1,
+    "config": {"dim": 768, "ratio": 4.0},
+}
+
+ComponentSpec("moe.0", "dabsn:sparse_moe", {
+    "hidden_dim": 768, "experts": 4, "top_k": 2,
+    "router": "switch", "balance_coefficient": 0.01,
+    "expert_specs": [attention, mlp, attention, mlp],   # heterogeneous
+})
+```
+
+Those specs are the checkpoint. A model whose experts are half attention and
+half MLP saves and reloads through the ordinary path, because the loader
+rebuilds each expert from its provider key rather than from a hardcoded list of
+architectures DABSN knows about.
+
+Routing granularity is explicit component configuration. The built-in component
+routes individual hidden vectors; structure-native routing belongs to a provider
+that declares that contract rather than being silently assumed.
+
+### Writing a provider
+
+A provider owns config validation, the contract its config implies,
+construction, and config-schema migration. Registering one makes an architecture
+addressable by name, portable in checkpoints, and subject to the same
+conformance matrix as the built-ins:
+
+```python
+from dabsn import check_component
+from dabsn.components import component_registry
+
+component_registry.register(MyProvider(), distribution="mypkg", version="1.0.0")
+report = check_component("mypkg.my_component", config, device="cuda")
+print(report.to_dict())
+```
+
+`check_component` runs the declared capability matrix — build and schema,
+dynamic axes, whole-graph compile, export, AMP, streaming state, determinism,
+FSDP wrapping. A capability the provider does not claim is reported as a skip,
+never as a pass. Loading a checkpoint that names a third-party provider requires
+passing it in `trusted_providers`, because reconstruction runs its code.
+
+Note that data-dependent dispatch — sparse routing, where per-expert counts are
+known only at runtime — cannot be traced whole-graph or exported. That is a
+declared property of such components, not a defect, and the conformance report
+says so rather than claiming otherwise.
+
 ## Native runtimes
 
 ```python
@@ -430,16 +572,59 @@ model can fit in rank-zero host memory, add
 `--final-export run/model.safetensors` to consolidate a shareable inference
 file.
 
-FSDP is parameter, gradient, optimizer-state, and batch parallelism. It does
-not split one sequence, one oversized matrix, or the recurrent context across
-GPUs. DABSN does not currently ship tensor, pipeline, or context parallelism;
-therefore this repository does not claim that FSDP alone can train an
-arbitrary one-trillion-parameter configuration.
+FSDP is parameter, gradient, optimizer-state, and batch parallelism. It does not
+split one sequence or one oversized matrix across GPUs.
+
+### Tensor and expert parallelism
+
+Two further kinds ship, for the cases FSDP does not answer.
+
+**Tensor parallelism** splits the recurrent hidden dimension itself, so a core
+wider than one device still runs. Each worker owns a contiguous set of state
+units and the matching rows of the recurrent matrix:
+
+```python
+from dabsn.core import TensorParallelDABSNCore
+
+sharded = TensorParallelDABSNCore(core, group=group, rank=rank, world_size=world)
+```
+
+Because a unit's next state depends on every unit's current state, the
+recurrence exchanges the full activation at every step. That collective is
+required by the recurrence, not an implementation shortcut. It is fused with the
+recurrent matmul into a single autograd node, using a symmetric-memory
+collective where the interconnect supports it and an explicit gather elsewhere;
+both compute the same values. Reassemble per-rank trajectories with
+`reassemble_tensor_parallel_trajectory`.
+
+**Expert parallelism** places MoE experts on different workers and exchanges
+routed assignments by rank:
+
+```python
+from dabsn import ExpertParallelExpertGroup, GenericExpertGroup
+
+group = ExpertParallelExpertGroup(
+    GenericExpertGroup(local_experts),
+    process_group=process_group,
+    world_size=world,
+    rank=rank,
+)
+```
+
+Every assignment returns in its original order, so a sharded expert group is
+numerically indistinguishable from one unsharded model. Its variable all-to-all
+split sizes are incompatible with CUDA-graph capture unless a separately proven
+static communication plan is supplied.
+
+Pipeline and context parallelism do not ship, so this repository does not claim
+that it can train an arbitrary one-trillion-parameter configuration.
 
 Programmatic users can access the same implementation through
 `setup_distributed`, `prepare_distributed_model`, `save_distributed_dabsn`,
 `save_sharded_training_checkpoint`, and their matching load functions from
-`dabsn.runtime`.
+`dabsn.runtime`. `clip_grad_norm` from `dabsn.runtime` clips correctly under
+every arrangement above, accumulating the cross-worker sum of squares in FP64
+and returning the norm in the gradients' dtype regardless of topology.
 
 ## Checkpoints and export
 
@@ -459,14 +644,50 @@ export_dabsn(
 )
 ```
 
-Model checkpoints are atomic, non-pickle SafeTensors files. They embed the full
-clean DABSN construction config and preserve tied weights. Custom adapter
-implementations remain application-owned and must be registered before loading
-a checkpoint that names them. Optimizer sidecars and distributed training
-directories are trusted run state, not files to accept from an untrusted
-source.
+Model checkpoints are atomic, non-pickle SafeTensors files. Saving validates the
+schema, checks tensor/metadata consistency, writes a temporary file, flushes and
+synchronizes it, and atomically replaces the target. `artifact_digest` returns a
+SHA-256 over the finished file.
 
-## Train, pretrain, fine-tune, and resume
+An artifact carries the format and schema version, the complete ordered graph
+specification, stable component IDs, provider keys with their distributions,
+versions and configuration, a representation-contract fingerprint, the parameter
+namespace map, the tied/shared tensor map, DABSN memory ownership, and
+construction and framework versions. Metadata is canonical JSON under explicit
+size, nesting, and value limits. `inspect_dabsn` reads all of it without
+allocating a single model tensor.
+
+Loading rebuilds the architecture from provider keys and configuration and
+verifies the contract fingerprint before applying any tensor. **The loader
+contains no architecture-specific branch** — that absence is what makes an
+arbitrary composed model portable rather than dependent on the code that
+happened to create it. Use `load_graph` for a raw component graph and
+`load_dabsn` for a model; each rejects the other's artifact kind rather than
+guessing.
+
+Custom adapters and third-party providers remain application-owned and must be
+registered — and named in `trusted_providers` — before loading a checkpoint that
+references them, because reconstruction executes their construction code.
+Migration is explicit: `migrate_dabsn_checkpoint` converts v1 artifacts to the v2
+graph form, and every existing `0.1.x` checkpoint remains loadable. Optimizer
+sidecars and distributed training directories are trusted run state, not files to
+accept from an untrusted source.
+
+## Train, pretrain, fine-tune, and resume (examples)
+
+**Scope.** These are worked examples for the plain dense DABSN path, not a
+training framework. They build a `DABSNSequenceLM` from flat configuration
+fields, so they cannot construct a composed architecture — a mixture of experts,
+attention experts, or anything else assembled as a component graph. For those,
+build the model yourself (see [Composing architectures](#composing-architectures))
+and train it in your own loop; everything the library actually owns —
+checkpoints, distributed execution, kernels, gradient checks — works there
+unchanged.
+
+They are kept because they are tested and genuinely useful for the case they
+cover, and because `--resume` will continue any `DABSNSequenceLM` checkpoint,
+including one you built from a graph. They are not the intended path for a
+serious run.
 
 These commands are deliberately separate:
 

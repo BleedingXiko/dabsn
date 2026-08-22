@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dabsn-external-fixture"
+version = "1.0.0"
+requires-python = ">=3.10"
+dependencies = ["dabsn"]
+
+[project.entry-points."dabsn.components.v2"]
+"fixture.scale" = "dabsn_external_fixture:ScaleProvider"
+"fixture.h_attention" = "dabsn_external_fixture:HAttentionProvider"
+"fixture.cnn" = "dabsn_external_fixture:CNNProvider"
+"fixture.transformer" = "dabsn_external_fixture:TransformerProvider"
+"fixture.world_transformer_expert" = "dabsn_external_fixture:WorldTransformerExpertProvider"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+packages = ["dabsn_external_fixture"]

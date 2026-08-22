@@ -25,7 +25,9 @@ class ManualGradientAccumulator:
     def __init__(self, module: nn.Module, *, dtype: torch.dtype = torch.float32):
         self.module = module
         self.dtype = dtype
-        self.parameters = [parameter for parameter in module.parameters() if parameter.requires_grad]
+        self.parameters = [
+            parameter for parameter in module.parameters() if parameter.requires_grad
+        ]
         self.buffers = {
             parameter: torch.zeros_like(
                 parameter,
@@ -68,7 +70,9 @@ class ManualGradientAccumulator:
         self.module.zero_grad(set_to_none=True)
         for parameter in self.active:
             buffer = self.buffers[parameter]
-            parameter.grad = buffer if buffer.dtype == parameter.dtype else buffer.to(parameter.dtype)
+            parameter.grad = (
+                buffer if buffer.dtype == parameter.dtype else buffer.to(parameter.dtype)
+            )
 
     @torch.no_grad()
     def reset(self) -> None:

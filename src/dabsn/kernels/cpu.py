@@ -6,6 +6,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any
 
 import torch
 from torch import Tensor
@@ -13,6 +14,8 @@ from torch import Tensor
 _EXT = None
 _TRIED = False
 _EAGER_THREE_WAY_READ = None
+_CORE_OP_CPU_REGISTERED = False
+_READ_OP_CPU_REGISTERED = False
 _SOURCE = Path(__file__).with_name("cpu_runtime.cpp")
 
 
@@ -110,6 +113,7 @@ def _load_ext(*, required: bool = False):
 
 def _scalars(core):
     import torch.nn.functional as F
+
     gate_alpha = torch.sigmoid(core.logit_alpha.reshape(())).item()
     lam = F.softplus(core.log_lambda.reshape(())).item()
     saturation_suppress = torch.sigmoid(core.logit_saturation_suppress.reshape(())).item()
@@ -146,7 +150,7 @@ def native_core_forward(
     """
     ext = _load_ext()
     if ext is None or e_in.is_cuda:
-        return core._eager_forward_from_state(
+        return core._reference_forward_from_state(
             e_in,
             initial_state=initial_state,
             return_writes=return_writes,
@@ -162,6 +166,7 @@ def native_core_forward(
         U, nov, p, ay, write, energy, saturation, final_b, final_e, final_c = (
             native_core_forward_train(core, e_in, initial_state=initial_state)
         )
+        result: tuple[Any, ...]
         if return_cocktail:
             result = U, nov, p, ay, write, energy, saturation
         elif return_writes:
@@ -196,7 +201,7 @@ def _native_core_forward_infer(
     H = int(core.hidden_dim)
     gate_alpha, lam, saturation_suppress = _scalars(core)
     if ext is None or e_in.is_cuda:
-        return core._eager_forward_from_state(
+        return core._reference_forward_from_state(
             e_in,
             initial_state=initial_state,
             return_writes=return_writes,
@@ -211,17 +216,34 @@ def _native_core_forward_infer(
     kc = core.k_saturation.float().contiguous()
     rc = core.r_saturation.float().contiguous()
     U, nov, p, ay, write, energy, saturation, final_b, final_e, final_c = ext.dabsn_core_scan_cpu(
-        Wx, Wgx, GA_w,
-        core.beta.float().contiguous(), core.log_kappa.float().contiguous(),
+        Wx,
+        Wgx,
+        GA_w,
+        core.beta.float().contiguous(),
+        core.log_kappa.float().contiguous(),
         core.logit_recover.float().contiguous(),
-        core.k_s.float().contiguous(), core.k_y.float().contiguous(), core.k_b.float().contiguous(),
-        core.k_n.float().contiguous(), core.k_bias.float().contiguous(),
-        core.r_s.float().contiguous(), core.r_y.float().contiguous(), core.r_b.float().contiguous(),
-        core.r_n.float().contiguous(), core.r_bias.float().contiguous(),
-        lcd, kc, rc,
-        initial_b.float().contiguous(), initial_e.float().contiguous(), initial_c.float().contiguous(),
-        gate_alpha, lam, saturation_suppress)
-    if return_cocktail:                       # admission read needs the energy/saturation tape
+        core.k_s.float().contiguous(),
+        core.k_y.float().contiguous(),
+        core.k_b.float().contiguous(),
+        core.k_n.float().contiguous(),
+        core.k_bias.float().contiguous(),
+        core.r_s.float().contiguous(),
+        core.r_y.float().contiguous(),
+        core.r_b.float().contiguous(),
+        core.r_n.float().contiguous(),
+        core.r_bias.float().contiguous(),
+        lcd,
+        kc,
+        rc,
+        initial_b.float().contiguous(),
+        initial_e.float().contiguous(),
+        initial_c.float().contiguous(),
+        gate_alpha,
+        lam,
+        saturation_suppress,
+    )
+    result: tuple[Any, ...]
+    if return_cocktail:  # admission read needs the energy/saturation tape
         result = U, nov, p, ay, write, energy, saturation
     elif return_writes:
         result = U, nov, p, ay, write
@@ -238,9 +260,23 @@ class _ThreeWayReadFn(torch.autograd.Function):
     @staticmethod
     def forward(
         ctx,
-        q, kb, wb, wb_next, cocktail, cb, key_bias_g, adm_g,
-        scale, cocktail_gain, short_gain, pad_gain, induct_gain,
-        allow, induct_allow, has_elig, induct_elig,
+        q,
+        kb,
+        wb,
+        wb_next,
+        cocktail,
+        cb,
+        key_bias_g,
+        adm_g,
+        scale,
+        cocktail_gain,
+        short_gain,
+        pad_gain,
+        induct_gain,
+        allow,
+        induct_allow,
+        has_elig,
+        induct_elig,
     ):
         ext = _load_ext()
         scale_f = float(scale.detach().cpu())
@@ -261,14 +297,42 @@ class _ThreeWayReadFn(torch.autograd.Function):
         eligc = has_elig.contiguous()
         ieligc = induct_elig.contiguous()
         out = ext.three_way_read_cpu(
-            qf, kbf, wbf, wnf, cf, cbf, kbgf, admf,
-            allowc, iallowc, eligc, ieligc,
-            scale_f, cocktail_gain_f, short_gain_f, pad_gain_f, induct_gain_f,
+            qf,
+            kbf,
+            wbf,
+            wnf,
+            cf,
+            cbf,
+            kbgf,
+            admf,
+            allowc,
+            iallowc,
+            eligc,
+            ieligc,
+            scale_f,
+            cocktail_gain_f,
+            short_gain_f,
+            pad_gain_f,
+            induct_gain_f,
         )
         ctx.save_for_backward(
-            qf, kbf, wbf, wnf, cf, cbf, kbgf, admf,
-            allowc, iallowc, eligc, ieligc,
-            scale, cocktail_gain, short_gain, pad_gain, induct_gain,
+            qf,
+            kbf,
+            wbf,
+            wnf,
+            cf,
+            cbf,
+            kbgf,
+            admf,
+            allowc,
+            iallowc,
+            eligc,
+            ieligc,
+            scale,
+            cocktail_gain,
+            short_gain,
+            pad_gain,
+            induct_gain,
         )
         ctx.scale = scale_f
         ctx.cocktail_gain = cocktail_gain_f
@@ -280,19 +344,58 @@ class _ThreeWayReadFn(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_out):
         (
-            q, kb, wb, wb_next, cocktail, cb, key_bias_g, adm_g,
-            allow, induct_allow, has_elig, induct_elig,
-            scale, cocktail_gain, short_gain, pad_gain, induct_gain,
+            q,
+            kb,
+            wb,
+            wb_next,
+            cocktail,
+            cb,
+            key_bias_g,
+            adm_g,
+            allow,
+            induct_allow,
+            has_elig,
+            induct_elig,
+            scale,
+            cocktail_gain,
+            short_gain,
+            pad_gain,
+            induct_gain,
         ) = ctx.saved_tensors
         ext = _load_ext()
         (
-            gq, gkb, gwb, gwb_next, gcocktail, gcb, gkey, gadm,
-            gscale, gcocktail_gain, gshort, gpad, ginduct,
+            gq,
+            gkb,
+            gwb,
+            gwb_next,
+            gcocktail,
+            gcb,
+            gkey,
+            gadm,
+            gscale,
+            gcocktail_gain,
+            gshort,
+            gpad,
+            ginduct,
         ) = ext.three_way_read_bwd(
             grad_out.float().contiguous(),
-            q, kb, wb, wb_next, cocktail, cb, key_bias_g, adm_g,
-            allow, induct_allow, has_elig, induct_elig,
-            ctx.scale, ctx.cocktail_gain, ctx.short_gain, ctx.pad_gain, ctx.induct_gain,
+            q,
+            kb,
+            wb,
+            wb_next,
+            cocktail,
+            cb,
+            key_bias_g,
+            adm_g,
+            allow,
+            induct_allow,
+            has_elig,
+            induct_elig,
+            ctx.scale,
+            ctx.cocktail_gain,
+            ctx.short_gain,
+            ctx.pad_gain,
+            ctx.induct_gain,
         )
         return (
             gq.to(dtype=grad_out.dtype),
@@ -304,10 +407,18 @@ class _ThreeWayReadFn(torch.autograd.Function):
             gkey.to(dtype=grad_out.dtype),
             gadm.to(dtype=grad_out.dtype),
             torch.as_tensor(gscale, device=scale.device, dtype=scale.dtype).reshape_as(scale),
-            torch.as_tensor(gcocktail_gain, device=cocktail_gain.device, dtype=cocktail_gain.dtype).reshape_as(cocktail_gain),
-            torch.as_tensor(gshort, device=short_gain.device, dtype=short_gain.dtype).reshape_as(short_gain),
-            torch.as_tensor(gpad, device=pad_gain.device, dtype=pad_gain.dtype).reshape_as(pad_gain),
-            torch.as_tensor(ginduct, device=induct_gain.device, dtype=induct_gain.dtype).reshape_as(induct_gain),
+            torch.as_tensor(
+                gcocktail_gain, device=cocktail_gain.device, dtype=cocktail_gain.dtype
+            ).reshape_as(cocktail_gain),
+            torch.as_tensor(gshort, device=short_gain.device, dtype=short_gain.dtype).reshape_as(
+                short_gain
+            ),
+            torch.as_tensor(gpad, device=pad_gain.device, dtype=pad_gain.dtype).reshape_as(
+                pad_gain
+            ),
+            torch.as_tensor(ginduct, device=induct_gain.device, dtype=induct_gain.dtype).reshape_as(
+                induct_gain
+            ),
             None,
             None,
             None,
@@ -315,8 +426,22 @@ class _ThreeWayReadFn(torch.autograd.Function):
         )
 
 
-def native_three_way_read(self, q, kb, wb, wb_next, cocktail, cb, key_bias_g, adm_g, scale,
-                          allow, induct_allow, has_elig, induct_elig) -> Tensor:
+def native_three_way_read(
+    self,
+    q,
+    kb,
+    wb,
+    wb_next,
+    cocktail,
+    cb,
+    key_bias_g,
+    adm_g,
+    scale,
+    allow,
+    induct_allow,
+    has_elig,
+    induct_elig,
+) -> Tensor:
     """Native CPU path for ``DABSNRead._three_way_read``.
 
     This is geometry-agnostic: seq, field, and hybrid pass different masks into
@@ -325,9 +450,22 @@ def native_three_way_read(self, q, kb, wb, wb_next, cocktail, cb, key_bias_g, ad
     """
     ext = _load_ext()
     if ext is None or q.is_cuda:
+        assert _EAGER_THREE_WAY_READ is not None
         return _EAGER_THREE_WAY_READ(
-            self, q, kb, wb, wb_next, cocktail, cb, key_bias_g, adm_g, scale,
-            allow, induct_allow, has_elig, induct_elig
+            self,
+            q,
+            kb,
+            wb,
+            wb_next,
+            cocktail,
+            cb,
+            key_bias_g,
+            adm_g,
+            scale,
+            allow,
+            induct_allow,
+            has_elig,
+            induct_elig,
         )
 
     needs_grad = (
@@ -350,16 +488,43 @@ def native_three_way_read(self, q, kb, wb, wb_next, cocktail, cb, key_bias_g, ad
     # Python-side score materialization.
     required = bool(getattr(type(self), "_cpu_native_required", False))
     if not required and needs_grad and q.shape[1] <= 64 and kb.shape[1] <= 64:
+        assert _EAGER_THREE_WAY_READ is not None
         return _EAGER_THREE_WAY_READ(
-            self, q, kb, wb, wb_next, cocktail, cb, key_bias_g, adm_g, scale,
-            allow, induct_allow, has_elig, induct_elig
+            self,
+            q,
+            kb,
+            wb,
+            wb_next,
+            cocktail,
+            cb,
+            key_bias_g,
+            adm_g,
+            scale,
+            allow,
+            induct_allow,
+            has_elig,
+            induct_elig,
         )
     self._last_three_way_backend = "cpu_native_cpp"
     if needs_grad:
         return _ThreeWayReadFn.apply(
-            q, kb, wb, wb_next, cocktail, cb, key_bias_g, adm_g,
-            scale, self.cocktail_gain, self.short_gain, self.pad_gain, self.induct_gain,
-            allow, induct_allow, has_elig, induct_elig,
+            q,
+            kb,
+            wb,
+            wb_next,
+            cocktail,
+            cb,
+            key_bias_g,
+            adm_g,
+            scale,
+            self.cocktail_gain,
+            self.short_gain,
+            self.pad_gain,
+            self.induct_gain,
+            allow,
+            induct_allow,
+            has_elig,
+            induct_elig,
         )
 
     return ext.three_way_read_cpu(
@@ -391,43 +556,159 @@ class _DABSNCoreScanFn(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, Wx, Wgx, GA_w, beta, log_kappa, logit_recover,
-                k_s, k_y, k_b, k_n, k_bias, r_s, r_y, r_b, r_n, r_bias,
-                logit_c_decay, k_c, r_c, initial_b, initial_e, initial_c,
-                gate_alpha, lam, saturation_suppress):
+    def forward(
+        ctx,
+        Wx,
+        Wgx,
+        GA_w,
+        beta,
+        log_kappa,
+        logit_recover,
+        k_s,
+        k_y,
+        k_b,
+        k_n,
+        k_bias,
+        r_s,
+        r_y,
+        r_b,
+        r_n,
+        r_bias,
+        logit_c_decay,
+        k_c,
+        r_c,
+        initial_b,
+        initial_e,
+        initial_c,
+        gate_alpha,
+        lam,
+        saturation_suppress,
+    ):
         ext = _load_ext()
         out = ext.dabsn_core_scan_fwd_train(
-            Wx.contiguous(), Wgx.contiguous(), GA_w.contiguous(),
-            beta, log_kappa, logit_recover, k_s, k_y, k_b, k_n, k_bias,
-            r_s, r_y, r_b, r_n, r_bias, logit_c_decay, k_c, r_c,
-            initial_b, initial_e, initial_c,
-            float(gate_alpha), float(lam), float(saturation_suppress))
+            Wx.contiguous(),
+            Wgx.contiguous(),
+            GA_w.contiguous(),
+            beta,
+            log_kappa,
+            logit_recover,
+            k_s,
+            k_y,
+            k_b,
+            k_n,
+            k_bias,
+            r_s,
+            r_y,
+            r_b,
+            r_n,
+            r_bias,
+            logit_c_decay,
+            k_c,
+            r_c,
+            initial_b,
+            initial_e,
+            initial_c,
+            float(gate_alpha),
+            float(lam),
+            float(saturation_suppress),
+        )
         U, nov, p, ay, write, energy, saturation, bpre, cpre, final_b, final_e, final_c = out
-        ctx.save_for_backward(bpre, energy, cpre, Wx, Wgx, GA_w, beta, log_kappa,
-                              logit_recover, k_s, k_y, k_b, k_n, k_bias,
-                              r_s, r_y, r_b, r_n, r_bias, logit_c_decay, k_c, r_c)
-        ctx.gate_alpha = float(gate_alpha); ctx.lam = float(lam)
+        ctx.save_for_backward(
+            bpre,
+            energy,
+            cpre,
+            Wx,
+            Wgx,
+            GA_w,
+            beta,
+            log_kappa,
+            logit_recover,
+            k_s,
+            k_y,
+            k_b,
+            k_n,
+            k_bias,
+            r_s,
+            r_y,
+            r_b,
+            r_n,
+            r_bias,
+            logit_c_decay,
+            k_c,
+            r_c,
+        )
+        ctx.gate_alpha = float(gate_alpha)
+        ctx.lam = float(lam)
         ctx.saturation_suppress = float(saturation_suppress)
         return U, nov, p, ay, write, energy, saturation, final_b, final_e, final_c
 
     @staticmethod
-    def backward(ctx, gU, gNov, gP, gAy, gWrite, gEnergy, gCort,
-                 gFinalB, gFinalE, gFinalC):
-        (bpre, epre, cpre, Wx, Wgx, GA_w, beta, log_kappa, logit_recover,
-         k_s, k_y, k_b, k_n, k_bias, r_s, r_y, r_b, r_n, r_bias,
-         logit_c_decay, k_c, r_c) = ctx.saved_tensors
+    def backward(ctx, gU, gNov, gP, gAy, gWrite, gEnergy, gCort, gFinalB, gFinalE, gFinalC):
+        (
+            bpre,
+            epre,
+            cpre,
+            Wx,
+            Wgx,
+            GA_w,
+            beta,
+            log_kappa,
+            logit_recover,
+            k_s,
+            k_y,
+            k_b,
+            k_n,
+            k_bias,
+            r_s,
+            r_y,
+            r_b,
+            r_n,
+            r_bias,
+            logit_c_decay,
+            k_c,
+            r_c,
+        ) = ctx.saved_tensors
         ext = _load_ext()
         gFinalB = torch.zeros_like(bpre[:, 0]) if gFinalB is None else gFinalB
         gFinalE = torch.zeros_like(epre[:, 0]) if gFinalE is None else gFinalE
         gFinalC = torch.zeros_like(cpre[:, 0]) if gFinalC is None else gFinalC
         g = ext.dabsn_core_scan_bwd(
-            gU.contiguous(), gNov.contiguous(), gP.contiguous(), gAy.contiguous(),
-            gWrite.contiguous(), gEnergy.contiguous(), gCort.contiguous(),
-            gFinalB.contiguous(), gFinalE.contiguous(), gFinalC.contiguous(),
-            bpre, epre, cpre, Wx, Wgx, GA_w, beta, log_kappa, logit_recover,
-            k_s, k_y, k_b, k_n, k_bias, r_s, r_y, r_b, r_n, r_bias,
-            logit_c_decay, k_c, r_c,
-            ctx.gate_alpha, ctx.lam, ctx.saturation_suppress)
+            gU.contiguous(),
+            gNov.contiguous(),
+            gP.contiguous(),
+            gAy.contiguous(),
+            gWrite.contiguous(),
+            gEnergy.contiguous(),
+            gCort.contiguous(),
+            gFinalB.contiguous(),
+            gFinalE.contiguous(),
+            gFinalC.contiguous(),
+            bpre,
+            epre,
+            cpre,
+            Wx,
+            Wgx,
+            GA_w,
+            beta,
+            log_kappa,
+            logit_recover,
+            k_s,
+            k_y,
+            k_b,
+            k_n,
+            k_bias,
+            r_s,
+            r_y,
+            r_b,
+            r_n,
+            r_bias,
+            logit_c_decay,
+            k_c,
+            r_c,
+            ctx.gate_alpha,
+            ctx.lam,
+            ctx.saturation_suppress,
+        )
         return tuple(g)
 
 
@@ -439,10 +720,11 @@ def native_core_forward_train(core, e_in, *, initial_state=None):
     or the input is not a CPU tensor.
     """
     import torch.nn.functional as F
+
     ext = _load_ext()
     H = int(core.hidden_dim)
     if ext is None or e_in.is_cuda:
-        result, final_state = core._eager_forward_from_state(
+        result, final_state = core._reference_forward_from_state(
             e_in,
             initial_state=initial_state,
             return_writes=True,
@@ -464,54 +746,303 @@ def native_core_forward_train(core, e_in, *, initial_state=None):
     kc = core.k_saturation.float().contiguous()
     rc = core.r_saturation.float().contiguous()
     return _DABSNCoreScanFn.apply(
-        Wx, Wgx, GA_w, core.beta.float(), core.log_kappa.float(), core.logit_recover.float(),
-        core.k_s.float(), core.k_y.float(), core.k_b.float(), core.k_n.float(), core.k_bias.float(),
-        core.r_s.float(), core.r_y.float(), core.r_b.float(), core.r_n.float(), core.r_bias.float(),
-        lcd, kc, rc,
-        initial_b.float().contiguous(), initial_e.float().contiguous(), initial_c.float().contiguous(),
-        gate_alpha, lam, saturation_suppress)
+        Wx,
+        Wgx,
+        GA_w,
+        core.beta.float(),
+        core.log_kappa.float(),
+        core.logit_recover.float(),
+        core.k_s.float(),
+        core.k_y.float(),
+        core.k_b.float(),
+        core.k_n.float(),
+        core.k_bias.float(),
+        core.r_s.float(),
+        core.r_y.float(),
+        core.r_b.float(),
+        core.r_n.float(),
+        core.r_bias.float(),
+        lcd,
+        kc,
+        rc,
+        initial_b.float().contiguous(),
+        initial_e.float().contiguous(),
+        initial_c.float().contiguous(),
+        gate_alpha,
+        lam,
+        saturation_suppress,
+    )
+
+
+def _registered_cpu_core_scan(*inputs: Tensor) -> tuple[Tensor, ...]:
+    """C++ CPU implementation for the fixed registered core-scan schema."""
+
+    from .batched_runtime import _batched_forward_tapes
+
+    wx, wgx, ug, a = inputs[:4]
+    if wx.dtype != torch.float32:
+        from dabsn.runtime.dispatch import warn_routing_once
+
+        warn_routing_once(
+            "core_scan_batched",
+            f"native CPU core scan supports float32, not {wx.dtype}",
+            requested_path="cpu_native_cpp",
+            selected_path="registered_reference",
+            corrective_action=(
+                "use float32 CPU activations or run a supported low-precision CUDA backend"
+            ),
+            device="cpu",
+            dtype=str(wx.dtype),
+        )
+        return _batched_forward_tapes(*inputs)
+    (
+        beta,
+        log_kappa,
+        logit_recover,
+        k_s,
+        k_y,
+        k_b,
+        k_n,
+        k_bias,
+        r_s,
+        r_y,
+        r_b,
+        r_n,
+        r_bias,
+        logit_c_decay,
+        k_c,
+        r_c,
+        logit_alpha,
+        log_lambda,
+        logit_c_suppress,
+        initial_b,
+        initial_e,
+        initial_c,
+    ) = inputs[4:]
+    extension = _load_ext(required=True)
+    assert extension is not None
+    outputs = extension.dabsn_core_scan_fwd_train(
+        wx.float().contiguous(),
+        wgx.float().contiguous(),
+        torch.cat((ug, a), dim=0).float().contiguous(),
+        beta.float().contiguous(),
+        log_kappa.float().contiguous(),
+        logit_recover.float().contiguous(),
+        k_s.float().contiguous(),
+        k_y.float().contiguous(),
+        k_b.float().contiguous(),
+        k_n.float().contiguous(),
+        k_bias.float().contiguous(),
+        r_s.float().contiguous(),
+        r_y.float().contiguous(),
+        r_b.float().contiguous(),
+        r_n.float().contiguous(),
+        r_bias.float().contiguous(),
+        logit_c_decay.float().contiguous(),
+        k_c.float().contiguous(),
+        r_c.float().contiguous(),
+        initial_b.float().contiguous(),
+        initial_e.float().contiguous(),
+        initial_c.float().contiguous(),
+        float(torch.sigmoid(logit_alpha)),
+        float(torch.nn.functional.softplus(log_lambda)),
+        float(torch.sigmoid(logit_c_suppress)),
+    )
+    (
+        trajectory,
+        novelty,
+        plasticity,
+        expression,
+        write,
+        energy_tape,
+        saturation_tape,
+        _budget_tape,
+        _saturation_pre_tape,
+        final_b,
+        final_e,
+        final_c,
+    ) = outputs
+    hidden = wx.shape[-1]
+    y = trajectory[..., :hidden]
+    gate_tape = torch.nn.functional.hardsigmoid(
+        wgx.float() + torch.nn.functional.linear(y, ug.float())
+    )
+    return (
+        trajectory,
+        novelty,
+        plasticity,
+        expression,
+        write,
+        energy_tape,
+        saturation_tape,
+        gate_tape,
+        final_b,
+        final_e,
+        final_c,
+    )
+
+
+def _registered_cpu_admitted_read(*inputs: Tensor) -> Tensor:
+    from .admitted import admitted_three_way_read
+
+    query = inputs[0]
+    if query.dtype != torch.float32:
+        from dabsn.runtime.dispatch import warn_routing_once
+
+        warn_routing_once(
+            "admitted_three_way_read",
+            f"native CPU admitted read supports float32, not {query.dtype}",
+            requested_path="cpu_native_cpp",
+            selected_path="registered_reference",
+            corrective_action=(
+                "use float32 CPU activations or run a supported low-precision CUDA backend"
+            ),
+            device="cpu",
+            dtype=str(query.dtype),
+        )
+        return admitted_three_way_read(*inputs)
+    (
+        query,
+        bank_keys,
+        bank_writes,
+        next_writes,
+        cocktail,
+        bank_cocktail,
+        bank_key_bias,
+        bank_admission,
+        scale,
+        allow,
+        induct_allow,
+        eligible,
+        induct_eligible,
+        short_gain,
+        pad_gain,
+        induct_gain,
+        cocktail_gain,
+    ) = inputs
+    extension = _load_ext(required=True)
+    assert extension is not None
+    return extension.three_way_read_cpu(
+        query.contiguous(),
+        bank_keys.contiguous(),
+        bank_writes.contiguous(),
+        next_writes.contiguous(),
+        cocktail.contiguous(),
+        bank_cocktail.contiguous(),
+        bank_key_bias.contiguous(),
+        bank_admission.contiguous(),
+        allow.contiguous(),
+        induct_allow.contiguous(),
+        eligible.contiguous(),
+        induct_eligible.contiguous(),
+        float(scale),
+        float(cocktail_gain),
+        float(short_gain),
+        float(pad_gain),
+        float(induct_gain),
+    )
+
+
+def _registered_cpu_admitted_read_backward(*inputs: Tensor) -> tuple[Tensor, ...]:
+    from .admitted import _native_backward_reference
+
+    grad_output, query = inputs[:2]
+    if query.dtype != torch.float32:
+        return _native_backward_reference(*inputs)
+    (
+        grad_output,
+        query,
+        bank_keys,
+        bank_writes,
+        next_writes,
+        cocktail,
+        bank_cocktail,
+        bank_key_bias,
+        bank_admission,
+        scale,
+        allow,
+        induct_allow,
+        eligible,
+        induct_eligible,
+        short_gain,
+        pad_gain,
+        induct_gain,
+        cocktail_gain,
+    ) = inputs
+    extension = _load_ext(required=True)
+    assert extension is not None
+    gradients = extension.three_way_read_bwd(
+        grad_output.float().contiguous(),
+        query.float().contiguous(),
+        bank_keys.float().contiguous(),
+        bank_writes.float().contiguous(),
+        next_writes.float().contiguous(),
+        cocktail.float().contiguous(),
+        bank_cocktail.float().contiguous(),
+        bank_key_bias.float().contiguous(),
+        bank_admission.float().contiguous(),
+        allow.contiguous(),
+        induct_allow.contiguous(),
+        eligible.contiguous(),
+        induct_eligible.contiguous(),
+        float(scale),
+        float(cocktail_gain),
+        float(short_gain),
+        float(pad_gain),
+        float(induct_gain),
+    )
+    return (
+        gradients[0].to(query.dtype),
+        gradients[1].to(bank_keys.dtype),
+        gradients[2].to(bank_writes.dtype),
+        gradients[3].to(next_writes.dtype),
+        gradients[4].to(cocktail.dtype),
+        gradients[5].to(bank_cocktail.dtype),
+        gradients[6].to(bank_key_bias.dtype),
+        gradients[7].to(bank_admission.dtype),
+        gradients[8].to(scale.dtype).reshape_as(scale),
+        gradients[10].to(short_gain.dtype).reshape_as(short_gain),
+        gradients[11].to(pad_gain.dtype).reshape_as(pad_gain),
+        gradients[12].to(induct_gain.dtype).reshape_as(induct_gain),
+        gradients[9].to(cocktail_gain.dtype).reshape_as(cocktail_gain),
+    )
+
 
 def enable_native_cpu_scan(*, required: bool = False) -> bool:
+    global _CORE_OP_CPU_REGISTERED
     from dabsn.core import DABSNCore
 
-    if not hasattr(DABSNCore, "_eager_forward_from_state"):
-        DABSNCore._eager_forward_from_state = DABSNCore.forward_from_state
     if _load_ext(required=required) is None:
         return False
-    DABSNCore.forward = (
-        lambda self, inputs, return_writes=False, return_cocktail=False:
-        native_core_forward(self, inputs, return_writes, return_cocktail)
-    )
-    DABSNCore.forward_from_state = (
-        lambda self, inputs, *, initial_state=None, return_writes=False,
-        return_cocktail=False, return_final_state=False:
-        native_core_forward(
-            self,
-            inputs,
-            return_writes,
-            return_cocktail,
-            initial_state=initial_state,
-            return_final_state=return_final_state,
-        )
-    )
-    DABSNCore._cpu_native_enabled = True
-    DABSNCore._cpu_native_required = bool(required)
+    if not _CORE_OP_CPU_REGISTERED:
+        from .batched_runtime import _core_scan_batched_op
+
+        _core_scan_batched_op.register_kernel("cpu")(_registered_cpu_core_scan)
+        _CORE_OP_CPU_REGISTERED = True
+    setattr(DABSNCore, "_cpu_native_enabled", True)
+    setattr(DABSNCore, "_cpu_native_required", bool(required))
     return True
 
 
 def enable_native_cpu_read(*, required: bool = False) -> bool:
-    global _EAGER_THREE_WAY_READ
+    global _READ_OP_CPU_REGISTERED
     from dabsn.read import DABSNRead
 
-    if _EAGER_THREE_WAY_READ is None:
-        _EAGER_THREE_WAY_READ = DABSNRead._three_way_read
     if _load_ext(required=required) is None:
         return False
-    native_three_way_read._dabsn_cpu_native_read = True
-    native_three_way_read._dabsn_fallback = _EAGER_THREE_WAY_READ
-    DABSNRead._three_way_read = native_three_way_read
-    DABSNRead._cpu_native_read_enabled = True
-    DABSNRead._cpu_native_required = bool(required)
+    if not _READ_OP_CPU_REGISTERED:
+        from .admitted import (
+            _admitted_three_way_read_native_backward_op,
+            _admitted_three_way_read_native_op,
+        )
+
+        _admitted_three_way_read_native_op.register_kernel("cpu")(_registered_cpu_admitted_read)
+        _admitted_three_way_read_native_backward_op.register_kernel("cpu")(
+            _registered_cpu_admitted_read_backward
+        )
+        _READ_OP_CPU_REGISTERED = True
+    setattr(DABSNRead, "_cpu_native_read_enabled", True)
+    setattr(DABSNRead, "_cpu_native_required", bool(required))
     return True
 
 
@@ -527,12 +1058,18 @@ def native_cpu_status() -> dict[str, object]:
     return {
         "extension_available": extension is not None,
         "core_scan_enabled": bool(
-            getattr(__import__("dabsn.core", fromlist=["DABSNCore"]).DABSNCore,
-                    "_cpu_native_enabled", False)
+            getattr(
+                __import__("dabsn.core", fromlist=["DABSNCore"]).DABSNCore,
+                "_cpu_native_enabled",
+                False,
+            )
         ),
         "three_way_read_enabled": bool(
-            getattr(__import__("dabsn.read", fromlist=["DABSNRead"]).DABSNRead,
-                    "_cpu_native_read_enabled", False)
+            getattr(
+                __import__("dabsn.read", fromlist=["DABSNRead"]).DABSNRead,
+                "_cpu_native_read_enabled",
+                False,
+            )
         ),
         "source": str(_SOURCE),
     }

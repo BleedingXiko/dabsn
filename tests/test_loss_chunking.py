@@ -11,7 +11,6 @@ import pytest
 import torch
 
 from dabsn.runtime.loss import (
-    ChunkedLinearCrossEntropy,
     chunked_cross_entropy_from_logits,
     chunked_linear_cross_entropy,
 )

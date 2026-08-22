@@ -16,7 +16,8 @@ def test_stack_gradients_and_checkpoint(tmp_path):
     layers = [DABSNLayerSpec(8, read_geometry=g) for g in ("seq", "field", "hybrid")]
     model = DABSNModel(5, 3, layers, output_adapter="token")
     x = torch.randn(2, 6, 5, requires_grad=True)
-    output = model.forward_sequence(x); output.square().mean().backward()
+    output = model.forward_sequence(x)
+    output.square().mean().backward()
     assert x.grad is not None and torch.isfinite(x.grad).all()
     assert all(block.core.W.weight.grad is not None for block in model.backbone.blocks)
     path = tmp_path / "model.safetensors"
@@ -94,7 +95,9 @@ def test_custom_adapter_checkpoint_roundtrip(tmp_path):
 
 
 def test_cli_help():
-    result = subprocess.run([sys.executable, "-m", "dabsn.cli", "--help"], text=True, capture_output=True)
+    result = subprocess.run(
+        [sys.executable, "-m", "dabsn.cli", "--help"], text=True, capture_output=True
+    )
     assert result.returncode == 0 and "doctor" in result.stdout
 
 
@@ -124,26 +127,37 @@ def test_cli_train_evaluate_infer_export_lifecycle(tmp_path):
     commands = [
         (
             "train",
-            "--config", str(config_path),
-            "--data", str(data_path),
-            "--output", str(checkpoint_path),
-            "--steps", "1",
+            "--config",
+            str(config_path),
+            "--data",
+            str(data_path),
+            "--output",
+            str(checkpoint_path),
+            "--steps",
+            "1",
         ),
         (
             "evaluate",
-            "--checkpoint", str(checkpoint_path),
-            "--data", str(data_path),
+            "--checkpoint",
+            str(checkpoint_path),
+            "--data",
+            str(data_path),
         ),
         (
             "infer",
-            "--checkpoint", str(checkpoint_path),
-            "--data", str(data_path),
-            "--output", str(inference_path),
+            "--checkpoint",
+            str(checkpoint_path),
+            "--data",
+            str(data_path),
+            "--output",
+            str(inference_path),
         ),
         (
             "export",
-            "--checkpoint", str(checkpoint_path),
-            "--output", str(export_path),
+            "--checkpoint",
+            str(checkpoint_path),
+            "--output",
+            str(export_path),
         ),
     ]
     for command in commands:

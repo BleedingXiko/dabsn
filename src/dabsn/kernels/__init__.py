@@ -6,7 +6,15 @@ from dataclasses import asdict, dataclass
 
 import torch
 
+from .admitted import admitted_three_way_read
+from .batched_runtime import core_scan_batched
+from .compact_admitted import (
+    admitted_three_way_read_compact_dense,
+    admitted_three_way_read_compact_dense_bmm,
+)
+from .compact_flash import admitted_three_way_read_compact_flash
 from .local_field import local_field_gather, local_field_gather_stats
+from .long import linear_recurrence
 from .permanent import (
     permanent_delta_read,
     permanent_delta_scan,
@@ -41,8 +49,8 @@ PRIMITIVES = (
         "admitted_three_way_read",
         "DABSNRead._three_way_read",
         "ATen BLAS or forced C++/OpenMP",
-        "Triton compact flash",
-        "ATen/C++ autograd or Triton compact backward",
+        "registered compact dense / registered compact flash Triton",
+        "registered ATen/C++ analytic or compact Triton backward",
         ("seq", "field", "hybrid"),
         "reference/native forward and backward parity",
     ),
@@ -114,12 +122,8 @@ def enable(
         from .permanent import enable_native_cpu_permanent
 
         results = enable_native_cpu_kernels(required=required)
-        results["permanent_delta_scan"] = enable_native_cpu_permanent(
-            required=required
-        )
-        results["local_field_gather"] = enable_native_cpu_local_field(
-            required=required
-        )
+        results["permanent_delta_scan"] = enable_native_cpu_permanent(required=required)
+        results["local_field_gather"] = enable_native_cpu_local_field(required=required)
         enable_fused_long_read(required_cuda=False)
         if required and not all(results.values()):
             raise RuntimeError(f"required native CPU primitives unavailable: {results}")
@@ -162,7 +166,13 @@ def status() -> dict[str, object]:
 __all__ = [
     "PRIMITIVES",
     "Primitive",
+    "admitted_three_way_read",
+    "admitted_three_way_read_compact_dense",
+    "admitted_three_way_read_compact_dense_bmm",
+    "admitted_three_way_read_compact_flash",
+    "core_scan_batched",
     "enable",
+    "linear_recurrence",
     "local_field_gather",
     "local_field_gather_stats",
     "permanent_delta_read",

@@ -105,8 +105,8 @@ def main() -> int:
         reference_loss.backward()
         reference_optimizer.step()
 
-        parameter_groups = dabsn_adamw_param_groups(raw_model, 0.1)
         train_model = prepare_distributed_model(raw_model, state, precision="fp32")
+        parameter_groups = dabsn_adamw_param_groups(train_model, 0.1)
         optimizer = torch.optim.AdamW(parameter_groups, lr=1e-3)
         local_inputs = global_inputs.chunk(state.world_size, dim=0)[state.rank]
         local_targets = global_targets.chunk(state.world_size, dim=0)[state.rank]
@@ -176,8 +176,8 @@ def main() -> int:
             step=1,
         )
         restored = load_dabsn(checkpoint, map_location=state.device)
-        restored_groups = dabsn_adamw_param_groups(restored, 0.1)
         restored_train_model = prepare_distributed_model(restored, state, precision="fp32")
+        restored_groups = dabsn_adamw_param_groups(restored_train_model, 0.1)
         restored_optimizer = torch.optim.AdamW(restored_groups, lr=1e-3)
         restored_step = load_distributed_optimizer(
             restored_optimizer,
@@ -206,8 +206,8 @@ def main() -> int:
             residual=True,
             mlp_ratio=2.0,
         ).to(state.device)
-        sharded_groups = dabsn_adamw_param_groups(sharded_raw, 0.1)
         sharded_model = prepare_distributed_model(sharded_raw, state, precision="fp32")
+        sharded_groups = dabsn_adamw_param_groups(sharded_model, 0.1)
         sharded_optimizer = torch.optim.AdamW(sharded_groups, lr=1e-3)
         sharded_manifest = load_sharded_training_checkpoint(
             sharded_model,
@@ -247,8 +247,8 @@ def main() -> int:
             residual=True,
             mlp_ratio=2.0,
         ).to(state.device)
-        amp_groups = dabsn_adamw_param_groups(amp_raw, 0.1)
         amp_model = prepare_distributed_model(amp_raw, state, precision="fp16")
+        amp_groups = dabsn_adamw_param_groups(amp_model, 0.1)
         amp_optimizer = torch.optim.AdamW(amp_groups, lr=1e-3)
         amp_scaler = make_grad_scaler(state, "fp16")
         amp_optimizer.zero_grad(set_to_none=True)
@@ -280,12 +280,12 @@ def main() -> int:
             scaler=amp_scaler,
         )
         amp_restored = load_dabsn(amp_checkpoint, map_location=state.device)
-        amp_restored_groups = dabsn_adamw_param_groups(amp_restored, 0.1)
         amp_restored_model = prepare_distributed_model(
             amp_restored,
             state,
             precision="fp16",
         )
+        amp_restored_groups = dabsn_adamw_param_groups(amp_restored_model, 0.1)
         amp_restored_optimizer = torch.optim.AdamW(amp_restored_groups, lr=1e-3)
         amp_restored_scaler = make_grad_scaler(state, "fp16")
         amp_restored_step = load_distributed_optimizer(

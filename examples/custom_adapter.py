@@ -129,16 +129,10 @@ def example_batch(batch: int = 8, steps: int = 32) -> tuple[Tensor, Tensor, Tens
     values = values.masked_fill(missing.bool(), 0.0)
     inputs = torch.cat([values, elapsed, sensor, missing], dim=-1)
 
-    event = (
-        (values[..., 2] > 0.7).long()
-        + 2 * (values[..., 3] > 0.9).long()
-    ).clamp_max(EVENT_CLASSES - 1)
-    time_to_event = (
-        2.0
-        + elapsed[..., 0] * 0.2
-        + values[..., 0].abs()
-        + missing[..., 0] * 3.0
+    event = ((values[..., 2] > 0.7).long() + 2 * (values[..., 3] > 0.9).long()).clamp_max(
+        EVENT_CLASSES - 1
     )
+    time_to_event = 2.0 + elapsed[..., 0] * 0.2 + values[..., 0].abs() + missing[..., 0] * 3.0
     return inputs, event, time_to_event
 
 
@@ -154,9 +148,7 @@ def main() -> None:
         event_logits.flatten(0, 1),
         event_target.flatten(),
     )
-    normalized_error = (
-        torch.log(time_target) - log_time_mean
-    ) / log_time_scale
+    normalized_error = (torch.log(time_target) - log_time_mean) / log_time_scale
     time_nll = (log_time_scale.log() + 0.5 * normalized_error.square()).mean()
     loss = event_loss + 0.2 * time_nll
 

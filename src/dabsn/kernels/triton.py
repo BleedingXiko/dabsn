@@ -9,8 +9,8 @@ import torch
 from torch import Tensor
 
 _EAGER_CORE_FORWARD_FROM_STATE = None
-_EAGER_THREE_WAY_READ = None
 _IMPORT_ERROR: Exception | None = None
+_CORE_OP_CUDA_REGISTERED = False
 
 
 def triton_available() -> bool:
@@ -69,8 +69,7 @@ def select_core_backend(
     normalized = (requested or "auto").lower()
     if normalized not in _VALID_CORE_BACKENDS:
         raise ValueError(
-            "DABSN_CORE_BACKEND must be one of "
-            f"{sorted(_VALID_CORE_BACKENDS)}; got {requested!r}"
+            f"DABSN_CORE_BACKEND must be one of {sorted(_VALID_CORE_BACKENDS)}; got {requested!r}"
         )
     # The fused scan's Function stores a backward context it will never use under
     # no_grad, so prefer the plain batched GEMM there; same math, no dead tape.
@@ -156,6 +155,8 @@ def cuda_core_forward(
     return_final_state: bool = False,
 ):
     if not inputs.is_cuda:
+        if _EAGER_CORE_FORWARD_FROM_STATE is None:
+            raise RuntimeError("DABSN eager core fallback was not installed")
         return _EAGER_CORE_FORWARD_FROM_STATE(
             core,
             inputs,
@@ -255,6 +256,7 @@ def cuda_core_forward(
         )
         core._last_core_backend = "cuda_triton"
     trajectory, novelty, plasticity, expression, write = outputs[:5]
+    result: tuple[Tensor, ...]
     if return_cocktail:
         energy, saturation = outputs[5], outputs[6]
         result = trajectory, novelty, plasticity, expression, write, energy, saturation
@@ -266,11 +268,50 @@ def cuda_core_forward(
         result = trajectory, novelty, plasticity
         final_offset = 5
     if return_final_state:
-        return result, tuple(outputs[final_offset:final_offset + 3])
+        return result, tuple(outputs[final_offset : final_offset + 3])
     return result
 
 
-def cuda_three_way_read(
+def _registered_cuda_core_scan(*inputs: Tensor) -> tuple[Tensor, ...]:
+    """CUDA implementation for the fixed registered core-scan schema."""
+
+    wx = inputs[0]
+    requested = os.environ.get("DABSN_CORE_BACKEND", "auto").lower()
+    selected = select_core_backend(
+        int(wx.shape[0]),
+        int(wx.shape[-1]),
+        requested=requested,
+        grad_enabled=bool(torch.is_grad_enabled()),
+    )
+    from dabsn.runtime.dispatch import log_routing_once
+
+    log_routing_once(
+        "core_scan",
+        selected,
+        batch=int(wx.shape[0]),
+        hidden=int(wx.shape[-1]),
+        dtype=str(wx.dtype).replace("torch.", ""),
+        requested=requested,
+        grad=bool(torch.is_grad_enabled()),
+    )
+    if selected == "batched":
+        from .batched_runtime import _batched_forward_tapes
+
+        return _batched_forward_tapes(*inputs)
+    runtime = _runtime()
+    if selected == "batched_fused":
+        return runtime.dabsn_core_scan_batched_fused_forward(*inputs)
+    return runtime.dabsn_core_scan_triton_tape(
+        *inputs[:20],
+        logit_alpha=inputs[20],
+        log_lambda=inputs[21],
+        logit_c_suppress=inputs[22],
+        initial_state=(inputs[23], inputs[24], inputs[25]),
+        return_final_state=True,
+    )
+
+
+def cuda_compact_three_way_read(
     read,
     query: Tensor,
     bank_keys: Tensor,
@@ -281,125 +322,67 @@ def cuda_three_way_read(
     bank_key_bias: Tensor,
     bank_admission: Tensor,
     scale: Tensor,
-    allow: Tensor | None,
-    induct_allow: Tensor | None,
-    eligible: Tensor | None,
-    induct_eligible: Tensor | None,
+    bank_idx: Tensor,
+    bank_valid: Tensor,
+    *,
+    mode: str,
 ) -> Tensor:
     if not query.is_cuda:
-        return _EAGER_THREE_WAY_READ(
-            read,
-            query,
-            bank_keys,
-            bank_writes,
-            next_writes,
-            cocktail,
-            bank_cocktail,
-            bank_key_bias,
-            bank_admission,
-            scale,
-            allow,
-            induct_allow,
-            eligible,
-            induct_eligible,
-        )
+        raise TypeError("compact CUDA admitted read requires CUDA tensors")
+    if mode not in {"seq", "field"}:
+        raise ValueError("compact CUDA admitted-read mode must be seq or field")
     runtime = _runtime()
+    from .compact_admitted import admitted_three_way_read_compact_dense_bmm
+
     gains = {
         "short_gain": read.short_gain,
         "pad_gain": read.pad_gain,
         "induct_gain": read.induct_gain,
         "cocktail_gain": read.cocktail_gain,
     }
-    if allow is None:
-        bank_idx = getattr(read, "_compact_bank_idx", None)
-        bank_valid = getattr(read, "_compact_bank_valid", None)
-        mode = getattr(read, "_compact_read_mode", None)
-        if bank_idx is None or bank_valid is None or mode not in {"seq", "field"}:
-            raise RuntimeError("compact DABSN read is missing bank index/valid metadata")
-        B, T, N = query.shape[0], query.shape[1], bank_keys.shape[1]
-        dense_limit = int(os.environ.get("DABSN_TRAIN_DENSE_MAX_SCORES", "8388608"))
+    B, T, N = query.shape[0], query.shape[1], bank_keys.shape[1]
+    dense_limit = int(os.environ.get("DABSN_TRAIN_DENSE_MAX_SCORES", "8388608"))
 
-        def _query_chunk_t(requested_backend: str) -> int:
-            """Query rows per tile so one tile's [B,chunk,N] scores stay in budget.
+    if torch.is_grad_enabled():
+        # At language-model training sizes the admitted bank is front-packed
+        # and modest, so dense BMM does O(T*admitted) work on tensor cores in
+        # BOTH forward and backward -- the compact flash forward's legacy
+        # backward is one serial program per query. The old dispatch kept BMM
+        # only while B*T*admitted <= 8M and fell to that serial path beyond it,
+        # so long context (or larger batch) dropped OFF tensor cores exactly
+        # when it hurt most. Instead, TILE the query-time axis so every tile
+        # stays under the score cap: the read never leaves tensor cores at any
+        # context length, and per-tile activations shrink (lower peak memory,
+        # so batch can stay larger). Query rows are independent given the bank,
+        # so this is bit-identical to the untiled read.
+        requested = os.environ.get("DABSN_TRAIN_READ_BACKEND", "dense_chunked").lower()
+        if requested not in {"dense_chunked", "dense", "flash"}:
+            raise ValueError(
+                "DABSN_TRAIN_READ_BACKEND must be dense_chunked, dense, or flash; "
+                f"got {requested!r}"
+            )
+        if requested == "flash":
+            from .compact_flash import admitted_three_way_read_compact_flash
 
-            Derived from the live shape, never pinned by hand. There used to be a
-            DABSN_READ_QUERY_CHUNK override here; a flag whose correct value a
-            human has to know is a decision the framework failed to make, and it
-            silently outranked the budget it was meant to help -- a stale pin
-            would hold a width that no longer fit the shape in front of it.
-            B and N are known here, so the width is computed.
-            """
-            if requested_backend == "dense":
-                return T
-            return max(1, dense_limit // max(1, B * N))
-
-        def _chunked_dense(chunk_t: int) -> Tensor:
-            pieces = []
-            for start in range(0, T, chunk_t):
-                stop = min(T, start + chunk_t)
-                pieces.append(runtime.dense_bmm_three_way_read(
-                    query[:, start:stop], bank_keys, bank_writes, next_writes,
-                    cocktail[:, start:stop], bank_cocktail, bank_key_bias,
-                    bank_admission, scale, bank_idx, bank_valid, mode=mode,
-                    query_offset=start, total_T=T, **gains,
-                ))
-            return torch.cat(pieces, dim=1)
-
-        if torch.is_grad_enabled():
-            # At language-model training sizes the admitted bank is front-packed
-            # and modest, so dense BMM does O(T*admitted) work on tensor cores in
-            # BOTH forward and backward -- the compact flash forward's legacy
-            # backward is one serial program per query. The old dispatch kept BMM
-            # only while B*T*admitted <= 8M and fell to that serial path beyond it,
-            # so long context (or larger batch) dropped OFF tensor cores exactly
-            # when it hurt most. Instead, TILE the query-time axis so every tile
-            # stays under the score cap: the read never leaves tensor cores at any
-            # context length, and per-tile activations shrink (lower peak memory,
-            # so batch can stay larger). Query rows are independent given the bank,
-            # so this is bit-identical to the untiled read.
-            requested = os.environ.get("DABSN_TRAIN_READ_BACKEND", "dense_chunked").lower()
-            if requested not in {"dense_chunked", "dense", "flash"}:
-                raise ValueError(
-                    "DABSN_TRAIN_READ_BACKEND must be dense_chunked, dense, or flash; "
-                    f"got {requested!r}"
-                )
-            if requested == "flash":
-                output = runtime.admitted_three_way_read_compact_flash_trainable(
-                    query, bank_keys, bank_writes, next_writes, cocktail,
-                    bank_cocktail, bank_key_bias, bank_admission, scale,
-                    bank_idx, bank_valid, mode=mode, **gains,
-                )
-                read._last_three_way_backend = "compact_flash_trainable"
-                return output
-            chunk_t = _query_chunk_t(requested)
-            if chunk_t >= T:
-                output = runtime.dense_bmm_three_way_read(
-                    query, bank_keys, bank_writes, next_writes, cocktail,
-                    bank_cocktail, bank_key_bias, bank_admission, scale,
-                    bank_idx, bank_valid, mode=mode, query_offset=0, total_T=T, **gains,
-                )
-                read._last_three_way_backend = "dense_bmm_trainable"
-            else:
-                output = _chunked_dense(chunk_t)
-                read._last_three_way_backend = "dense_bmm_trainable_chunked"
+            output = admitted_three_way_read_compact_flash(
+                query,
+                bank_keys,
+                bank_writes,
+                next_writes,
+                cocktail,
+                bank_cocktail,
+                bank_key_bias,
+                bank_admission,
+                scale,
+                bank_idx,
+                bank_valid,
+                mode=mode,
+                **gains,
+            )
+            read._last_three_way_backend = "registered_compact_flash_trainable"
             return output
-
-        # Forward-only. The density dispatcher below picks dense vs flash purely
-        # on how full the bank is -- it has no notion of how BIG the resulting
-        # score tensor would be. At a large batch or long context the dense
-        # branch materializes [B,T,N] scores plus per-read temporaries, which is
-        # how a forward pass OOMs on 4 GiB allocations while the training path
-        # (which tiles) sails through the same shapes. Query rows are independent
-        # given the bank, so apply the same score budget here: bit-identical
-        # output, bounded peak, and inference inherits the long-context headroom
-        # training already had.
-        infer_chunk_t = _query_chunk_t(
-            os.environ.get("DABSN_TRAIN_READ_BACKEND", "dense_chunked").lower())
-        if infer_chunk_t < T:
-            output = _chunked_dense(infer_chunk_t)
-            read._last_three_way_backend = "dense_bmm_infer_chunked"
-            return output
-        output, backend = runtime.admitted_three_way_read_dispatch(
+        score_budget = max(dense_limit, B * T * N) if requested == "dense" else dense_limit
+        output = admitted_three_way_read_compact_dense_bmm(
             query,
             bank_keys,
             bank_writes,
@@ -412,12 +395,76 @@ def cuda_three_way_read(
             bank_idx,
             bank_valid,
             mode=mode,
-            return_backend=True,
+            score_budget=score_budget,
             **gains,
         )
-        read._last_three_way_backend = backend
+        read._last_three_way_backend = (
+            "registered_dense_bmm_trainable"
+            if score_budget >= B * T * N
+            else "registered_dense_bmm_trainable_chunked"
+        )
         return output
-    output = runtime.admitted_three_way_read_trainable(
+
+    # Forward-only. The density dispatcher below picks dense vs flash purely
+    # on how full the bank is -- it has no notion of how BIG the resulting
+    # score tensor would be. At a large batch or long context the dense
+    # branch materializes [B,T,N] scores plus per-read temporaries, which is
+    # how a forward pass OOMs on 4 GiB allocations while the training path
+    # (which tiles) sails through the same shapes. Query rows are independent
+    # given the bank, so apply the same score budget here: bit-identical
+    # output, bounded peak, and inference inherits the long-context headroom
+    # training already had.
+    if B * T * N > dense_limit:
+        output = admitted_three_way_read_compact_dense_bmm(
+            query,
+            bank_keys,
+            bank_writes,
+            next_writes,
+            cocktail,
+            bank_cocktail,
+            bank_key_bias,
+            bank_admission,
+            scale,
+            bank_idx,
+            bank_valid,
+            mode=mode,
+            score_budget=dense_limit,
+            **gains,
+        )
+        read._last_three_way_backend = "registered_dense_bmm_infer_chunked"
+        return output
+    density = 0.0 if N == 0 else float(bank_valid.to(torch.float32).mean().item())
+    precision = os.environ.get("DABSN_FLASH_PREC", "tf32x3")
+    crossover = runtime._read_crossover_for(
+        query.device,
+        query.dtype,
+        N,
+        query.shape[-1],
+        precision,
+        mode,
+    )
+    if density >= crossover:
+        output = admitted_three_way_read_compact_dense_bmm(
+            query,
+            bank_keys,
+            bank_writes,
+            next_writes,
+            cocktail,
+            bank_cocktail,
+            bank_key_bias,
+            bank_admission,
+            scale,
+            bank_idx,
+            bank_valid,
+            mode=mode,
+            score_budget=max(dense_limit, B * T * N),
+            **gains,
+        )
+        read._last_three_way_backend = "registered_dense_bmm_infer"
+        return output
+    from .compact_flash import admitted_three_way_read_compact_flash
+
+    output = admitted_three_way_read_compact_flash(
         query,
         bank_keys,
         bank_writes,
@@ -427,18 +474,17 @@ def cuda_three_way_read(
         bank_key_bias,
         bank_admission,
         scale,
-        allow,
-        induct_allow,
-        eligible,
-        induct_eligible,
+        bank_idx,
+        bank_valid,
+        mode=mode,
         **gains,
     )
-    read._last_three_way_backend = "dense_mask_triton_trainable"
+    read._last_three_way_backend = "registered_compact_flash_infer"
     return output
 
 
 def enable_triton_kernels(*, required: bool = False) -> dict[str, bool]:
-    global _EAGER_CORE_FORWARD_FROM_STATE, _EAGER_THREE_WAY_READ
+    global _CORE_OP_CUDA_REGISTERED
     from dabsn.core import DABSNCore
     from dabsn.read import DABSNRead
 
@@ -449,17 +495,18 @@ def enable_triton_kernels(*, required: bool = False) -> dict[str, bool]:
     if not triton_available():
         return {"core_scan": False, "admitted_three_way_read": False}
     _runtime()
-    if _EAGER_CORE_FORWARD_FROM_STATE is None:
-        _EAGER_CORE_FORWARD_FROM_STATE = DABSNCore.forward_from_state
-    if _EAGER_THREE_WAY_READ is None:
-        _EAGER_THREE_WAY_READ = DABSNRead._three_way_read
-    DABSNCore.forward = cuda_core_forward
-    DABSNCore.forward_from_state = cuda_core_forward
-    DABSNCore._cuda_native_enabled = True
-    DABSNCore._cuda_native_required = bool(required)
-    DABSNRead._three_way_read = cuda_three_way_read
-    DABSNRead._cuda_native_enabled = True
-    DABSNRead._cuda_native_required = bool(required)
+    from .compact_flash import register_compact_flash_cuda
+
+    register_compact_flash_cuda(_runtime())
+    if not _CORE_OP_CUDA_REGISTERED:
+        from .batched_runtime import _core_scan_batched_op
+
+        _core_scan_batched_op.register_kernel("cuda")(_registered_cuda_core_scan)
+        _CORE_OP_CUDA_REGISTERED = True
+    setattr(DABSNCore, "_cuda_native_enabled", True)
+    setattr(DABSNCore, "_cuda_native_required", bool(required))
+    setattr(DABSNRead, "_cuda_native_enabled", True)
+    setattr(DABSNRead, "_cuda_native_required", bool(required))
     return {"core_scan": True, "admitted_three_way_read": True}
 
 
@@ -478,8 +525,6 @@ def triton_status() -> dict[str, object]:
         "train_dense_max_scores": int(os.environ.get("DABSN_TRAIN_DENSE_MAX_SCORES", "8388608")),
         "train_read_backend": os.environ.get("DABSN_TRAIN_READ_BACKEND", "dense_chunked"),
         "core_scan_enabled": bool(getattr(DABSNCore, "_cuda_native_enabled", False)),
-        "admitted_three_way_read_enabled": bool(
-            getattr(DABSNRead, "_cuda_native_enabled", False)
-        ),
+        "admitted_three_way_read_enabled": bool(getattr(DABSNRead, "_cuda_native_enabled", False)),
         "import_error": None if _IMPORT_ERROR is None else repr(_IMPORT_ERROR),
     }

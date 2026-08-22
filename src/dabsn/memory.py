@@ -40,12 +40,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterator, Sequence
+from typing import Any, Iterator, Mapping, Sequence, cast
 
 import torch
+import torch.nn as nn
 from torch import Tensor
 
-from .model import DABSNBlock, DABSNSequenceLM
+from .model import DABSNBackbone, DABSNBlock, DABSNSequenceLM
 
 __all__ = [
     "DABSNMemory",
@@ -103,8 +104,8 @@ class LayerMemory:
 
         return LayerMemory(
             bank={k: cast(v) for k, v in self.bank.items()},
-            core=tuple(cast(t) for t in self.core),  # type: ignore[arg-type]
-            long=tuple(cast(t) for t in self.long),  # type: ignore[arg-type]
+            core=(cast(self.core[0]), cast(self.core[1]), cast(self.core[2])),
+            long=(cast(self.long[0]), cast(self.long[1]), cast(self.long[2])),
         )
 
     def nbytes(self) -> int:
@@ -177,15 +178,14 @@ def _check_fingerprint(memory: DABSNMemory, model: DABSNSequenceLM) -> None:
             for key, value in expected.items()
             if observed.get(key) != value
         ]
-        raise ValueError(
-            "memory was built by a different architecture: " + "; ".join(mismatched)
-        )
+        raise ValueError("memory was built by a different architecture: " + "; ".join(mismatched))
 
 
 def _require_seq_geometry(model: DABSNSequenceLM) -> None:
+    backbone = _legacy_backbone(model)
     bad = [
         index
-        for index, block in enumerate(model.backbone.blocks)
+        for index, block in enumerate(cast(list[DABSNBlock], list(backbone.blocks)))
         if block.read_geometry != "seq"
     ]
     if bad:
@@ -193,6 +193,15 @@ def _require_seq_geometry(model: DABSNSequenceLM) -> None:
             "carried memory is exact only for seq read geometry; "
             f"blocks {bad} use field/hybrid. forward_query_bank refuses those."
         )
+
+
+def _legacy_backbone(model: DABSNSequenceLM) -> DABSNBackbone:
+    if not isinstance(model.backbone, DABSNBackbone):
+        raise NotImplementedError(
+            "carried .dmem state currently requires the legacy DABSN backbone; "
+            "a first-class graph must declare its own streaming-state contract"
+        )
+    return model.backbone
 
 
 def _chunks(total: int, size: int | None) -> Iterator[tuple[int, int]]:
@@ -277,6 +286,7 @@ def _ingest_block(
     )
     dabsn_output = block.state_to_hidden(y + block.read_gain * retrieved)
     hidden = block._finish_block(inputs, dabsn_output)
+    hidden = block.forward_mlp(hidden)
     return hidden, LayerMemory(bank=bank, core=final_core, long=final_long)
 
 
@@ -289,9 +299,10 @@ def _run(
     extend: bool,
 ) -> tuple[Tensor, DABSNMemory]:
     _require_seq_geometry(model)
+    backbone = _legacy_backbone(model)
     if ids.dim() != 2:
         raise ValueError(f"ids must be [B, T]; got {tuple(ids.shape)}")
-    blocks = list(model.backbone.blocks)
+    blocks = cast(list[DABSNBlock], list(backbone.blocks))
 
     if memory is None:
         memory = DABSNMemory(
@@ -316,11 +327,9 @@ def _run(
         for start, stop in _chunks(int(ids.shape[1]), chunk_size):
             hidden = model.embed(ids[:, start:stop])
             for index, block in enumerate(blocks):
-                hidden, state[index] = _ingest_block(
-                    block, hidden, state[index], position
-                )
-                if index == model.backbone.mlp_depth_index:
-                    for mlp in model.backbone.middle_mlps:
+                hidden, state[index] = _ingest_block(block, hidden, state[index], position)
+                if index == backbone.mlp_depth_index:
+                    for mlp in cast(list[nn.Module], list(backbone.middle_mlps)):
                         hidden = mlp(hidden)
             outputs.append(hidden)
             position += stop - start
@@ -397,26 +406,55 @@ def _to_payload(memory: DABSNMemory) -> dict[str, object]:
 def _from_payload(payload: dict[str, object]) -> DABSNMemory:
     if payload.get("format") != FORMAT:
         raise ValueError(
-            f"not a DABSN memory payload: format={payload.get('format')!r}, "
-            f"expected {FORMAT!r}"
+            f"not a DABSN memory payload: format={payload.get('format')!r}, expected {FORMAT!r}"
         )
-    layers = []
-    for entry in payload["layers"]:  # type: ignore[index]
-        missing = [k for k in BANK_FIELDS if k not in entry["bank"]]
+    raw_layers = payload.get("layers")
+    if not isinstance(raw_layers, Sequence):
+        raise ValueError("memory payload layers must be a sequence")
+    layers: list[LayerMemory] = []
+    for raw_entry in raw_layers:
+        if not isinstance(raw_entry, Mapping):
+            raise ValueError("memory payload layer entries must be objects")
+        entry = cast(Mapping[str, object], raw_entry)
+        raw_bank = entry.get("bank")
+        if not isinstance(raw_bank, Mapping):
+            raise ValueError("memory payload layer bank must be an object")
+        bank = cast(Mapping[str, object], raw_bank)
+        missing = [k for k in BANK_FIELDS if k not in bank]
         if missing:
             raise ValueError(f"memory payload is missing bank fields: {missing}")
+        raw_core = entry.get("core")
+        raw_long = entry.get("long")
+        if not isinstance(raw_core, Sequence) or len(raw_core) != 3:
+            raise ValueError("memory payload core state must contain three tensors")
+        if not isinstance(raw_long, Sequence) or len(raw_long) != 3:
+            raise ValueError("memory payload long state must contain three tensors")
+        tensors = [*bank.values(), *raw_core, *raw_long]
+        if any(not isinstance(value, Tensor) for value in tensors):
+            raise ValueError("memory payload state values must be tensors")
         layers.append(
             LayerMemory(
-                bank={k: entry["bank"][k] for k in BANK_FIELDS},
-                core=tuple(entry["core"]),  # type: ignore[arg-type]
-                long=tuple(entry["long"]),  # type: ignore[arg-type]
+                bank={k: cast(Tensor, bank[k]) for k in BANK_FIELDS},
+                core=(
+                    cast(Tensor, raw_core[0]),
+                    cast(Tensor, raw_core[1]),
+                    cast(Tensor, raw_core[2]),
+                ),
+                long=(
+                    cast(Tensor, raw_long[0]),
+                    cast(Tensor, raw_long[1]),
+                    cast(Tensor, raw_long[2]),
+                ),
             )
         )
+    raw_fingerprint = payload.get("fingerprint") or {}
+    if not isinstance(raw_fingerprint, Mapping):
+        raise ValueError("memory payload fingerprint must be an object")
     return DABSNMemory(
         layers=layers,
-        position=int(payload["position"]),  # type: ignore[arg-type]
-        batch_size=int(payload["batch_size"]),  # type: ignore[arg-type]
-        fingerprint=dict(payload.get("fingerprint") or {}),  # type: ignore[arg-type]
+        position=int(cast(Any, payload["position"])),
+        batch_size=int(cast(Any, payload["batch_size"])),
+        fingerprint=dict(cast(Mapping[str, object], raw_fingerprint)),
     )
 
 
@@ -469,8 +507,7 @@ def embed_in_checkpoint(
     payload = torch.load(source, map_location="cpu", weights_only=False)
     if not isinstance(payload, dict):
         raise ValueError(
-            f"can only embed memory into a dict checkpoint; {source} holds "
-            f"{type(payload).__name__}"
+            f"can only embed memory into a dict checkpoint; {source} holds {type(payload).__name__}"
         )
     payload["dabsn_memory"] = _to_payload(memory)
     torch.save(payload, target)
@@ -495,16 +532,15 @@ def extract_from_checkpoint(
     return memory
 
 
-def memory_cost(model: DABSNSequenceLM, tokens: int, *, batch_size: int = 1,
-                bytes_per_element: int = 4) -> dict[str, object]:
+def memory_cost(
+    model: DABSNSequenceLM, tokens: int, *, batch_size: int = 1, bytes_per_element: int = 4
+) -> dict[str, object]:
     """Bank bytes for ``tokens`` ingested tokens, before running anything.
 
     One vector of ``state_dim`` per layer for the write tape, plus one scalar
     per layer for each of the four reduced fields.
     """
-    per_token = sum(
-        int(spec.resolved_state_dim) + len(MEAN_FIELDS) for spec in model.layers
-    )
+    per_token = sum(int(spec.resolved_state_dim) + len(MEAN_FIELDS) for spec in model.layers)
     total = per_token * tokens * batch_size * bytes_per_element
     return {
         "bytes_per_token": per_token * bytes_per_element * batch_size,

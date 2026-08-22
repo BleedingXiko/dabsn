@@ -233,9 +233,7 @@ def test_carried_memory_replays_tower_and_keeps_one_state_per_dabsn(chunk_size):
     _move_middle_tower(model)
     ids = torch.randint(0, model.vocab, (2, 9))
     reference = model.forward_sequence(ids)
-    logits, memory = forward_with_memory(
-        model, ids, chunk_size=chunk_size, extend=True
-    )
+    logits, memory = forward_with_memory(model, ids, chunk_size=chunk_size, extend=True)
     torch.testing.assert_close(logits, reference, atol=1e-5, rtol=1e-4)
     assert len(memory.layers) == len(model.backbone.blocks) == 3
     assert memory.fingerprint["mlp_middle_depth"] == 3
@@ -269,10 +267,12 @@ def test_memory_has_one_layer_per_dabsn_never_one_per_middle_mlp(depth, depth_in
 def test_memory_fingerprint_rejects_a_different_middle_layout(change):
     model = _model(middle_depth=3, depth_index=0).eval()
     memory = ingest(model, torch.randint(0, model.vocab, (2, 5)))
-    other = _model(**{
-        "middle_depth": change["mlp_middle_depth"],
-        "depth_index": change["mlp_depth_index"],
-    }).eval()
+    other = _model(
+        **{
+            "middle_depth": change["mlp_middle_depth"],
+            "depth_index": change["mlp_depth_index"],
+        }
+    ).eval()
     with pytest.raises(ValueError, match="different architecture"):
         forward_with_memory(other, torch.randint(0, model.vocab, (2, 2)), memory)
 
@@ -297,15 +297,11 @@ def test_middle_mlp_count_does_not_change_dmem_cost_or_actual_bank_bytes():
     torch.manual_seed(47)
     plain = DABSNSequenceLM(**common).eval()
     torch.manual_seed(47)
-    tower = DABSNSequenceLM(
-        **common, mlp_middle_depth=7, mlp_depth_index=0
-    ).eval()
+    tower = DABSNSequenceLM(**common, mlp_middle_depth=7, mlp_depth_index=0).eval()
     ids = torch.randint(0, 31, (1, 6))
     plain_memory = ingest(plain, ids)
     tower_memory = ingest(tower, ids)
-    assert memory_cost(plain, 6, batch_size=1) == memory_cost(
-        tower, 6, batch_size=1
-    )
+    assert memory_cost(plain, 6, batch_size=1) == memory_cost(tower, 6, batch_size=1)
     assert plain_memory.nbytes() == tower_memory.nbytes()
 
 
@@ -332,21 +328,15 @@ def test_resume_validation_includes_both_middle_tower_fields(tmp_path):
     model = _model(middle_depth=3, depth_index=1)
     _validate_model_config(
         model,
-        DABSNPretrainConfig(
-            **common, mlp_middle_depth=3, mlp_depth_index=1
-        ),
+        DABSNPretrainConfig(**common, mlp_middle_depth=3, mlp_depth_index=1),
     )
     with pytest.raises(ValueError, match="mlp_middle_depth"):
         _validate_model_config(
             model,
-            DABSNPretrainConfig(
-                **common, mlp_middle_depth=2, mlp_depth_index=1
-            ),
+            DABSNPretrainConfig(**common, mlp_middle_depth=2, mlp_depth_index=1),
         )
     with pytest.raises(ValueError, match="mlp_depth_index"):
         _validate_model_config(
             model,
-            DABSNPretrainConfig(
-                **common, mlp_middle_depth=3, mlp_depth_index=0
-            ),
+            DABSNPretrainConfig(**common, mlp_middle_depth=3, mlp_depth_index=0),
         )

@@ -8,6 +8,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
+from torch._subclasses.fake_tensor import is_fake
 
 
 def _parameter(value: float) -> nn.Parameter:
@@ -21,6 +22,15 @@ def _stream_is_capturing() -> bool:
     illegal -- so it is the correct gate for forcing a static, sync-free bank
     width. Returns False on CPU or when CUDA graphs are unavailable.
     """
+    # Dynamo cannot trace `is_current_stream_capturing` -- it is a torch.* op
+    # returning a bool, which has no place in an FX graph -- so asking during
+    # tracing turns a whole-graph compile into a hard failure. The answer during
+    # tracing is False regardless: Dynamo is symbolically walking the function,
+    # not recording a stream, and Inductor's own cudagraph handling does not go
+    # through this probe. Short-circuiting keeps the module compilable without
+    # changing what it decides at runtime.
+    if torch.compiler.is_compiling():
+        return False
     if not torch.cuda.is_available():
         return False
     try:
@@ -74,9 +84,7 @@ class DABSNRead(nn.Module):
     def __init__(self, hidden_dim: int, read_geometry: str = "seq") -> None:
         super().__init__()
         if read_geometry not in {"seq", "field", "hybrid"}:
-            raise ValueError(
-                f"read_geometry must be seq, field, or hybrid; got {read_geometry}"
-            )
+            raise ValueError(f"read_geometry must be seq, field, or hybrid; got {read_geometry}")
         self.hidden_dim = hidden_dim
         self.read_geometry = read_geometry
         self.last_n_max: int | None = None
@@ -149,7 +157,7 @@ class DABSNRead(nn.Module):
         # normalize(gather(write)) == gather(normalize(write)) exactly, but the
         # backward now only pins the [B, n_max, H] gathered keys instead of a
         # full [B, T, H] normalized-write tape.
-        scale = (F.softplus(read_parameters.log_temp) + 1.0) * (hidden ** 0.5)
+        scale = (F.softplus(read_parameters.log_temp) + 1.0) * (hidden**0.5)
         key_bias = (
             read_parameters.p_gain * torch.log1p(plasticity.mean(dim=-1) * hidden)
             + read_parameters.novelty_gain * novelty.mean(dim=-1)
@@ -182,7 +190,9 @@ class DABSNRead(nn.Module):
             admit_floor = admission.max(dim=1, keepdim=True).values - window
             admission_policy = "whole_sequence_max"
         member = admission >= admit_floor
-        self.last_admit_gate_mean = None
+        compiling = torch.compiler.is_compiling()
+        if not compiling:
+            self.last_admit_gate_mean = None
 
         counts = member.sum(dim=1)
         order = torch.argsort(
@@ -212,18 +222,21 @@ class DABSNRead(nn.Module):
         # explicit manual override for callers that need the static path.
         capturing = expression.is_cuda and _stream_is_capturing()
         capture_safe_bank = bool(getattr(self, "_capture_safe_bank", False)) or capturing
-        if capture_safe_bank:
+        fake_tensor = not compiling and is_fake(expression)
+        if fake_tensor:
+            n_max = seq_len
+        elif capture_safe_bank:
             cap = getattr(self, "_capture_bank_width", None)
             n_max = int(cap) if cap else seq_len
             n_max = max(1, min(n_max, seq_len))
         else:
             n_max = max(int(counts.max().item()), 1)
-        self.last_n_max = n_max
+        if not compiling:
+            self.last_n_max = n_max
         seq_idx = order[:, :n_max]
-        seq_valid = (
-            torch.arange(n_max, device=expression.device).unsqueeze(0)
-            < counts.clamp_min(1).unsqueeze(1)
-        )
+        seq_valid = torch.arange(n_max, device=expression.device).unsqueeze(0) < counts.clamp_min(
+            1
+        ).unsqueeze(1)
 
         def gather_bank(index: Tensor):
             gather_hidden = index.unsqueeze(-1).expand(-1, -1, hidden)
@@ -246,19 +259,20 @@ class DABSNRead(nn.Module):
         field_keys, field_writes, field_cocktail = seq_keys, seq_writes, seq_cocktail
         field_bias, field_admission = seq_bias, seq_admission
         read_paths = 2 if self.read_geometry == "hybrid" else 1
-        self.last_read_contract = {
-            "read_strategy": "eager_admitted_bank",
-            "exact": True,
-            "approximation_reason": None,
-            "bank_growth": "grows_with_T" if n_max >= seq_len else "data_dependent",
-            "stored_writes_preserved": True,
-            "max_admitted_bank": int(n_max),
-            "estimated_read_work": int(batch) * int(seq_len) * int(n_max) * 3 * read_paths,
-            "dense_masks_materialized": True,
-            "context_parallel": False,
-            "admission_policy": admission_policy,
-            "kernel_backend": "eager_reference",
-        }
+        if not compiling:
+            self.last_read_contract = {
+                "read_strategy": "eager_admitted_bank",
+                "exact": True,
+                "approximation_reason": None,
+                "bank_growth": "grows_with_T" if n_max >= seq_len else "data_dependent",
+                "stored_writes_preserved": True,
+                "max_admitted_bank": int(n_max),
+                "estimated_read_work": int(batch) * int(seq_len) * int(n_max) * 3 * read_paths,
+                "dense_masks_materialized": True,
+                "context_parallel": False,
+                "admission_policy": admission_policy,
+                "kernel_backend": "eager_reference",
+            }
 
         compact_cuda = expression.is_cuda and bool(
             getattr(type(self), "_cuda_native_enabled", False)
@@ -273,11 +287,11 @@ class DABSNRead(nn.Module):
             seq_eligible = seq_allow.any(dim=-1)
             field_allow = field_valid.unsqueeze(1).expand(-1, seq_len, -1)
             field_eligible = field_allow.any(dim=-1)
-        trace_enabled = self.collect_traces or not expression.is_cuda
+        trace_enabled = (
+            not compiling and not fake_tensor and (self.collect_traces or not expression.is_cuda)
+        )
         if self.read_geometry != "seq" and trace_enabled:
-            self.last_field_neighbors = float(
-                field_valid.detach().sum(dim=1).float().mean().cpu()
-            )
+            self.last_field_neighbors = float(field_valid.detach().sum(dim=1).float().mean().cpu())
         elif self.read_geometry != "seq":
             self.last_field_neighbors = None
 
@@ -291,6 +305,7 @@ class DABSNRead(nn.Module):
             seq_induct_allow = seq_induct_eligible = None
             field_induct_allow = field_induct_eligible = None
         else:
+            assert query_pos is not None
             seq_induct_allow = (seq_idx.unsqueeze(1) < query_pos) & seq_valid.unsqueeze(1)
             field_induct_allow = (
                 (field_idx.unsqueeze(1) < (seq_len - 1)) & field_valid.unsqueeze(1)
@@ -302,17 +317,11 @@ class DABSNRead(nn.Module):
             next_field_writes = torch.gather(
                 write,
                 1,
-                (field_idx + 1)
-                .clamp(max=seq_len - 1)
-                .unsqueeze(-1)
-                .expand(-1, -1, hidden),
+                (field_idx + 1).clamp(max=seq_len - 1).unsqueeze(-1).expand(-1, -1, hidden),
             )
 
         if self.read_geometry == "seq":
-            self._compact_bank_idx = seq_idx
-            self._compact_bank_valid = seq_valid
-            self._compact_read_mode = "seq"
-            retrieved = self._three_way_read(
+            retrieved = self._admitted_read(
                 query,
                 seq_keys,
                 seq_writes,
@@ -326,18 +335,16 @@ class DABSNRead(nn.Module):
                 seq_induct_allow,
                 seq_eligible,
                 seq_induct_eligible,
+                bank_idx=seq_idx,
+                bank_valid=seq_valid,
+                mode="seq",
             )
             self.last_hybrid_gate = None
-            self.last_seq_norm = (
-                float(retrieved.detach().norm().cpu()) if trace_enabled else None
-            )
+            self.last_seq_norm = float(retrieved.detach().norm().cpu()) if trace_enabled else None
             self.last_field_norm = None
             self.last_field_neighbors = None
         elif self.read_geometry == "field":
-            self._compact_bank_idx = field_idx
-            self._compact_bank_valid = field_valid
-            self._compact_read_mode = "field"
-            retrieved = self._three_way_read(
+            retrieved = self._admitted_read(
                 query,
                 field_keys,
                 field_writes,
@@ -351,17 +358,15 @@ class DABSNRead(nn.Module):
                 field_induct_allow,
                 field_eligible,
                 field_induct_eligible,
+                bank_idx=field_idx,
+                bank_valid=field_valid,
+                mode="field",
             )
             self.last_hybrid_gate = None
             self.last_seq_norm = None
-            self.last_field_norm = (
-                float(retrieved.detach().norm().cpu()) if trace_enabled else None
-            )
+            self.last_field_norm = float(retrieved.detach().norm().cpu()) if trace_enabled else None
         else:
-            self._compact_bank_idx = seq_idx
-            self._compact_bank_valid = seq_valid
-            self._compact_read_mode = "seq"
-            seq_retrieved = self._three_way_read(
+            seq_retrieved = self._admitted_read(
                 query,
                 seq_keys,
                 seq_writes,
@@ -375,11 +380,11 @@ class DABSNRead(nn.Module):
                 seq_induct_allow,
                 seq_eligible,
                 seq_induct_eligible,
+                bank_idx=seq_idx,
+                bank_valid=seq_valid,
+                mode="seq",
             )
-            self._compact_bank_idx = field_idx
-            self._compact_bank_valid = field_valid
-            self._compact_read_mode = "field"
-            field_retrieved = self._three_way_read(
+            field_retrieved = self._admitted_read(
                 query,
                 field_keys,
                 field_writes,
@@ -393,6 +398,9 @@ class DABSNRead(nn.Module):
                 field_induct_allow,
                 field_eligible,
                 field_induct_eligible,
+                bank_idx=field_idx,
+                bank_valid=field_valid,
+                mode="field",
             )
             if self.hybrid_gate_override is None:
                 gate = torch.sigmoid(self.hybrid_gate)
@@ -413,70 +421,140 @@ class DABSNRead(nn.Module):
             )
             retrieved = seq_contribution + field_contribution
 
-        self.last_read_contract.update(
-            {
-                "read_strategy": (
-                    "compact_flash_admitted_bank" if compact_cuda else "eager_admitted_bank"
-                ),
-                "dense_masks_materialized": not compact_cuda,
-                "kernel_backend": getattr(
-                    self, "_last_three_way_backend", "eager_reference"
-                ),
-            }
-        )
+        if not compiling:
+            self.last_read_contract.update(
+                {
+                    "read_strategy": (
+                        "compact_flash_admitted_bank" if compact_cuda else "eager_admitted_bank"
+                    ),
+                    "dense_masks_materialized": not compact_cuda,
+                    "kernel_backend": getattr(self, "_last_three_way_backend", "eager_reference"),
+                }
+            )
 
         output = read_parameters.out(torch.cat([y, budget, retrieved], dim=-1))
         long = self._long_scan(write, plasticity, novelty)
-        self.last_long_scan_norm = (
-            float(long.detach().norm().cpu()) if trace_enabled else None
-        )
+        self.last_long_scan_norm = float(long.detach().norm().cpu()) if trace_enabled else None
         return output + self.long_gain * long
+
+    def _admitted_read(
+        self,
+        query: Tensor,
+        bank_keys: Tensor,
+        bank_writes: Tensor,
+        next_writes: Tensor | None,
+        cocktail: Tensor,
+        bank_cocktail: Tensor,
+        bank_key_bias: Tensor,
+        bank_admission: Tensor,
+        scale: Tensor,
+        allow: Tensor | None,
+        induct_allow: Tensor | None,
+        eligible: Tensor | None,
+        induct_eligible: Tensor | None,
+        *,
+        bank_idx: Tensor,
+        bank_valid: Tensor,
+        mode: str,
+    ) -> Tensor:
+        """Dispatch an admitted read without mutating the module or its class."""
+        compact_cuda = query.is_cuda and bool(getattr(type(self), "_cuda_native_enabled", False))
+        if compact_cuda:
+            if next_writes is None:
+                raise RuntimeError("compact admitted read requires next-write memory")
+            from .kernels.triton import cuda_compact_three_way_read
+
+            return cuda_compact_three_way_read(
+                self,
+                query,
+                bank_keys,
+                bank_writes,
+                next_writes,
+                cocktail,
+                bank_cocktail,
+                bank_key_bias,
+                bank_admission,
+                scale,
+                bank_idx,
+                bank_valid,
+                mode=mode,
+            )
+        return self._three_way_read(
+            query,
+            bank_keys,
+            bank_writes,
+            next_writes,
+            cocktail,
+            bank_cocktail,
+            bank_key_bias,
+            bank_admission,
+            scale,
+            allow,
+            induct_allow,
+            eligible,
+            induct_eligible,
+        )
 
     def _three_way_read(
         self,
         query: Tensor,
         bank_keys: Tensor,
         bank_writes: Tensor,
-        next_writes: Tensor,
+        next_writes: Tensor | None,
         cocktail: Tensor,
         bank_cocktail: Tensor,
         bank_key_bias: Tensor,
         bank_admission: Tensor,
         scale: Tensor,
-        allow: Tensor,
-        induct_allow: Tensor,
-        eligible: Tensor,
-        induct_eligible: Tensor,
+        allow: Tensor | None,
+        induct_allow: Tensor | None,
+        eligible: Tensor | None,
+        induct_eligible: Tensor | None,
     ) -> Tensor:
-        compatibility = torch.bmm(query, bank_keys.transpose(1, 2)) * scale
-        cocktail_compatibility = (
-            torch.bmm(cocktail, bank_cocktail.transpose(1, 2)) * self.cocktail_gain
+        from .kernels.admitted import (
+            admitted_three_way_read,
+            admitted_three_way_read_native,
         )
-        content = compatibility + bank_key_bias.unsqueeze(1)
-        short_scores = content + bank_admission.unsqueeze(1)
-        permanent_scores = content + cocktail_compatibility + bank_admission.unsqueeze(1)
 
-        def read(
-            scores: Tensor,
-            values: Tensor,
-            allow_mask: Tensor,
-            has_eligible: Tensor,
-        ) -> Tensor:
-            scores = scores.masked_fill(~allow_mask, float("-inf"))
-            scores = scores.masked_fill(~has_eligible.unsqueeze(-1), 0.0)
-            weights = F.softmax(scores, dim=-1)
-            weights = torch.where(
-                has_eligible.unsqueeze(-1),
-                weights,
-                torch.zeros_like(weights),
+        if (
+            next_writes is None
+            or allow is None
+            or induct_allow is None
+            or eligible is None
+            or induct_eligible is None
+        ):
+            raise RuntimeError(
+                "the registered dense admitted read requires explicit write and mask tensors"
             )
-            return torch.bmm(weights, values)
 
-        return (
-            self.short_gain * read(short_scores, bank_writes, allow, eligible)
-            + self.pad_gain * read(permanent_scores, bank_writes, allow, eligible)
-            + self.induct_gain
-            * read(short_scores, next_writes, induct_allow, induct_eligible)
+        read_op = admitted_three_way_read
+        if query.device.type == "cpu" and bool(
+            getattr(type(self), "_cpu_native_read_enabled", False)
+        ):
+            read_op = admitted_three_way_read_native
+            if not torch.compiler.is_compiling():
+                self._last_three_way_backend = (
+                    "cpu_native_cpp" if query.dtype == torch.float32 else "registered_reference"
+                )
+
+        return read_op(
+            query,
+            bank_keys,
+            bank_writes,
+            next_writes,
+            cocktail,
+            bank_cocktail,
+            bank_key_bias,
+            bank_admission,
+            scale,
+            allow,
+            induct_allow,
+            eligible,
+            induct_eligible,
+            self.short_gain,
+            self.pad_gain,
+            self.induct_gain,
+            self.cocktail_gain,
         )
 
     def initial_long_scan_state(
@@ -505,6 +583,17 @@ class DABSNRead(nn.Module):
         initial_state: tuple[Tensor, Tensor, Tensor] | None = None,
         return_final_state: bool = False,
     ):
+        if bool(getattr(type(self), "_long_native_enabled", False)):
+            from .kernels.long import fused_long_scan_from_state
+
+            return fused_long_scan_from_state(
+                self,
+                write,
+                plasticity,
+                novelty,
+                initial_state=initial_state,
+                return_final_state=return_final_state,
+            )
         batch, seq_len, hidden = write.shape
         retain = torch.sigmoid(self.logit_retain)
         if initial_state is None:
@@ -536,21 +625,13 @@ class DABSNRead(nn.Module):
         for step in range(seq_len):
             prediction_error = torch.tanh((write[:, step, :] - expected).abs())
             plastic_salience = plasticity[:, step, :] * prediction_error
-            expected = (
-                expect_retain * expected
-                + (1.0 - expect_retain) * write[:, step, :]
+            expected = expect_retain * expected + (1.0 - expect_retain) * write[:, step, :]
+            retention = retention_decay * retention + (1.0 - retention_decay) * (
+                1.0 - prediction_error
             )
-            retention = (
-                retention_decay * retention
-                + (1.0 - retention_decay) * (1.0 - prediction_error)
-            )
-            effective_retain = (
-                retain + (1.0 - retain) * retention_strength * retention
-            )
-            long = (
-                effective_retain * long
-                + (1.0 - effective_retain)
-                * (plastic_salience * write[:, step, :])
+            effective_retain = retain + (1.0 - retain) * retention_strength * retention
+            long = effective_retain * long + (1.0 - effective_retain) * (
+                plastic_salience * write[:, step, :]
             )
             outputs.append(long)
         output = torch.stack(outputs, dim=1)
@@ -577,9 +658,9 @@ class DABSNRead(nn.Module):
         energy: Tensor,
         saturation: Tensor,
         *,
-        bank_y: Tensor,
-        bank_b: Tensor,
-        bank_ay: Tensor,
+        bank_y: Tensor | None,
+        bank_b: Tensor | None,
+        bank_ay: Tensor | None,
         bank_write: Tensor,
         bank_novelty: Tensor,
         bank_p: Tensor,
@@ -602,7 +683,7 @@ class DABSNRead(nn.Module):
         query = F.normalize(expression, dim=-1)
         # Keys normalized after the gather (Phase 2c) -- see the short read: the
         # row-wise normalize commutes with the row gather bit-for-bit.
-        scale = (F.softplus(read_parameters.log_temp) + 1.0) * (hidden ** 0.5)
+        scale = (F.softplus(read_parameters.log_temp) + 1.0) * (hidden**0.5)
         key_bias = (
             read_parameters.p_gain * torch.log1p(bank_p.mean(dim=-1) * hidden)
             + read_parameters.novelty_gain * bank_novelty.mean(dim=-1)
@@ -643,7 +724,8 @@ class DABSNRead(nn.Module):
         admit_floor = torch.cummax(admission, dim=1).values - window
         member = admission >= admit_floor
         counts = member.sum(dim=1)
-        n_max = max(int(counts.max().item()), 1)
+        fake_tensor = not torch.compiler.is_compiling() and is_fake(expression)
+        n_max = bank_len if fake_tensor else max(int(counts.max().item()), 1)
         order = torch.argsort(
             member.to(query.dtype),
             dim=1,
@@ -651,10 +733,9 @@ class DABSNRead(nn.Module):
             stable=True,
         )
         bank_idx = order[:, :n_max]
-        bank_valid = (
-            torch.arange(n_max, device=expression.device).unsqueeze(0)
-            < counts.clamp_min(1).unsqueeze(1)
-        )
+        bank_valid = torch.arange(n_max, device=expression.device).unsqueeze(0) < counts.clamp_min(
+            1
+        ).unsqueeze(1)
 
         gather_hidden = bank_idx.unsqueeze(-1).expand(-1, -1, hidden)
         bank_writes = torch.gather(bank_write, 1, gather_hidden)
@@ -679,17 +760,14 @@ class DABSNRead(nn.Module):
         if compact_cuda:
             allow = induct_allow = eligible = induct_eligible = None
         else:
-            query_pos = (
-                query_start + torch.arange(query_len, device=expression.device)
-            ).view(1, query_len, 1)
+            query_pos = (query_start + torch.arange(query_len, device=expression.device)).view(
+                1, query_len, 1
+            )
             allow = (bank_idx.unsqueeze(1) <= query_pos) & bank_valid.unsqueeze(1)
             induct_allow = (bank_idx.unsqueeze(1) < query_pos) & bank_valid.unsqueeze(1)
             eligible = allow.any(dim=-1)
             induct_eligible = induct_allow.any(dim=-1)
-        self._compact_bank_idx = bank_idx - query_start
-        self._compact_bank_valid = bank_valid
-        self._compact_read_mode = "seq"
-        retrieved = self._three_way_read(
+        retrieved = self._admitted_read(
             query,
             bank_keys,
             bank_writes,
@@ -703,37 +781,42 @@ class DABSNRead(nn.Module):
             induct_allow,
             eligible,
             induct_eligible,
+            bank_idx=bank_idx - query_start,
+            bank_valid=bank_valid,
+            mode="seq",
         )
         kernel_backend = getattr(self, "_last_three_way_backend", "eager_reference")
 
-        trace_enabled = self.collect_traces or not expression.is_cuda
-        self.last_n_max = n_max
-        self.last_hybrid_gate = None
-        self.last_seq_norm = (
-            float(retrieved.detach().norm().cpu()) if trace_enabled else None
+        compiling = torch.compiler.is_compiling()
+        trace_enabled = (
+            not compiling and not fake_tensor and (self.collect_traces or not expression.is_cuda)
         )
-        self.last_field_norm = None
-        self.last_field_neighbors = None
-        self.last_read_contract = {
-            "read_strategy": (
-                "query_only_compact_flash_admitted_bank"
-                if compact_cuda
-                else "query_only_eager_admitted_bank"
-            ),
-            "exact": True,
-            "approximation_reason": None,
-            "bank_growth": "grows_with_T" if n_max >= bank_len else "data_dependent",
-            "stored_writes_preserved": True,
-            "max_admitted_bank": int(n_max),
-            "estimated_read_work": int(batch) * int(query_len) * int(n_max) * 3,
-            "dense_masks_materialized": not compact_cuda,
-            "context_parallel": True,
-            "query_only": True,
-            "query_start": query_start,
-            "bank_entries": int(bank_len),
-            "admission_policy": "causal_write_prefix_max",
-            "kernel_backend": kernel_backend,
-        }
+        if not compiling:
+            self.last_n_max = n_max
+            self.last_hybrid_gate = None
+            self.last_seq_norm = float(retrieved.detach().norm().cpu()) if trace_enabled else None
+            self.last_field_norm = None
+            self.last_field_neighbors = None
+            self.last_read_contract = {
+                "read_strategy": (
+                    "query_only_compact_flash_admitted_bank"
+                    if compact_cuda
+                    else "query_only_eager_admitted_bank"
+                ),
+                "exact": True,
+                "approximation_reason": None,
+                "bank_growth": "grows_with_T" if n_max >= bank_len else "data_dependent",
+                "stored_writes_preserved": True,
+                "max_admitted_bank": int(n_max),
+                "estimated_read_work": int(batch) * int(query_len) * int(n_max) * 3,
+                "dense_masks_materialized": not compact_cuda,
+                "context_parallel": True,
+                "query_only": True,
+                "query_start": query_start,
+                "bank_entries": int(bank_len),
+                "admission_policy": "causal_write_prefix_max",
+                "kernel_backend": kernel_backend,
+            }
 
         short_output = read_parameters.out(torch.cat([y, budget, retrieved], dim=-1))
         long_result = self._long_scan_from_state(
@@ -748,9 +831,7 @@ class DABSNRead(nn.Module):
         else:
             long = long_result
             final_long_state = None
-        self.last_long_scan_norm = (
-            float(long.detach().norm().cpu()) if trace_enabled else None
-        )
+        self.last_long_scan_norm = float(long.detach().norm().cpu()) if trace_enabled else None
         output = short_output + self.long_gain * long
         if return_long_state:
             return output, final_long_state

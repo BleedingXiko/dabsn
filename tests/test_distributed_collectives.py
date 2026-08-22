@@ -79,11 +79,14 @@ def _strip(name: str) -> str:
 def _single_process_grads() -> dict[str, torch.Tensor]:
     from dabsn.distributed import DABSNSequenceModule
 
-    module = DABSNSequenceModule(_build_model())   # same forward the ranks use
+    module = DABSNSequenceModule(_build_model())  # same forward the ranks use
     ids, targets = _make_batch()
     _loss(module, ids, targets).backward()
-    return {_strip(n): p.grad.detach().clone()
-            for n, p in module.named_parameters() if p.grad is not None}
+    return {
+        _strip(n): p.grad.detach().clone()
+        for n, p in module.named_parameters()
+        if p.grad is not None
+    }
 
 
 def _rank_main(rank: int, world: int, kind: str, out_path: str) -> int:
@@ -94,9 +97,12 @@ def _rank_main(rank: int, world: int, kind: str, out_path: str) -> int:
     try:
         from dabsn.distributed import DABSNSequenceModule, DistributedState, wrap_distributed
 
-        module = DABSNSequenceModule(_build_model())   # same seed on every rank
+        module = DABSNSequenceModule(_build_model())  # same seed on every rank
         state = DistributedState(
-            kind=kind, rank=rank, local_rank=rank, world_size=world,
+            kind=kind,
+            rank=rank,
+            local_rank=rank,
+            world_size=world,
             device=torch.device("cpu"),
         )
         wrapped = wrap_distributed(module, state)
@@ -110,10 +116,14 @@ def _rank_main(rank: int, world: int, kind: str, out_path: str) -> int:
         loss = _loss(wrapped, ids[lo:hi], targets[lo:hi])
         loss.backward()
 
-        grads = {_strip(n): p.grad.detach().clone()
-                 for n, p in wrapped.named_parameters() if p.grad is not None}
-        torch.save({"grads": grads, "loss": float(loss.detach()),
-                    "report": state.report()}, out_path)
+        grads = {
+            _strip(n): p.grad.detach().clone()
+            for n, p in wrapped.named_parameters()
+            if p.grad is not None
+        }
+        torch.save(
+            {"grads": grads, "loss": float(loss.detach()), "report": state.report()}, out_path
+        )
         return 0
     finally:
         dist.destroy_process_group()
@@ -123,7 +133,7 @@ def _run_world(kind: str) -> dict[int, dict]:
     """Launch `_WORLD` ranks as subprocesses and collect what they produced."""
     import socket
 
-    with socket.socket() as sock:                 # a port nothing else holds
+    with socket.socket() as sock:  # a port nothing else holds
         sock.bind(("127.0.0.1", 0))
         port = int(sock.getsockname()[1])
 
@@ -134,15 +144,23 @@ def _run_world(kind: str) -> dict[int, dict]:
         paths[rank] = os.path.join(tmp, f"rank{rank}.pt")
         env = dict(
             os.environ,
-            MASTER_ADDR="127.0.0.1", MASTER_PORT=str(port),
-            RANK=str(rank), WORLD_SIZE=str(_WORLD), LOCAL_RANK=str(rank),
+            MASTER_ADDR="127.0.0.1",
+            MASTER_PORT=str(port),
+            RANK=str(rank),
+            WORLD_SIZE=str(_WORLD),
+            LOCAL_RANK=str(rank),
             PYTHONPATH=os.path.join(root, "src") + os.pathsep + os.environ.get("PYTHONPATH", ""),
             OMP_NUM_THREADS="1",
         )
-        procs.append(subprocess.Popen(
-            [sys.executable, os.path.abspath(__file__), str(rank), kind, paths[rank]],
-            env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-        ))
+        procs.append(
+            subprocess.Popen(
+                [sys.executable, os.path.abspath(__file__), str(rank), kind, paths[rank]],
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+        )
 
     results, failures = {}, []
     for rank, proc in enumerate(procs):
@@ -150,8 +168,10 @@ def _run_world(kind: str) -> dict[int, dict]:
             output = proc.communicate(timeout=_RANK_TIMEOUT_S)[0]
         except subprocess.TimeoutExpired:
             proc.kill()
-            failures.append(f"rank {rank} deadlocked (no exit in {_RANK_TIMEOUT_S}s) -- "
-                            "a collective that one rank entered and another did not")
+            failures.append(
+                f"rank {rank} deadlocked (no exit in {_RANK_TIMEOUT_S}s) -- "
+                "a collective that one rank entered and another did not"
+            )
             continue
         if proc.returncode != 0:
             failures.append(f"rank {rank} exited {proc.returncode}:\n{output[-2000:]}")
@@ -182,10 +202,15 @@ def test_ddp_two_ranks_reproduce_single_process_gradients():
     checked = 0
     for name, expected in reference.items():
         got = rank0.get(name)
-        if got is None:            # unused-parameter path; DDP marks these
+        if got is None:  # unused-parameter path; DDP marks these
             continue
-        torch.testing.assert_close(got, expected, rtol=1e-4, atol=1e-6,
-                                   msg=lambda m, n=name: f"gradient mismatch on {n}\n{m}")
+        torch.testing.assert_close(
+            got,
+            expected,
+            rtol=1e-4,
+            atol=1e-6,
+            msg=lambda m, n=name: f"gradient mismatch on {n}\n{m}",
+        )
         checked += 1
     assert checked >= 10, f"only {checked} parameters compared; the check is too weak"
 
@@ -209,8 +234,6 @@ def test_distributed_state_reports_real_group_membership():
         assert report["batch_parallel"] is True
 
 
-
-
 def test_capture_refuses_a_ddp_wrapped_module():
     """Recording a step whose gradients a collective owns must fail loudly.
 
@@ -224,10 +247,11 @@ def test_capture_refuses_a_ddp_wrapped_module():
     from dabsn.runtime.graph import _reject_capture_of_a_replicated_module
 
     plain = torch.nn.Linear(4, 4)
-    _reject_capture_of_a_replicated_module(plain)   # unwrapped: no objection
+    _reject_capture_of_a_replicated_module(plain)  # unwrapped: no objection
 
     class _FakeDDP(torch.nn.Module):
         pass
+
     # Match by qualified name so the guard needs no live process group to fire.
     _FakeDDP.__module__ = "torch.nn.parallel.distributed"
     _FakeDDP.__qualname__ = "DistributedDataParallel"
@@ -236,7 +260,7 @@ def test_capture_refuses_a_ddp_wrapped_module():
         _reject_capture_of_a_replicated_module(_FakeDDP())
     message = str(excinfo.value)
     assert "DDP" in message
-    assert "make_graphed_train_callable" in message   # names the way out
+    assert "make_graphed_train_callable" in message  # names the way out
     assert "DABSN_SCAN_GRAPH=0" in message
 
 
@@ -273,8 +297,7 @@ def test_hidden_shards_partition_every_unit_exactly_once():
             for rank in range(world):
                 cut = hidden_shard(hidden, rank, world)
                 covered.extend(range(cut.start, cut.stop))
-            assert covered == list(range(hidden)), (
-                f"H={hidden} world={world} covered {covered}")
+            assert covered == list(range(hidden)), f"H={hidden} world={world} covered {covered}"
             widths = [hidden_shard(hidden, r, world) for r in range(world)]
             sizes = [c.stop - c.start for c in widths]
             # The remainder spreads one unit at a time instead of piling onto
@@ -292,7 +315,7 @@ def test_single_rank_tensor_parallel_scan_matches_the_core():
 
     core = _build_core()
     inputs = _tp_inputs()
-    expected = core(inputs)[0]      # trajectory: cat([y, budget])
+    expected = core(inputs)[0]  # trajectory: cat([y, budget])
     shard = shard_core_tensor_parallel(core, 0, 1)
     actual = tensor_parallel_core_scan(shard, inputs)
     assert actual.shape == (_TP_BATCH, _TP_STEPS, 2 * _TP_HIDDEN)
@@ -306,18 +329,21 @@ def _tp_rank_main(rank: int, world: int, out_path: str) -> int:
     try:
         from dabsn.distributed import shard_core_tensor_parallel, tensor_parallel_core_scan
 
-        core = _build_core()          # identical on every rank
+        core = _build_core()  # identical on every rank
         shard = shard_core_tensor_parallel(core, rank, world)
         for key, value in shard.items():
             if torch.is_tensor(value):
                 shard[key] = value.requires_grad_(True)
         out = tensor_parallel_core_scan(shard, _tp_inputs())
         out.sum().backward()
-        torch.save({
-            "out": out.detach().clone(),
-            "slice": (shard["slice"].start, shard["slice"].stop),
-            "grad_A": shard["A"].grad.detach().clone(),
-        }, out_path)
+        torch.save(
+            {
+                "out": out.detach().clone(),
+                "slice": (shard["slice"].start, shard["slice"].stop),
+                "grad_A": shard["A"].grad.detach().clone(),
+            },
+            out_path,
+        )
         return 0
     finally:
         dist.destroy_process_group()
@@ -354,14 +380,92 @@ def test_two_rank_tensor_parallel_reproduces_the_whole_model():
     # the unsharded gradient: sharding places the work, it does not change it.
     for rank in range(_WORLD):
         lo, hi = results[rank]["slice"]
-        torch.testing.assert_close(results[rank]["grad_A"], ref_grad_A[lo:hi],
-                                   rtol=1e-4, atol=1e-6)
+        torch.testing.assert_close(results[rank]["grad_A"], ref_grad_A[lo:hi], rtol=1e-4, atol=1e-6)
+
+
+def _tp_core_rank_main(rank: int, world: int, out_path: str) -> int:
+    import torch.distributed as dist
+
+    dist.init_process_group(backend="gloo", rank=rank, world_size=world)
+    try:
+        from dabsn.core import TensorParallelDABSNCore
+
+        source = _build_core()  # identical on every rank
+        core = TensorParallelDABSNCore(
+            source, group=dist.group.WORLD, rank=rank, world_size=world
+        )
+        trajectory = core.forward_from_state(_tp_inputs())[0]
+        trajectory.sum().backward()
+        torch.save(
+            {
+                "out": trajectory.detach().clone(),
+                "slice": (core.tensor_slice.start, core.tensor_slice.stop),
+                "grad_A": core.A.weight.grad.detach().clone(),
+                "grad_Ug": core.Ug.weight.grad.detach().clone(),
+                "grad_alpha": core.logit_alpha.grad.detach().clone(),
+                "backend": core._last_core_backend,
+            },
+            out_path,
+        )
+        return 0
+    finally:
+        dist.destroy_process_group()
+
+
+def test_two_rank_tensor_parallel_core_matches_the_unsharded_core():
+    """The live sharded core -- not the standalone helper -- must be exact.
+
+    ``tensor_parallel_core_scan`` in ``distributed.py`` has a two-rank test
+    above, but nothing outside this file calls it. The class that actually runs
+    during training is ``TensorParallelDABSNCore``, and until now no test put
+    two ranks through it, so its gradient path was unproven -- the one place
+    where being wrong is silent rather than loud.
+
+    Both gradient directions are checked, because they fail differently. The
+    recurrent-matrix rows are local: this rank owns the rows that produce its
+    own units, and its gradient must equal the matching block of the unsharded
+    gradient. The replicated scalars are the opposite: every rank computes a
+    partial for the same parameter, so they are only correct once summed across
+    ranks. A missing reduction leaves the first check passing and the second
+    failing, which is precisely the asymmetry worth pinning.
+    """
+    if not torch.distributed.is_available():
+        pytest.skip("torch.distributed unavailable")
+
+    core = _build_core()
+    inputs = _tp_inputs()
+    reference = core(inputs)[0].detach().clone()
+    core.zero_grad(set_to_none=True)
+    core(inputs)[0].sum().backward()
+    ref_grad_A = core.A.weight.grad.detach().clone()
+    ref_grad_Ug = core.Ug.weight.grad.detach().clone()
+    ref_grad_alpha = core.logit_alpha.grad.detach().clone()
+
+    results = _run_world("tpcore")
+    assert set(results) == set(range(_WORLD))
+
+    for rank in range(_WORLD):
+        got = results[rank]
+        assert got["backend"] == "tensor_parallel_registered_step"
+        # Every rank reassembles the complete public trajectory, so each one
+        # must reproduce the unsharded output on its own.
+        torch.testing.assert_close(got["out"], reference, rtol=1e-5, atol=1e-6)
+
+        lo, hi = got["slice"]
+        torch.testing.assert_close(got["grad_A"], ref_grad_A[lo:hi], rtol=1e-4, atol=1e-6)
+        torch.testing.assert_close(got["grad_Ug"], ref_grad_Ug[lo:hi], rtol=1e-4, atol=1e-6)
+        # Replicated scalar: the per-rank hook all-reduces, so each rank should
+        # already hold the whole-model gradient, not its own share of it.
+        torch.testing.assert_close(got["grad_alpha"], ref_grad_alpha, rtol=1e-4, atol=1e-6)
 
 
 if __name__ == "__main__":
     # Rank entry point. `kind` selects which parallelism this rank exercises:
-    # "tp" splits the model across ranks, everything else replicates it.
+    # "tp" and "tpcore" split the model across ranks, everything else
+    # replicates it.
     _RANK, _KIND, _OUT = int(sys.argv[1]), sys.argv[2], sys.argv[3]
     if _KIND == "tp":
         raise SystemExit(_tp_rank_main(_RANK, _WORLD, _OUT))
+    if _KIND == "tpcore":
+        raise SystemExit(_tp_core_rank_main(_RANK, _WORLD, _OUT))
     raise SystemExit(_rank_main(_RANK, _WORLD, _KIND, _OUT))

@@ -4,13 +4,13 @@ from __future__ import annotations
 
 import math
 import os
-from pathlib import Path
 import time
+from pathlib import Path
+from typing import Any, cast
 
 import numpy as np
 import torch
 import torch.distributed as torch_dist
-import torch.nn.functional as F
 from torch import Tensor
 
 from .checkpoint import inspect_dabsn, load_dabsn
@@ -24,6 +24,7 @@ from .distributed import (
     make_grad_scaler,
     no_sync_context,
     optimizer_checkpoint_path,
+    parse_parallel_topology,
     prepare_distributed_model,
     resolve_precision,
     save_distributed_dabsn,
@@ -32,7 +33,7 @@ from .distributed import (
 )
 from .kernels import enable as enable_kernels
 from .model import DABSNSequenceLM
-from .runtime.api import verify_gradients
+from .runtime.api import apply_optimizer_step, verify_gradients
 from .runtime.grad_accum import ManualGradientAccumulator
 from .runtime.graph import make_graphed_train_callable
 from .runtime.loss import chunked_cross_entropy_from_logits
@@ -80,7 +81,7 @@ def _next_token_batch(
         raise ValueError(f"corpus split is too short for context={context}")
     starts = rng.integers(0, max_start, size=int(batch_size), endpoint=False)
     windows = np.stack(
-        [data[int(start):int(start) + int(context) + 1] for start in starts]
+        [data[int(start) : int(start) + int(context) + 1] for start in starts]
     ).astype(np.int64, copy=False)
     cpu = torch.from_numpy(windows)
     if device.type == "cuda":
@@ -93,9 +94,9 @@ def _mean_across_ranks(value: Tensor, state) -> float:
     reduced = value.detach().float()
     if reduced.numel() != 1:
         reduced = reduced.mean()
-    if state.enabled:
-        torch_dist.all_reduce(reduced, op=torch_dist.ReduceOp.SUM)
-        reduced /= state.world_size
+    if state.batch_parallel:
+        torch_dist.all_reduce(reduced, op=torch_dist.ReduceOp.SUM, group=state.data_group)
+        reduced /= state.data_world_size
     return float(reduced.cpu())
 
 
@@ -198,9 +199,7 @@ def _validate_model_config(model: DABSNSequenceLM, config: DABSNPretrainConfig) 
     if model.vocab != config.vocab:
         mismatches.append(f"vocab checkpoint={model.vocab} requested={config.vocab}")
     if model.hidden_dim != config.hidden_dim:
-        mismatches.append(
-            f"hidden_dim checkpoint={model.hidden_dim} requested={config.hidden_dim}"
-        )
+        mismatches.append(f"hidden_dim checkpoint={model.hidden_dim} requested={config.hidden_dim}")
     if actual_layers != expected_layers:
         mismatches.append("layers differ")
     if model.tie_embeddings != config.tie_embeddings:
@@ -208,13 +207,9 @@ def _validate_model_config(model: DABSNSequenceLM, config: DABSNPretrainConfig) 
             f"tie_embeddings checkpoint={model.tie_embeddings} requested={config.tie_embeddings}"
         )
     if model.residual != config.residual:
-        mismatches.append(
-            f"residual checkpoint={model.residual} requested={config.residual}"
-        )
+        mismatches.append(f"residual checkpoint={model.residual} requested={config.residual}")
     if model.mlp_ratio != config.mlp_ratio:
-        mismatches.append(
-            f"mlp_ratio checkpoint={model.mlp_ratio} requested={config.mlp_ratio}"
-        )
+        mismatches.append(f"mlp_ratio checkpoint={model.mlp_ratio} requested={config.mlp_ratio}")
     if model.mlp_middle_depth != config.mlp_middle_depth:
         mismatches.append(
             "mlp_middle_depth "
@@ -222,8 +217,7 @@ def _validate_model_config(model: DABSNSequenceLM, config: DABSNPretrainConfig) 
         )
     if model.mlp_depth_index != config.mlp_depth_index:
         mismatches.append(
-            "mlp_depth_index "
-            f"checkpoint={model.mlp_depth_index} requested={config.mlp_depth_index}"
+            f"mlp_depth_index checkpoint={model.mlp_depth_index} requested={config.mlp_depth_index}"
         )
     if mismatches:
         raise ValueError("resume configuration does not match checkpoint: " + "; ".join(mismatches))
@@ -267,12 +261,14 @@ def _evaluate(
 
 
 def _gather_rng_states(rng: np.random.Generator, state) -> list[dict[str, object]]:
-    local = rng.bit_generator.state
+    local = dict(rng.bit_generator.state)
     if not state.enabled:
         return [local]
-    gathered = [None for _ in range(state.world_size)]
+    gathered: list[object | None] = [None for _ in range(state.world_size)]
     torch_dist.all_gather_object(gathered, local)
-    return gathered
+    if any(not isinstance(item, dict) for item in gathered):
+        raise RuntimeError("distributed corpus RNG gather returned an invalid state")
+    return cast(list[dict[str, object]], gathered)
 
 
 def _restore_rng_state(
@@ -312,7 +308,11 @@ def pretrain_next_token(
     # Expandable segments must be set before the first CUDA allocation, which
     # setup_distributed may trigger -- configure the allocator first.
     _configure_cuda_allocator()
-    state = setup_distributed(config.distributed, device)
+    state = setup_distributed(
+        config.distributed,
+        device,
+        topology=parse_parallel_topology(config.parallel_axes),
+    )
     destination = Path(output)
     try:
         if checkpoint_mode not in {"portable", "sharded"}:
@@ -334,7 +334,7 @@ def pretrain_next_token(
 
         corpus = _load_corpus(config)
         training, validation = _split_corpus(corpus, config)
-        rng = np.random.default_rng(config.seed + state.rank * 100_003)
+        rng = np.random.default_rng(config.seed + state.data_rank * 100_003)
         exists = destination.is_file() if checkpoint_mode == "portable" else destination.is_dir()
         if resume and not exists:
             raise FileNotFoundError(f"--resume requires an existing checkpoint: {destination}")
@@ -362,11 +362,7 @@ def pretrain_next_token(
                 mlp_depth_index=config.mlp_depth_index,
             ).to(state.device)
 
-        global_tokens_per_step = (
-            config.batch_size
-            * config.train_context
-            * state.world_size
-        )
+        global_tokens_per_step = config.batch_size * config.train_context * state.data_world_size
         total_steps = config.steps
         if config.token_budget:
             total_steps = max(1, math.ceil(config.token_budget / global_tokens_per_step))
@@ -377,7 +373,7 @@ def pretrain_next_token(
                 batch_size=min(2, config.batch_size),
                 context=min(config.train_context, 32),
                 device=state.device,
-                rng=np.random.default_rng(config.seed + state.rank * 100_003 + 1),
+                rng=np.random.default_rng(config.seed + state.data_rank * 100_003 + 1),
             )
             verify_gradients(
                 model,
@@ -417,10 +413,14 @@ def pretrain_next_token(
                     optimizer,
                     destination,
                     state,
+                    scaler=scaler,
                 )
-                start_step = int(manifest["step"])
-                resume_extra = manifest.get("extra", {})
-                scaler_state = manifest.get("extra", {}).get("amp_scaler")
+                start_step = int(cast(Any, manifest["step"]))
+                raw_extra = manifest.get("extra", {})
+                if not isinstance(raw_extra, dict):
+                    raise ValueError("resume manifest extra metadata must be an object")
+                resume_extra = cast(dict[str, object], raw_extra)
+                scaler_state = resume_extra.get("amp_scaler")
                 if scaler is not None and scaler_state is not None:
                     scaler.load_state_dict(scaler_state)
             if total_steps < start_step:
@@ -439,6 +439,8 @@ def pretrain_next_token(
         graph_call = train_model
         accumulator: ManualGradientAccumulator | None = None
         graph_note = None
+        training_graph = getattr(model, "graph", None)
+        has_component_terms = bool(training_graph is not None and training_graph.loss_declarations)
         if config.cuda_graph:
             if state.device.type != "cuda":
                 graph_note = "skipped: cuda_graph requires a CUDA device"
@@ -446,6 +448,12 @@ def pretrain_next_token(
                 graph_note = (
                     "skipped: cuda_graph capture is single-process only; "
                     f"distributed={state.kind} runs eager with comm-overlap"
+                )
+            elif has_component_terms:
+                raise RuntimeError(
+                    "cuda_graph was requested for a graph with component loss terms, "
+                    "but fixed flattened ComponentOutput capture has not passed this "
+                    "runtime's CUDA release gate; refusing to silently omit the terms"
                 )
             else:
                 sample_inputs, _ = _next_token_batch(
@@ -458,9 +466,7 @@ def pretrain_next_token(
                 # On CUDA a capture failure is a real defect, not a reason to
                 # silently fall back to the eager Python T-loop (which is the slow
                 # path this whole feature exists to remove). Let it raise.
-                graph_call = make_graphed_train_callable(
-                    train_model, (sample_inputs,), verify=True
-                )
+                graph_call = make_graphed_train_callable(train_model, (sample_inputs,), verify=True)
                 if graph_call is train_model:
                     raise RuntimeError(
                         "cuda_graph was requested but make_graphed_train_callable "
@@ -507,7 +513,12 @@ def pretrain_next_token(
                     # the element budget; identical loss otherwise). The graphed
                     # forward is captured in `graph_call`; the loss stays outside
                     # capture, so this does not change the graph.
-                    loss = chunked_cross_entropy_from_logits(graph_call(inputs), targets)
+                    if has_component_terms:
+                        component_result = train_model(inputs, with_terms=True)
+                        loss = chunked_cross_entropy_from_logits(component_result.value, targets)
+                        loss = loss + sum(component_result.loss_terms)
+                    else:
+                        loss = chunked_cross_entropy_from_logits(graph_call(inputs), targets)
                 local_loss = loss.detach()
                 scaled = loss / config.grad_accum_steps
                 if scaler is None:
@@ -526,11 +537,7 @@ def pretrain_next_token(
                     scaler.unscale_(optimizer)
                 if config.clip_grad_norm > 0:
                     clip_grad_norm(train_model, config.clip_grad_norm)
-                if scaler is None:
-                    optimizer.step()
-                else:
-                    scaler.step(optimizer)
-                    scaler.update()
+                apply_optimizer_step(model, optimizer, scaler=scaler)
                 optimizer.zero_grad(set_to_none=True)
                 if accumulator is not None:
                     accumulator.reset()
@@ -543,14 +550,12 @@ def pretrain_next_token(
                 validation is not None
                 and config.val_batches > 0
                 and (config.val_every or config.log_every)
-                and (
-                    step % (config.val_every or config.log_every) == 0
-                    or step == total_steps
-                )
+                and (step % (config.val_every or config.log_every) == 0 or step == total_steps)
             )
             if should_log or should_validate or step == total_steps:
                 last_loss = _mean_across_ranks(local_loss, state)
             if should_validate:
+                assert validation is not None
                 last_validation = _evaluate(
                     train_model,
                     validation,
@@ -611,6 +616,7 @@ def pretrain_next_token(
                         state,
                         step=step,
                         extra=checkpoint_extra,
+                        scaler=scaler,
                     )
 
         final_step = max(start_step, total_steps)
@@ -643,6 +649,7 @@ def pretrain_next_token(
                 state,
                 step=final_step,
                 extra=final_extra,
+                scaler=scaler,
             )
             if final_export is not None:
                 save_distributed_dabsn(

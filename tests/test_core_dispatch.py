@@ -65,9 +65,14 @@ def test_small_model_small_batch_stays_persistent():
 def test_work_floor_boundary_is_configurable():
     # B*H == min_work is inclusive; just under stays persistent.
     assert select_core_backend(4, 1024, requested="auto", min_batch=64, min_work=4096) == "batched"
-    assert select_core_backend(4, 1023, requested="auto", min_batch=64, min_work=4096) == "persistent"
+    assert (
+        select_core_backend(4, 1023, requested="auto", min_batch=64, min_work=4096) == "persistent"
+    )
     # Raising the floor keeps a mid-size shape on the persistent path.
-    assert select_core_backend(4, 2048, requested="auto", min_batch=64, min_work=1 << 20) == "persistent"
+    assert (
+        select_core_backend(4, 2048, requested="auto", min_batch=64, min_work=1 << 20)
+        == "persistent"
+    )
 
 
 def test_explicit_overrides_win():
@@ -94,7 +99,9 @@ def test_explicit_fused_too_wide_routes_to_batched():
     assert select_core_backend(4, 2048, requested="batched_fused") == "batched"
     assert select_core_backend(4, 257, requested="batched_fused") == "batched"
     # The width bound is configurable.
-    assert select_core_backend(4, 300, requested="batched_fused", fused_max_h=512) == "batched_fused"
+    assert (
+        select_core_backend(4, 300, requested="batched_fused", fused_max_h=512) == "batched_fused"
+    )
 
 
 def test_auto_selects_fused_when_width_safe_and_work_floor_cleared():

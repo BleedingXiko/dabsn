@@ -78,3 +78,40 @@ def test_core_carried_state_matches_one_full_sequence() -> None:
             rtol=1e-5,
             atol=1e-6,
         )
+
+
+def test_core_registered_path_matches_retained_reference_forward_and_backward() -> None:
+    torch.manual_seed(17)
+    registered = DABSNCore(input_dim=5, hidden_dim=6)
+    reference = DABSNCore(input_dim=5, hidden_dim=6)
+    reference.load_state_dict(registered.state_dict())
+    actual_inputs = torch.randn(2, 4, 5, requires_grad=True)
+    expected_inputs = actual_inputs.detach().clone().requires_grad_(True)
+
+    actual, actual_state = registered.forward_from_state(
+        actual_inputs,
+        return_writes=True,
+        return_cocktail=True,
+        return_final_state=True,
+    )
+    expected, expected_state = reference._reference_forward_from_state(
+        expected_inputs,
+        return_writes=True,
+        return_cocktail=True,
+        return_final_state=True,
+    )
+    for observed, wanted in zip((*actual, *actual_state), (*expected, *expected_state)):
+        torch.testing.assert_close(observed, wanted, rtol=1e-5, atol=1e-6)
+
+    sum(tensor.square().mean() for tensor in (*actual, *actual_state)).backward()
+    sum(tensor.square().mean() for tensor in (*expected, *expected_state)).backward()
+    torch.testing.assert_close(actual_inputs.grad, expected_inputs.grad, rtol=2e-5, atol=2e-5)
+    for actual_parameter, expected_parameter in zip(
+        registered.parameters(), reference.parameters()
+    ):
+        torch.testing.assert_close(
+            actual_parameter.grad,
+            expected_parameter.grad,
+            rtol=2e-5,
+            atol=2e-5,
+        )

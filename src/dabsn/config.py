@@ -27,9 +27,7 @@ def _validate_middle_mlp(
     if int(dabsn_depth) < 2:
         raise ValueError("mlp_middle_depth requires at least two DABSN blocks")
     if not 0 <= int(mlp_depth_index) < int(dabsn_depth) - 1:
-        raise ValueError(
-            "mlp_depth_index must select a DABSN block before the final block"
-        )
+        raise ValueError("mlp_depth_index must select a DABSN block before the final block")
 
 
 @dataclass(frozen=True)
@@ -82,8 +80,7 @@ def parse_dabsn_layer_specs(spec: str | Sequence[object] | None) -> list[DABSNLa
             fields = [item.strip() for item in part.split(":")]
             if len(fields) not in {2, 3}:
                 raise ValueError(
-                    "compact DABSN layer specs must be geometry:hidden[:state], "
-                    f"got {part!r}"
+                    f"compact DABSN layer specs must be geometry:hidden[:state], got {part!r}"
                 )
             layers.append(
                 DABSNLayerSpec(
@@ -130,7 +127,9 @@ def resolve_layer_geometries(
     if layer_geometries is None or layer_geometries == "":
         pattern = ["seq"]
     elif isinstance(layer_geometries, str):
-        pattern = [part.strip() for part in layer_geometries.replace(",", " ").split() if part.strip()]
+        pattern = [
+            part.strip() for part in layer_geometries.replace(",", " ").split() if part.strip()
+        ]
     else:
         pattern = [str(part).strip() for part in layer_geometries if str(part).strip()]
     if not pattern:
@@ -269,6 +268,7 @@ class DABSNPretrainConfig:
     seed: int = 0
     precision: str = "auto"
     distributed: str = "fsdp"
+    parallel_axes: tuple[str, ...] = ()
     grad_checkpoint: bool = True
     grad_accum_steps: int = 4
     cuda_graph: bool = False
@@ -309,8 +309,24 @@ class DABSNPretrainConfig:
             raise ValueError("val_fraction must be in [0, 0.5)")
         if not 0.0 <= self.min_lr_ratio <= 1.0:
             raise ValueError("min_lr_ratio must be in [0, 1]")
-        if self.distributed not in {"none", "ddp", "fsdp"}:
-            raise ValueError("distributed must be none, ddp, or fsdp")
+        if self.distributed not in {"none", "ddp", "fsdp", "fsdp2"}:
+            raise ValueError("distributed must be none, ddp, fsdp, or fsdp2")
+        axis_names = []
+        for declaration in self.parallel_axes:
+            if not isinstance(declaration, str) or declaration.count("=") != 1:
+                raise ValueError("parallel_axes entries must use name=size")
+            name, raw_size = (part.strip() for part in declaration.split("=", 1))
+            if not name or not raw_size:
+                raise ValueError("parallel_axes entries must use name=size")
+            try:
+                size = int(raw_size)
+            except ValueError as exc:
+                raise ValueError(f"parallel axis {name!r} size must be an integer") from exc
+            if size <= 0:
+                raise ValueError(f"parallel axis {name!r} size must be positive")
+            axis_names.append(name)
+        if len(axis_names) != len(set(axis_names)):
+            raise ValueError("parallel_axes names must be unique")
         if self.precision not in {"auto", "fp32", "fp16", "bf16"}:
             raise ValueError("precision must be auto, fp32, fp16, or bf16")
         if self.mlp_ratio is not None and float(self.mlp_ratio) <= 0:
@@ -344,5 +360,6 @@ class DABSNPretrainConfig:
         data = asdict(self)
         data["layers"] = [spec.to_metadata() for spec in self.layer_specs()]
         data["eval_contexts"] = list(self.eval_contexts)
+        data["parallel_axes"] = list(self.parallel_axes)
         data["objective"] = "next-token"
         return data

@@ -5,9 +5,17 @@ import pytest
 import torch
 from safetensors.torch import load_file
 
-from dabsn import DABSNLayerSpec, DABSNModel, inspect_dabsn, load_dabsn, save_dabsn
+from dabsn import (
+    DABSNLayerSpec,
+    DABSNModel,
+    inspect_dabsn,
+    load_dabsn,
+    load_graph,
+    save_dabsn,
+)
 from dabsn.cli import main as cli_main
 from dabsn.config import DABSNPretrainConfig
+from dabsn.distributed import inspect_sharded_training_checkpoint
 from dabsn.pretrain import pretrain_next_token
 
 
@@ -17,14 +25,126 @@ def _model_config(path):
             {
                 "input_dim": 4,
                 "out_dim": 3,
-                "layers": [
-                    {"hidden_dim": 7, "state_dim": 6, "read_geometry": "seq"}
-                ],
+                "layers": [{"hidden_dim": 7, "state_dim": 6, "read_geometry": "seq"}],
                 "output_adapter": "token",
             }
         ),
         encoding="utf-8",
     )
+
+
+def _graph_config(path):
+    path.write_text(
+        json.dumps(
+            {
+                "model_kind": "graph",
+                "components": [
+                    {
+                        "component_id": "dabsn.0",
+                        "provider_key": "dabsn:block",
+                        "config": {
+                            "input_dim": 4,
+                            "hidden_dim": 4,
+                            "state_dim": 6,
+                            "read_geometry": "seq",
+                            "residual": True,
+                        },
+                    },
+                    {
+                        "component_id": "mlp.0",
+                        "provider_key": "dabsn:residual_mlp",
+                        "config": {"dim": 4, "ratio": 2.0},
+                    },
+                ],
+                "require_world_builder": True,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def test_cli_trains_and_reloads_raw_graph_from_json(tmp_path):
+    config = tmp_path / "graph.json"
+    data = tmp_path / "graph-data.pt"
+    output = tmp_path / "graph.safetensors"
+    _graph_config(config)
+    torch.save(
+        {
+            "inputs": torch.randn(2, 5, 4),
+            "targets": torch.randn(2, 5, 4),
+        },
+        data,
+    )
+    assert (
+        cli_main(
+            [
+                "train",
+                "--config",
+                str(config),
+                "--data",
+                str(data),
+                "--output",
+                str(output),
+                "--backend",
+                "reference",
+                "--steps",
+                "1",
+            ]
+        )
+        == 0
+    )
+    assert inspect_dabsn(output)["config"]["model_kind"] == "graph"
+    restored = load_graph(output)
+    assert restored(torch.randn(2, 3, 4)).shape == (2, 3, 4)
+    assert (tmp_path / "graph.safetensors.optimizer.pt").is_file()
+
+
+def test_cli_sharded_graph_resume_and_portable_final_export(tmp_path):
+    config = tmp_path / "graph.json"
+    data = tmp_path / "graph-data.pt"
+    checkpoint = tmp_path / "graph-training"
+    final = tmp_path / "graph-final.safetensors"
+    _graph_config(config)
+    torch.save(
+        {
+            "inputs": torch.randn(2, 5, 4),
+            "targets": torch.randn(2, 5, 4),
+        },
+        data,
+    )
+    base = [
+        "train",
+        "--config",
+        str(config),
+        "--data",
+        str(data),
+        "--output",
+        str(checkpoint),
+        "--backend",
+        "reference",
+        "--checkpoint-mode",
+        "sharded",
+    ]
+    assert cli_main([*base, "--steps", "1"]) == 0
+    manifest = inspect_sharded_training_checkpoint(checkpoint)
+    assert manifest["config"]["model_kind"] == "graph"
+    assert manifest["providers"] == ["dabsn:block", "dabsn:residual_mlp"]
+    assert (
+        cli_main(
+            [
+                *base,
+                "--steps",
+                "2",
+                "--resume",
+                "--final-export",
+                str(final),
+            ]
+        )
+        == 0
+    )
+    assert inspect_sharded_training_checkpoint(checkpoint)["step"] == 2
+    restored = load_graph(final)
+    assert restored(torch.randn(2, 3, 4)).shape == (2, 3, 4)
 
 
 def test_checkpoint_is_atomic_self_describing_safetensors(tmp_path):
@@ -67,21 +187,24 @@ def test_finetune_means_weights_in_new_optimizer_run(tmp_path):
     )
     save_dabsn(model, source)
     source_before = source.read_bytes()
-    assert cli_main(
-        [
-            "finetune",
-            "--checkpoint",
-            str(source),
-            "--data",
-            str(data),
-            "--output",
-            str(output),
-            "--backend",
-            "reference",
-            "--steps",
-            "1",
-        ]
-    ) == 0
+    assert (
+        cli_main(
+            [
+                "finetune",
+                "--checkpoint",
+                str(source),
+                "--data",
+                str(data),
+                "--output",
+                str(output),
+                "--backend",
+                "reference",
+                "--steps",
+                "1",
+            ]
+        )
+        == 0
+    )
     assert source.read_bytes() == source_before
     metadata = inspect_dabsn(output)["extra"]
     assert metadata["step"] == 1

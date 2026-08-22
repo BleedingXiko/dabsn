@@ -57,12 +57,12 @@ class ChunkedLinearCrossEntropy(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(  # type: ignore[override]
+    def forward(
         ctx,
-        hidden: Tensor,       # [N, H] (already flattened)
-        weight: Tensor,       # [V, H]
+        hidden: Tensor,  # [N, H] (already flattened)
+        weight: Tensor,  # [V, H]
         bias: Tensor | None,  # [V] or None
-        targets: Tensor,      # [N] int64
+        targets: Tensor,  # [N] int64
         chunk_rows: int,
         ignore_index: int,
     ) -> Tensor:
@@ -95,7 +95,7 @@ class ChunkedLinearCrossEntropy(torch.autograd.Function):
         return loss_sum / denom
 
     @staticmethod
-    def backward(ctx, grad_output):  # type: ignore[override]
+    def backward(ctx, grad_output):
         hidden, weight, bias, targets, denom = ctx.saved_tensors
         chunk_rows = ctx.chunk_rows
         ignore_index = ctx.ignore_index
@@ -117,7 +117,9 @@ class ChunkedLinearCrossEntropy(torch.autograd.Function):
             probs = torch.softmax(logits_c, dim=-1)
             # d/dlogit CE = softmax - onehot(target), masked for ignore_index.
             probs.scatter_add_(
-                -1, safe_tgt.unsqueeze(-1), -torch.ones_like(safe_tgt, dtype=probs.dtype).unsqueeze(-1)
+                -1,
+                safe_tgt.unsqueeze(-1),
+                -torch.ones_like(safe_tgt, dtype=probs.dtype).unsqueeze(-1),
             )
             probs = probs * valid.to(probs.dtype).unsqueeze(-1) * scale
             # grad wrt hidden chunk: probs @ weight, cast back to hidden dtype.

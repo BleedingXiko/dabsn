@@ -31,7 +31,11 @@ def _inputs(batch, steps, hidden, *, seed):
 
 def _clone_inputs(inputs):
     return {
-        key: (value.detach().clone().requires_grad_(value.requires_grad) if torch.is_tensor(value) else value)
+        key: (
+            value.detach().clone().requires_grad_(value.requires_grad)
+            if torch.is_tensor(value)
+            else value
+        )
         for key, value in inputs.items()
     }
 

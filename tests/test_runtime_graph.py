@@ -6,7 +6,6 @@ parity, gradient-accumulation replay across microbatches, and optimiser-update
 parity -- the guarantees that make the helper safe for cluster-scale training.
 """
 
-import copy
 import os
 
 import pytest
@@ -99,9 +98,7 @@ def test_cpu_passthrough_still_trains_normally():
     graphed = make_graphed_train_callable(model, (torch.randn(2, 6, 5),))
     out = graphed(torch.randn(2, 6, 5))
     out.float().square().mean().backward()
-    assert any(
-        p.grad is not None and torch.isfinite(p.grad).all() for p in model.parameters()
-    )
+    assert any(p.grad is not None and torch.isfinite(p.grad).all() for p in model.parameters())
 
 
 def test_empty_sample_args_returns_module_unchanged():
@@ -110,9 +107,7 @@ def test_empty_sample_args_returns_module_unchanged():
 
 
 @pytest.mark.parametrize("initial", [None, "0", "1"])
-def test_outer_graph_build_exclusively_owns_capture_and_restores_policy(
-    monkeypatch, initial
-):
+def test_outer_graph_build_exclusively_owns_capture_and_restores_policy(monkeypatch, initial):
     from dabsn.runtime.graph import _suspend_nested_scan_graphs
 
     if initial is None:
@@ -167,9 +162,7 @@ def test_cuda_loss_and_gradient_parity():
 
     assert eager_grads.keys() == graph_grads.keys()
     for name, expected in eager_grads.items():
-        torch.testing.assert_close(
-            graph_grads[name], expected, rtol=_XPATH_RTOL, atol=_XPATH_ATOL
-        )
+        torch.testing.assert_close(graph_grads[name], expected, rtol=_XPATH_RTOL, atol=_XPATH_ATOL)
 
 
 @requires_cuda

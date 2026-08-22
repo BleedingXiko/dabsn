@@ -122,9 +122,7 @@ def test_incremental_decode_matches_one_pass():
     memory = ingest(model, context, chunk_size=8)
     steps = []
     for index in range(tail.shape[1]):
-        logits, memory = forward_with_memory(
-            model, tail[:, index : index + 1], memory, extend=True
-        )
+        logits, memory = forward_with_memory(model, tail[:, index : index + 1], memory, extend=True)
         steps.append(logits)
 
     assert torch.allclose(torch.cat(steps, dim=1), reference, atol=1e-5, rtol=1e-4)
@@ -204,9 +202,7 @@ def test_rejects_memory_from_another_architecture(tmp_path):
     ("residual", "mlp_ratio"),
     [(True, None), (False, 2.0), (True, 2.0)],
 )
-def test_rejects_memory_with_different_residual_mlp_architecture(
-    residual, mlp_ratio
-):
+def test_rejects_memory_with_different_residual_mlp_architecture(residual, mlp_ratio):
     memory = ingest(build_model(), token_ids())
     other = DABSNSequenceLM(
         vocab=VOCAB,
@@ -249,9 +245,7 @@ def test_memory_cost_matches_reality():
     memory = ingest(model, token_ids())
     predicted = memory_cost(model, TOKENS, batch_size=BATCH)["total_bytes"]
     banked = sum(
-        t.numel() * t.element_size()
-        for layer in memory.layers
-        for t in layer.bank.values()
+        t.numel() * t.element_size() for layer in memory.layers for t in layer.bank.values()
     )
     assert predicted == banked
 
@@ -263,7 +257,7 @@ def test_empty_memory_reports_zero():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA parity gate")
 def test_cuda_carry_matches_cpu_and_dense():
-    """The compact CUDA read takes ``_compact_bank_idx = bank_idx - query_start``,
+    """The compact CUDA read takes ``bank_idx - query_start`` explicitly,
     which is NEGATIVE for bank entries before the query window -- the carry case
     -- and a ``total_T`` equal to the query length while the bank is longer.
     Nothing exercised that until carry existed. This is that gate.
@@ -281,7 +275,5 @@ def test_cuda_carry_matches_cpu_and_dense():
     split, _ = forward_with_memory(model, ids[:, 32:], memory)
     assert torch.allclose(split, reference[:, 32:], atol=1e-3, rtol=1e-2)
 
-    cpu_logits, _ = forward_with_memory(
-        build_model().cpu(), ids.cpu(), chunk_size=8, extend=True
-    )
+    cpu_logits, _ = forward_with_memory(build_model().cpu(), ids.cpu(), chunk_size=8, extend=True)
     assert torch.allclose(logits.cpu(), cpu_logits, atol=1e-2, rtol=1e-2)

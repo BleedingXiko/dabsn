@@ -8,8 +8,6 @@ from __future__ import annotations
 
 import logging
 
-import pytest
-
 from dabsn.runtime.dispatch import (
     log_routing_once,
     reset_routing_log,
