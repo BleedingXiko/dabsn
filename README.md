@@ -341,37 +341,157 @@ bias after real optimizer steps. Routing returns expert counts and shares,
 balance entropy, cold-expert count, busiest and quietest share, selected
 confidence, and output-norm differentiation.
 
+#### What a routed item is
+
+Read this before sizing anything. The component flattens **every leading axis**
+and routes each hidden vector independently:
+
+```
+value in    [B, T, H]        the world at every position
+flatten     [B*T, H]         N = B*T routed items, one per position
+router      [N, K] indices   each item picks its own top_k experts
+experts     [N, H] -> [N, H] every expert sees items, never a batch or a sequence
+scatter     [B, T, H]        weighted sum back into the original shape
+```
+
+The count that matters is `B * T * top_k`, and it is large: a batch of 8 over a
+512-position window with `top_k=2` is 4,096 routed items and 8,192 expert calls
+in a single forward. An expert whose cost looks fine once is called thousands of
+times. Size experts against `N`, never against the batch.
+
+`H` is the only axis an expert sees. There is no time axis inside an expert and
+there cannot be one: routing is per position, so an item is one complete
+`H`-world, already causal because DABSN built it that way upstream. An expert
+that wants an internal sequence has to make one out of `H` itself.
+
+#### The expert contract
+
 The built-in `inner_dim` experts are grouped ReLU-squared MLPs. **An expert does
 not have to be an MLP.** Replace `inner_dim` with `expert_specs` — one provider
 spec per expert — and an expert becomes any registered component: an attention
-block, a whole transformer, a CNN, another MoE, or your own module. Mixing kinds
-within one group is just mixing entries in the list.
+block, a whole transformer, a CNN, another MoE, or your own module.
+
+An expert provider must declare the **routed-item** contract, two axes, not the
+three-axis world contract that graph-level components use:
+
+```python
+from dabsn.components import AxisContract, ComponentContract, ValueContract
+
+def routed_item(width: int) -> ValueContract:
+    return ValueContract.tensor(
+        AxisContract("dabsn:routed_item", "N", dynamic=True),
+        AxisContract("world", width),
+    )
+
+class AttentionExpertProvider:
+    provider_key = "yourpkg.attention_expert"
+    component_abi_version = 2
+    config_schema_version = 1
+    capabilities = ComponentCapabilities(eager=True, amp_bf16=True, amp_fp32=True)
+
+    def validate_config(self, config):
+        if int(config["width"]) <= 0:
+            raise ValueError("width must be positive")
+
+    def contract(self, config):
+        item = routed_item(int(config["width"]))
+        return ComponentContract(item, item)     # [N, H] in, [N, H] out
+
+    def build(self, config, context):
+        return AttentionExpert(int(config["width"]), int(config["d_model"]))
+
+    def migrate_config(self, old_version, config):
+        return dict(config)
+```
+
+**The graph-level built-ins are not usable as experts.** `dabsn:block` and
+`dabsn:residual_mlp` declare `[batch, experience, world]`, three axes, so
+`expert_specs` rejects them:
+
+```
+ValueError: expert 0 contract must preserve routed [N,H] worlds;
+input=('leaf 0 rank expected 2, received 3',)
+```
+
+That is the contract system working. A component built to consume a sequence of
+worlds is not a component that consumes one world, and silently reinterpreting
+the axes would be the bug. If you want a ReLU-squared MLP as one entry in a
+mixed matrix, write a routed-item provider for it — `expert_specs` is
+all-or-nothing, so the built-in grouped MLP is unavailable the moment you use it.
 
 ```python
 attention = {
-    "provider_key": "yourpkg.attention", "provider_distribution": "yourpkg",
+    "provider_key": "yourpkg.attention_expert", "provider_distribution": "yourpkg",
     "provider_version": "1.0.0", "component_abi_version": 2,
     "config_schema_version": 1,
-    "config": {"width": 768, "heads": 12},
+    "config": {"width": 768, "d_model": 512},
 }
 mlp = {
-    "provider_key": "dabsn:residual_mlp", "provider_distribution": "dabsn",
-    "provider_version": dabsn_version, "component_abi_version": 2,
+    "provider_key": "yourpkg.mlp_expert", "provider_distribution": "yourpkg",
+    "provider_version": "1.0.0", "component_abi_version": 2,
     "config_schema_version": 1,
-    "config": {"dim": 768, "ratio": 4.0},
+    "config": {"width": 768, "inner": 3072},
 }
 
 ComponentSpec("moe.0", "dabsn:sparse_moe", {
     "hidden_dim": 768, "experts": 4, "top_k": 2,
     "router": "switch", "balance_coefficient": 0.01,
-    "expert_specs": [attention, mlp, attention, mlp],   # heterogeneous
+    "expert_specs": [mlp, attention, mlp, attention],   # heterogeneous
 })
 ```
 
 Those specs are the checkpoint. A model whose experts are half attention and
 half MLP saves and reloads through the ordinary path, because the loader
 rebuilds each expert from its provider key rather than from a hardcoded list of
-architectures DABSN knows about.
+architectures DABSN knows about. Loading it requires naming those providers in
+`trusted_providers`, because reconstruction runs their code.
+
+#### Costs you inherit by mixing kinds
+
+- **The fused path is gone.** With `inner_dim`, all experts are one
+  `torch._grouped_mm` over stacked weights. One grouped matmul cannot run an MLP
+  and an attention block, so `expert_specs` dispatches with a per-expert loop.
+  Correct, and slower per expert than the homogeneous path.
+- **Output dtype is the group's problem, not yours.** Under autocast an expert
+  returns the autocast dtype while routed items are still the master dtype.
+  `GenericExpertGroup` casts each result to the output buffer before scattering,
+  so an expert may return bf16 from an fp32 input without a dtype error.
+
+#### The balance coefficient is not the Switch paper's
+
+`switch` routing computes `coefficient * E * sum(dispatch_share * prob_share)`,
+where **`dispatch_share` sums to 1** — the one-hot assignments are averaged over
+`N * K`, not over `N`. Many hand-written implementations average over `N`, which
+makes their shares sum to `top_k`.
+
+Same formula, a factor of `top_k` apart, on identical logits:
+
+| | sum of dispatch share | balance term |
+| --- | ---: | ---: |
+| averaged over `N * K` (this component) | 1.0 | `x` |
+| averaged over `N` (common variant) | `top_k` | `top_k * x` |
+
+So a coefficient carried over from an `N`-averaged implementation applies
+`1 / top_k` of the pressure it did there. Multiply by `top_k` when porting one,
+or tune it here directly. The `cold_experts` and `busiest_share` reports are what
+tell you whether the value you chose is doing anything.
+
+#### Do not compile a sparse MoE body
+
+Routing is data-dependent: which expert runs, and on how many items, is known
+only at runtime. Every routed expert is therefore its own graph break. With a
+`expert_specs` matrix the component declares `compile_fullgraph=False` and
+`cuda_graph=False`, and the conformance report says so rather than claiming
+otherwise.
+
+Wrapping such a body in `torch.compile` anyway does not fail — it graph-breaks.
+What it costs is compilation time proportional to the number of experts, spent
+producing graphs that need not be faster than eager. Measure before assuming it
+helps; on a many-expert body it usually does not.
+
+Run the MoE body eager. The DABSN scan keeps its own internal CUDA graphs
+regardless, which is where the recurrence speed comes from — you are not giving
+that up.
 
 Routing granularity is explicit component configuration. The built-in component
 routes individual hidden vectors; structure-native routing belongs to a provider
@@ -398,6 +518,12 @@ dynamic axes, whole-graph compile, export, AMP, streaming state, determinism,
 FSDP wrapping. A capability the provider does not claim is reported as a skip,
 never as a pass. Loading a checkpoint that names a third-party provider requires
 passing it in `trusted_providers`, because reconstruction runs its code.
+
+The conformance runner derives the shape it expects from your declared contract,
+including `AxisEffect.COLLAPSE`: an axis marked collapsed is expected to come
+back with length one. Declare the effect on any axis your component reduces, or
+the shape checks will expect the input length and fail a component that is
+behaving correctly.
 
 Note that data-dependent dispatch — sparse routing, where per-expert counts are
 known only at runtime — cannot be traced whole-graph or exported. That is a
