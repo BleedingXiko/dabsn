@@ -7,6 +7,8 @@ from types import SimpleNamespace
 import torch
 from torch import Tensor
 
+from dabsn._torch_compat import register_custom_op_autocast
+
 from .admitted import (
     _admitted_three_way_read_backward,
     _admitted_three_way_read_op,
@@ -479,7 +481,7 @@ torch.library.register_autograd(
     _compact_dense_backward,
     setup_context=_compact_dense_setup,
 )
-torch.library.register_autocast(
+register_custom_op_autocast(
     _admitted_three_way_read_compact_dense_op,
     "cpu",
     torch.bfloat16,

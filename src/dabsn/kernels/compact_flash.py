@@ -8,6 +8,8 @@ from typing import Any, cast
 import torch
 from torch import Tensor
 
+from dabsn._torch_compat import register_custom_op_autocast
+
 from .compact_admitted import _compact_dense_backward, _compact_dense_forward
 
 _REFERENCE_SCORE_BUDGET = 8_388_608
@@ -294,7 +296,7 @@ torch.library.register_autograd(
     _compact_flash_backward,
     setup_context=_compact_flash_setup,
 )
-torch.library.register_autocast(_compact_flash_op, "cpu", torch.bfloat16)
+register_custom_op_autocast(_compact_flash_op, "cpu", torch.bfloat16)
 
 
 @torch.library.register_vmap(_compact_flash_op)

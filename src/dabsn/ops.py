@@ -5,6 +5,8 @@ from __future__ import annotations
 import torch
 from torch import Tensor
 
+from ._torch_compat import register_custom_op_autocast
+
 
 @torch.library.custom_op("dabsn::stable_expert_permutation", mutates_args=())
 def stable_expert_permutation(
@@ -56,7 +58,7 @@ def _weighted_scatter_add_fake(
 
 
 def _weighted_scatter_setup(ctx, inputs, output):
-    values, item_indices, weights, output_items = inputs
+    values, item_indices, weights, _output_items = inputs
     ctx.save_for_backward(values, item_indices, weights)
 
 
@@ -100,8 +102,8 @@ def _weighted_scatter_add_vmap(info, in_dims, values, item_indices, weights, out
 
 
 # Autocast policy is explicit: preserve the active low-precision compute lane.
-torch.library.register_autocast(weighted_scatter_add, "cuda", torch.float16)
-torch.library.register_autocast(weighted_scatter_add, "cpu", torch.bfloat16)
+register_custom_op_autocast(weighted_scatter_add, "cuda", torch.float16)
+register_custom_op_autocast(weighted_scatter_add, "cpu", torch.bfloat16)
 
 
 __all__ = ["stable_expert_permutation", "weighted_scatter_add"]

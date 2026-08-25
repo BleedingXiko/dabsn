@@ -5,6 +5,8 @@ from __future__ import annotations
 import torch
 from torch import Tensor
 
+from dabsn._torch_compat import register_custom_op_autocast
+
 
 def _masked_softmax(scores: Tensor, allow: Tensor, eligible: Tensor) -> Tensor:
     masked = scores.masked_fill(~allow, float("-inf"))
@@ -620,12 +622,12 @@ torch.library.register_autograd(
     _admitted_three_way_read_native_backward,
     setup_context=_admitted_three_way_read_native_setup,
 )
-torch.library.register_autocast(
+register_custom_op_autocast(
     _admitted_three_way_read_op,
     "cpu",
     torch.bfloat16,
 )
-torch.library.register_autocast(
+register_custom_op_autocast(
     _admitted_three_way_read_native_op,
     "cpu",
     torch.bfloat16,
