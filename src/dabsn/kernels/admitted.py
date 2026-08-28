@@ -46,6 +46,27 @@ def _read_crossover_calibration_bytes(
     return int(value_elements * value_bytes + index_bytes + mask_bytes + score_bytes)
 
 
+def _read_crossover_should_measure(
+    dtype: torch.dtype,
+    bank_entries: int,
+    hidden: int,
+    *,
+    max_bytes: int,
+    free_bytes: int | None = None,
+) -> bool:
+    """Whether synthetic read calibration fits both absolute and live budgets."""
+    max_bytes = int(max_bytes)
+    if max_bytes <= 0:
+        raise ValueError("calibration max_bytes must be positive")
+    budget = max_bytes
+    if free_bytes is not None:
+        free_bytes = int(free_bytes)
+        if free_bytes < 0:
+            raise ValueError("calibration free_bytes must be non-negative")
+        budget = min(budget, max(free_bytes // 4, 1))
+    return _read_crossover_calibration_bytes(dtype, bank_entries, hidden) <= budget
+
+
 def _frontpack_admitted_bank(
     memory_key: Tensor,
     write_memory: Tensor,

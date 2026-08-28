@@ -1,8 +1,13 @@
 from __future__ import annotations
 
+import pytest
 import torch
 
-from dabsn.kernels.admitted import _frontpack_admitted_bank
+from dabsn.kernels.admitted import (
+    _frontpack_admitted_bank,
+    _read_crossover_calibration_bytes,
+    _read_crossover_should_measure,
+)
 
 
 def _inputs(
@@ -173,3 +178,46 @@ def test_fake_tensor_keeps_value_oblivious_gather_path():
         actual = _frontpack_admitted_bank(*inputs)
 
     assert any(observed is not source for observed, source in zip(actual, inputs, strict=True))
+
+
+def test_large_bank_skips_oversized_synthetic_crossover_calibration():
+    estimate = _read_crossover_calibration_bytes(torch.bfloat16, 524_288, 4096)
+
+    assert estimate > 100 * 2**30
+    assert not _read_crossover_should_measure(
+        torch.bfloat16,
+        524_288,
+        4096,
+        max_bytes=512 * 2**20,
+        free_bytes=12 * 2**30,
+    )
+
+
+def test_normal_bank_keeps_bounded_crossover_calibration():
+    estimate = _read_crossover_calibration_bytes(torch.bfloat16, 2048, 768)
+
+    assert estimate < 512 * 2**20
+    assert _read_crossover_should_measure(
+        torch.bfloat16,
+        2048,
+        768,
+        max_bytes=512 * 2**20,
+        free_bytes=8 * 2**30,
+    )
+
+
+def test_runtime_skips_measurement_for_oversized_bank(monkeypatch):
+    runtime = pytest.importorskip("dabsn.kernels.triton_runtime")
+    runtime._READ_CROSSOVER_CACHE.clear()
+    monkeypatch.delenv("DABSN_DENSE_CROSSOVER", raising=False)
+    monkeypatch.delenv("DABSN_READ_CALIBRATION_MAX_BYTES", raising=False)
+
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("oversized crossover calibration must not run")
+
+    monkeypatch.setattr(runtime, "measure_read_crossover", fail_if_called)
+    crossover = runtime._read_crossover_for(
+        torch.device("cpu"), torch.bfloat16, 524_288, 4096, "tf32x3", "exact"
+    )
+
+    assert crossover == float("inf")

@@ -11,7 +11,7 @@ import triton
 import triton.language as tl
 from torch import Tensor
 
-from .admitted import _frontpack_admitted_bank
+from .admitted import _frontpack_admitted_bank, _read_crossover_should_measure
 
 
 def _device_default_chunk_config() -> dict:
@@ -4325,7 +4325,7 @@ def measure_read_crossover(
 
     _prev_prec = _os.environ.get("DABSN_FLASH_PREC")
     _os.environ["DABSN_FLASH_PREC"] = prec
-    crossover = 1.0
+    crossover = float("inf")
     try:
         with torch.no_grad():
             for d in densities:
@@ -4378,7 +4378,31 @@ def _read_crossover_for(
     key = (dev.type, str(dtype), int(N), int(H), prec, mode)
     hit = _READ_CROSSOVER_CACHE.get(key)
     if hit is None:
-        hit = measure_read_crossover(dev, dtype, N, H, prec=prec, mode=mode)
+        absolute_budget = int(
+            _os.environ.get("DABSN_READ_CALIBRATION_MAX_BYTES", str(512 * 1024**2))
+        )
+        if absolute_budget <= 0:
+            raise ValueError("DABSN_READ_CALIBRATION_MAX_BYTES must be positive")
+        free_bytes = None
+        if dev.type == "cuda" and torch.cuda.is_available():
+            try:
+                free_bytes, _total_bytes = torch.cuda.mem_get_info(dev)
+            except RuntimeError:
+                pass
+        should_measure = _read_crossover_should_measure(
+            dtype,
+            N,
+            H,
+            max_bytes=absolute_budget,
+            free_bytes=free_bytes,
+        )
+        if not should_measure:
+            # Both read implementations are exact. Skip an oversized synthetic
+            # benchmark and choose compact flash, whose real DABSN bank is already
+            # prefix-packed and therefore uses the no-copy front-pack path.
+            hit = float("inf")
+        else:
+            hit = measure_read_crossover(dev, dtype, N, H, prec=prec, mode=mode)
         _READ_CROSSOVER_CACHE[key] = hit
     return hit
 
@@ -4406,10 +4430,12 @@ def admitted_three_way_read_dispatch(
     """Forward-only admitted read with density-aware sparse/dense dispatch.
 
     Sparse banks use the count-bounded flash kernel; dense banks use the
-    tensor-core BMM path. The crossover is measured and cached for each device,
-    shape, dtype, precision, and geometry bucket. ``DABSN_DENSE_CROSSOVER`` can
-    pin the threshold and skip calibration. The inference-only routing scalar is
-    a cost heuristic, not a data-dependent tensor shape; training retains the
+    tensor-core BMM path. For bounded shapes, the crossover is measured and
+    cached for each device, shape, dtype, precision, and geometry bucket.
+    Calibration that exceeds the configured or live-memory budget is skipped
+    and exact compact flash is used. ``DABSN_DENSE_CROSSOVER`` can pin the
+    threshold and skip calibration. The inference-only routing scalar is a cost
+    heuristic, not a data-dependent tensor shape; training retains the
     device-side count-bounded path.
     """
     N = memory_key.shape[1]
