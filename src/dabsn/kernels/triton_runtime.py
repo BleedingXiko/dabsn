@@ -11,6 +11,8 @@ import triton
 import triton.language as tl
 from torch import Tensor
 
+from .admitted import _frontpack_admitted_bank
+
 
 def _device_default_chunk_config() -> dict:
     """Per-architecture pinned defaults for the chunked K-tiled kernels.
@@ -3966,35 +3968,6 @@ def admitted_three_way_read_trainable(
         induct_gain,
         cocktail_gain,
     )
-
-
-def _frontpack_admitted_bank(
-    memory_key,
-    write_memory,
-    next_write_memory,
-    memory_cocktail,
-    key_bias,
-    admission_gate,
-    bank_idx,
-    bank_valid,
-):
-    """Move live entries to the front for count-bounded kernel traversal.
-
-    The order comes from a detached mask, while tensor gathers remain tracked by
-    autograd so backward scatters gradients to their original bank positions.
-    Query-side tensors and scalar controls are unchanged.
-    """
-    order = torch.argsort(bank_valid.detach().to(torch.int32), dim=1, descending=True, stable=True)
-    idx = order.unsqueeze(-1)
-    mk = torch.gather(memory_key, 1, idx.expand(-1, -1, memory_key.shape[-1]))
-    wm = torch.gather(write_memory, 1, idx.expand(-1, -1, write_memory.shape[-1]))
-    nwm = torch.gather(next_write_memory, 1, idx.expand(-1, -1, next_write_memory.shape[-1]))
-    mc = torch.gather(memory_cocktail, 1, idx.expand(-1, -1, memory_cocktail.shape[-1]))
-    kb = torch.gather(key_bias, 1, order)
-    ag = torch.gather(admission_gate, 1, order)
-    bi = torch.gather(bank_idx, 1, order)
-    bv = torch.gather(bank_valid, 1, order)
-    return mk, wm, nwm, mc, kb, ag, bi, bv
 
 
 def admitted_three_way_read_compact_trainable(

@@ -4,8 +4,125 @@ from __future__ import annotations
 
 import torch
 from torch import Tensor
+from torch._subclasses.fake_tensor import is_fake
 
 from dabsn._torch_compat import register_custom_op_autocast
+
+
+def _read_crossover_calibration_bytes(
+    dtype: torch.dtype,
+    bank_entries: int,
+    hidden: int,
+    *,
+    query_steps: int | None = None,
+    batch: int = 4,
+) -> int:
+    """Conservative peak-byte estimate for the synthetic CUDA read calibration."""
+    bank_entries = int(bank_entries)
+    hidden = int(hidden)
+    batch = int(batch)
+    if bank_entries < 0 or hidden <= 0 or batch <= 0:
+        raise ValueError("calibration shape requires bank_entries >= 0, hidden > 0, batch > 0")
+    query_steps = int(
+        query_steps if query_steps is not None else max(64, min(bank_entries, 256))
+    )
+    if query_steps <= 0:
+        raise ValueError("calibration query_steps must be positive")
+    value_bytes = torch.empty((), dtype=dtype).element_size()
+
+    # Persistent synthetic inputs plus the compact path's possible front-pack
+    # outputs: query, three full-width banks twice, and width-4/scalar metadata.
+    value_elements = (
+        batch * query_steps * hidden
+        + 6 * batch * bank_entries * hidden
+        + 2 * batch * query_steps * 4
+        + 4 * batch * bank_entries * 4
+    )
+    # Two index banks (input + packed output), validity masks, and conservative
+    # dense score/allow temporaries exercised by the comparison path.
+    index_bytes = 2 * batch * bank_entries * torch.empty((), dtype=torch.int64).element_size()
+    mask_bytes = 2 * batch * bank_entries
+    score_bytes = 16 * batch * query_steps * bank_entries
+    return int(value_elements * value_bytes + index_bytes + mask_bytes + score_bytes)
+
+
+def _frontpack_admitted_bank(
+    memory_key: Tensor,
+    write_memory: Tensor,
+    next_write_memory: Tensor,
+    memory_cocktail: Tensor,
+    key_bias: Tensor,
+    admission_gate: Tensor,
+    bank_idx: Tensor,
+    bank_valid: Tensor,
+) -> tuple[Tensor, ...]:
+    """Front-pack a valid mask without copying an order that is already packed.
+
+    A stable descending sort of a True-prefix mask is the identity.  Ordinary
+    eager execution returns contiguous inputs directly in that case, avoiding
+    redundant full-bank copies during large carried-memory inference.  Compiled
+    and CUDA-graph-captured execution keeps the value-oblivious gather path
+    because inspecting a device mask would introduce a host sync.
+    """
+    tensors = (
+        memory_key,
+        write_memory,
+        next_write_memory,
+        memory_cocktail,
+        key_bias,
+        admission_gate,
+        bank_idx,
+        bank_valid,
+    )
+    compiling = bool(torch.compiler.is_compiling())
+    capturing = False
+    if bank_valid.is_cuda and not compiling:
+        try:
+            capturing = bool(torch.cuda.is_current_stream_capturing())
+        except RuntimeError:
+            # A CUDA runtime without an initialized current stream cannot be
+            # capturing. Preserve the ordinary eager path in that case.
+            capturing = False
+    can_inspect = (
+        not compiling
+        and not capturing
+        and not is_fake(bank_valid)
+        and bank_valid.device.type != "meta"
+        and bank_valid.dtype == torch.bool
+        and bank_valid.ndim == 2
+        and all(tensor.is_contiguous() for tensor in tensors)
+    )
+    if can_inspect:
+        counts = bank_valid.to(torch.int64).sum(dim=1, keepdim=True)
+        positions = torch.arange(bank_valid.shape[1], device=bank_valid.device).unsqueeze(0)
+        if torch.equal(bank_valid, positions < counts):
+            return tensors
+
+    order = torch.argsort(
+        bank_valid.detach().to(torch.int32),
+        dim=1,
+        descending=True,
+        stable=True,
+    )
+    idx = order.unsqueeze(-1)
+    return (
+        torch.gather(memory_key, 1, idx.expand(-1, -1, memory_key.shape[-1])),
+        torch.gather(write_memory, 1, idx.expand(-1, -1, write_memory.shape[-1])),
+        torch.gather(
+            next_write_memory,
+            1,
+            idx.expand(-1, -1, next_write_memory.shape[-1]),
+        ),
+        torch.gather(
+            memory_cocktail,
+            1,
+            idx.expand(-1, -1, memory_cocktail.shape[-1]),
+        ),
+        torch.gather(key_bias, 1, order),
+        torch.gather(admission_gate, 1, order),
+        torch.gather(bank_idx, 1, order),
+        torch.gather(bank_valid, 1, order),
+    )
 
 
 def _masked_softmax(scores: Tensor, allow: Tensor, eligible: Tensor) -> Tensor:
