@@ -77,7 +77,10 @@ def _assert_close(
         atol, rtol = 2.0e-3, 2.0e-3
     else:
         atol, rtol = 3.0e-4, 3.0e-4
-    torch.testing.assert_close(actual, expected, atol=atol, rtol=rtol, msg=label)
+    torch.testing.assert_close(
+        actual, expected, atol=atol, rtol=rtol,
+        msg=lambda detail: f"{label}: {detail}",
+    )
 
 
 def _environment(backend: str) -> dict[str, object]:
@@ -398,6 +401,8 @@ def _model_native_parity(
             raise AssertionError(f"block {index} long read did not route through {expected_long}")
         read_backend = traces[index]["read_contract"]["kernel_backend"]
         if backend == "cuda" and read_backend not in {
+            "registered_dense_bmm_trainable",
+            "registered_compact_flash_trainable",
             "dense_bmm_trainable",
             "compact_flash_trainable",
             "dense_mask_triton_trainable",

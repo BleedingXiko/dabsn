@@ -324,3 +324,141 @@ def test_pretrain_portable_resume_matches_uninterrupted(tmp_path):
     for name in expected:
         torch.testing.assert_close(actual[name], expected[name], atol=0, rtol=0)
     assert inspect_dabsn(resumed)["extra"]["step"] == 2
+
+
+def test_online_pretrain_accumulates_and_portable_resume_is_exact(tmp_path):
+    corpus = tmp_path / "online-tokens.bin"
+    np.asarray(list(range(16)) * 32, dtype=np.uint8).tofile(corpus)
+    common = dict(
+        corpus_bin=str(corpus),
+        corpus_dtype="uint8",
+        vocab=16,
+        hidden_dim=6,
+        depth=1,
+        layer_geometries="seq",
+        state_dim=5,
+        tie_embeddings=False,
+        train_context=4,
+        steps=2,
+        batch_size=2,
+        eval_batch_size=2,
+        val_batches=0,
+        val_fraction=0.0,
+        learning_rate=1e-3,
+        warmup_steps=10,
+        seed=654,
+        precision="fp32",
+        distributed="none",
+        grad_checkpoint=False,
+        grad_accum_steps=1,
+        checkpoint_every=1,
+        log_every=0,
+        val_every=0,
+        temporal_credit="online",
+        temporal_chunk_size=2,
+        temporal_stream_policy="reset_each_batch",
+        eligibility_batch_mode="lane_grouped",
+        eligibility_lane_group_size=1,
+    )
+    uninterrupted = tmp_path / "online-uninterrupted.safetensors"
+    resumed = tmp_path / "online-resumed.safetensors"
+    report = pretrain_next_token(
+        DABSNPretrainConfig(**common),
+        uninterrupted,
+        device="cpu",
+        backend="cpu",
+    )
+    pretrain_next_token(
+        DABSNPretrainConfig(**{**common, "steps": 1}),
+        resumed,
+        device="cpu",
+        backend="cpu",
+    )
+    pretrain_next_token(
+        DABSNPretrainConfig(**common),
+        resumed,
+        device="cpu",
+        backend="cpu",
+        resume=True,
+    )
+
+    assert report["temporal_credit"] == "online"
+    expected = load_file(str(uninterrupted))
+    actual = load_file(str(resumed))
+    for name in expected:
+        torch.testing.assert_close(actual[name], expected[name], atol=0, rtol=0)
+    sidecar = torch.load(
+        str(resumed) + ".optimizer.pt", map_location="cpu", weights_only=False
+    )
+    saved_states = sidecar["training_state"]["online_temporal_states"]
+    assert len(saved_states) == 1
+    assert saved_states[0]["temporal_credit"] == "online"
+    assert load_dabsn(resumed).temporal_credit == "online"
+
+
+def test_online_pretrain_sharded_resume_matches_uninterrupted(tmp_path):
+    corpus = tmp_path / "online-sharded-tokens.bin"
+    np.asarray(list(range(8)) * 24, dtype=np.uint8).tofile(corpus)
+    common = dict(
+        corpus_bin=str(corpus),
+        corpus_dtype="uint8",
+        vocab=8,
+        hidden_dim=4,
+        depth=1,
+        layer_geometries="seq",
+        state_dim=3,
+        tie_embeddings=False,
+        train_context=3,
+        steps=2,
+        batch_size=1,
+        eval_batch_size=1,
+        val_batches=0,
+        val_fraction=0.0,
+        learning_rate=1e-3,
+        warmup_steps=4,
+        seed=777,
+        precision="fp32",
+        distributed="none",
+        grad_checkpoint=False,
+        grad_accum_steps=1,
+        checkpoint_every=1,
+        log_every=0,
+        val_every=0,
+        temporal_credit="online",
+        temporal_chunk_size=1,
+        temporal_stream_policy="reset_each_batch",
+    )
+    uninterrupted = tmp_path / "online-sharded-uninterrupted"
+    resumed = tmp_path / "online-sharded-resumed"
+    uninterrupted_export = tmp_path / "online-sharded-uninterrupted.safetensors"
+    resumed_export = tmp_path / "online-sharded-resumed.safetensors"
+    pretrain_next_token(
+        DABSNPretrainConfig(**common),
+        uninterrupted,
+        device="cpu",
+        backend="cpu",
+        checkpoint_mode="sharded",
+        final_export=uninterrupted_export,
+    )
+    pretrain_next_token(
+        DABSNPretrainConfig(**{**common, "steps": 1}),
+        resumed,
+        device="cpu",
+        backend="cpu",
+        checkpoint_mode="sharded",
+    )
+    pretrain_next_token(
+        DABSNPretrainConfig(**common),
+        resumed,
+        device="cpu",
+        backend="cpu",
+        checkpoint_mode="sharded",
+        final_export=resumed_export,
+        resume=True,
+    )
+
+    expected = load_file(str(uninterrupted_export))
+    actual = load_file(str(resumed_export))
+    assert set(actual) == set(expected)
+    for name in expected:
+        torch.testing.assert_close(actual[name], expected[name], atol=0, rtol=0)

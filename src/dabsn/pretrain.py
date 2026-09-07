@@ -13,7 +13,7 @@ import torch
 import torch.distributed as torch_dist
 from torch import Tensor
 
-from .checkpoint import inspect_dabsn, load_dabsn
+from .checkpoint import build_dabsn_from_checkpoint_config, inspect_dabsn, load_dabsn
 from .config import DABSNPretrainConfig
 from .distributed import (
     autocast_context,
@@ -21,6 +21,7 @@ from .distributed import (
     clip_grad_norm,
     load_distributed_optimizer,
     load_sharded_training_checkpoint,
+    inspect_sharded_training_checkpoint,
     make_grad_scaler,
     no_sync_context,
     optimizer_checkpoint_path,
@@ -34,6 +35,7 @@ from .distributed import (
 from .kernels import enable as enable_kernels
 from .model import DABSNSequenceLM
 from .runtime.api import apply_optimizer_step, verify_gradients
+from .runtime.api import _online_backward_step
 from .runtime.grad_accum import ManualGradientAccumulator
 from .runtime.graph import make_graphed_train_callable
 from .runtime.loss import chunked_cross_entropy_from_logits
@@ -219,6 +221,11 @@ def _validate_model_config(model: DABSNSequenceLM, config: DABSNPretrainConfig) 
         mismatches.append(
             f"mlp_depth_index checkpoint={model.mlp_depth_index} requested={config.mlp_depth_index}"
         )
+    if model.temporal_credit != config.temporal_credit:
+        mismatches.append(
+            "temporal_credit "
+            f"checkpoint={model.temporal_credit} requested={config.temporal_credit}"
+        )
     if mismatches:
         raise ValueError("resume configuration does not match checkpoint: " + "; ".join(mismatches))
 
@@ -285,6 +292,25 @@ def _restore_rng_state(
     rng.bit_generator.state = saved[state.rank]
 
 
+def _gather_online_states(online_state, state) -> list[dict[str, object]]:
+    from .temporal_credit import online_temporal_state_dict
+
+    local = online_temporal_state_dict(online_state)
+    if not state.enabled:
+        return [local]
+    gathered: list[object | None] = [None for _ in range(state.world_size)]
+    torch_dist.all_gather_object(gathered, local)
+    if any(not isinstance(item, dict) for item in gathered):
+        raise RuntimeError("distributed online temporal-state gather returned invalid data")
+    return cast(list[dict[str, object]], gathered)
+
+
+def _local_online_training_state(online_state) -> dict[str, object]:
+    from .temporal_credit import online_temporal_state_dict
+
+    return {"online_temporal_state": online_temporal_state_dict(online_state)}
+
+
 def pretrain_next_token(
     config: DABSNPretrainConfig,
     output: str | Path,
@@ -317,6 +343,11 @@ def pretrain_next_token(
     try:
         if checkpoint_mode not in {"portable", "sharded"}:
             raise ValueError("checkpoint_mode must be portable or sharded")
+        if config.temporal_credit == "online" and config.temporal_stream_policy != "reset_each_batch":
+            raise ValueError(
+                "the random-window pretrainer requires temporal_stream_policy=reset_each_batch; "
+                "carry_lanes is available through the streamed runtime API"
+            )
         selected_backend = state.device.type if backend == "auto" else backend
         kernel_report = enable_kernels(selected_backend, required=True)
         precision = resolve_precision(config.precision, state.device)
@@ -360,6 +391,7 @@ def pretrain_next_token(
                 mlp_ratio=config.mlp_ratio,
                 mlp_middle_depth=config.mlp_middle_depth,
                 mlp_depth_index=config.mlp_depth_index,
+                temporal_credit=config.temporal_credit,
             ).to(state.device)
 
         global_tokens_per_step = config.batch_size * config.train_context * state.data_world_size
@@ -392,6 +424,10 @@ def pretrain_next_token(
         )
         scaler = make_grad_scaler(state, precision)
         start_step = 0
+        restored_training_state: dict[str, object] = {}
+        online_stream_ids = tuple(
+            f"rank-{state.data_rank}:lane-{lane}" for lane in range(config.batch_size)
+        )
         if resume:
             if checkpoint_mode == "portable":
                 restored_step = load_distributed_optimizer(
@@ -400,6 +436,7 @@ def pretrain_next_token(
                     destination,
                     state,
                     scaler=scaler,
+                    training_state=restored_training_state,
                 )
                 if restored_step is None:
                     raise FileNotFoundError(
@@ -408,12 +445,46 @@ def pretrain_next_token(
                     )
                 start_step = restored_step
             else:
+                preview = inspect_sharded_training_checkpoint(destination)
+                preview_config = preview.get("config")
+                if not isinstance(preview_config, dict):
+                    raise ValueError("sharded checkpoint model config must be an object")
+                preview_model = build_dabsn_from_checkpoint_config(preview_config)
+                if not isinstance(preview_model, DABSNSequenceLM):
+                    raise TypeError("pretrain resume requires a DABSNSequenceLM checkpoint")
+                _validate_model_config(preview_model, config)
+
+                def validate_worker_training_state(saved) -> None:
+                    if config.temporal_credit != "online":
+                        return
+                    from .temporal_credit import load_online_temporal_state
+
+                    payload = saved.get("online_temporal_state")
+                    if not isinstance(payload, dict):
+                        raise ValueError("exact online resume requires this worker's temporal state")
+                    load_online_temporal_state(
+                        model,
+                        payload,
+                        device=state.device,
+                        expected_stream_policy=config.temporal_stream_policy,
+                        expected_stream_ids=online_stream_ids,
+                        expected_temporal_chunk_size=(
+                            config.train_context
+                            if config.temporal_chunk_size == 0
+                            else config.temporal_chunk_size
+                        ),
+                        expected_eligibility_batch_mode=config.eligibility_batch_mode,
+                        expected_eligibility_lane_group_size=config.eligibility_lane_group_size,
+                    )
+
                 manifest = load_sharded_training_checkpoint(
                     train_model,
                     optimizer,
                     destination,
                     state,
                     scaler=scaler,
+                    training_state=restored_training_state,
+                    validate_training_state=validate_worker_training_state,
                 )
                 start_step = int(cast(Any, manifest["step"]))
                 raw_extra = manifest.get("extra", {})
@@ -428,6 +499,49 @@ def pretrain_next_token(
                     f"requested final step {total_steps} is before resumed step {start_step}"
                 )
             _restore_rng_state(rng, resume_extra.get("corpus_rng_states"), state)
+
+        online_state = None
+        if config.temporal_credit == "online":
+            from .temporal_credit import (
+                initial_online_temporal_state,
+                load_online_temporal_state,
+            )
+
+            if config.cuda_graph:
+                raise ValueError(
+                    "online temporal credit does not yet support outer CUDA-graph capture"
+                )
+            if resume:
+                saved_states = restored_training_state.get("online_temporal_states")
+                if isinstance(saved_states, list) and len(saved_states) == state.world_size:
+                    saved_online_state = saved_states[state.rank]
+                else:
+                    saved_online_state = restored_training_state.get("online_temporal_state")
+                if not isinstance(saved_online_state, dict):
+                    raise ValueError("exact online resume requires this worker's temporal state")
+                online_state = load_online_temporal_state(
+                    model,
+                    cast(dict[str, object], saved_online_state),
+                    device=state.device,
+                    expected_stream_policy=config.temporal_stream_policy,
+                    expected_stream_ids=online_stream_ids,
+                    expected_temporal_chunk_size=(
+                        config.train_context
+                        if config.temporal_chunk_size == 0
+                        else config.temporal_chunk_size
+                    ),
+                    expected_eligibility_batch_mode=config.eligibility_batch_mode,
+                    expected_eligibility_lane_group_size=config.eligibility_lane_group_size,
+                )
+            else:
+                online_state = initial_online_temporal_state(
+                    model,
+                    config.batch_size,
+                    stream_policy=config.temporal_stream_policy,
+                    stream_ids=online_stream_ids,
+                    device=state.device,
+                    dtype=torch.float32,
+                )
 
         # Optional CUDA-graph capture of the fwd+bwd. Graphs remove the tens of
         # thousands of eager kernel launches the recurrent T-loop issues per
@@ -513,18 +627,43 @@ def pretrain_next_token(
                     # the element budget; identical loss otherwise). The graphed
                     # forward is captured in `graph_call`; the loss stays outside
                     # capture, so this does not change the graph.
-                    if has_component_terms:
+                    if config.temporal_credit == "online":
+                        assert online_state is not None
+                        scale = 1.0 / config.grad_accum_steps
+                        if scaler is not None:
+                            scale *= float(scaler.get_scale())
+                        online_loss, online_state, _ = _online_backward_step(
+                            train_model,
+                            inputs,
+                            targets,
+                            temporal_state=online_state,
+                            temporal_chunk_size=(
+                                config.train_context
+                                if config.temporal_chunk_size == 0
+                                else config.temporal_chunk_size
+                            ),
+                            stream_ids=online_stream_ids,
+                            eligibility_batch_mode=config.eligibility_batch_mode,
+                            eligibility_lane_group_size=config.eligibility_lane_group_size,
+                            loss_scale=scale,
+                            accumulation_position=(
+                                0 if update_boundary else step % config.grad_accum_steps
+                            ),
+                        )
+                        loss = online_loss
+                    elif has_component_terms:
                         component_result = train_model(inputs, with_terms=True)
                         loss = chunked_cross_entropy_from_logits(component_result.value, targets)
                         loss = loss + sum(component_result.loss_terms)
                     else:
                         loss = chunked_cross_entropy_from_logits(graph_call(inputs), targets)
                 local_loss = loss.detach()
-                scaled = loss / config.grad_accum_steps
-                if scaler is None:
-                    scaled.backward()
-                else:
-                    scaler.scale(scaled).backward()
+                if config.temporal_credit != "online":
+                    scaled = loss / config.grad_accum_steps
+                    if scaler is None:
+                        scaled.backward()
+                    else:
+                        scaler.scale(scaled).backward()
             if accumulator is not None:
                 # Each graph replay is an independent single backward; move its
                 # gradients into persistent buffers before the next replay clears
@@ -607,6 +746,11 @@ def pretrain_next_token(
                         step=step,
                         extra=checkpoint_extra,
                         scaler=scaler,
+                        training_state=(
+                            {}
+                            if online_state is None
+                            else {"online_temporal_states": _gather_online_states(online_state, state)}
+                        ),
                     )
                 else:
                     save_sharded_training_checkpoint(
@@ -617,6 +761,11 @@ def pretrain_next_token(
                         step=step,
                         extra=checkpoint_extra,
                         scaler=scaler,
+                        training_state=(
+                            None
+                            if online_state is None
+                            else _local_online_training_state(online_state)
+                        ),
                     )
 
         final_step = max(start_step, total_steps)
@@ -640,6 +789,11 @@ def pretrain_next_token(
                 step=final_step,
                 extra=final_extra,
                 scaler=scaler,
+                training_state=(
+                    {}
+                    if online_state is None
+                    else {"online_temporal_states": _gather_online_states(online_state, state)}
+                ),
             )
         else:
             save_sharded_training_checkpoint(
@@ -650,6 +804,11 @@ def pretrain_next_token(
                 step=final_step,
                 extra=final_extra,
                 scaler=scaler,
+                training_state=(
+                    None
+                    if online_state is None
+                    else _local_online_training_state(online_state)
+                ),
             )
             if final_export is not None:
                 save_distributed_dabsn(
@@ -673,6 +832,7 @@ def pretrain_next_token(
             "tokens_seen": final_step * global_tokens_per_step,
             "final_export": None if final_export is None else str(final_export),
             "cuda_graph": graph_note if config.cuda_graph else None,
+            "temporal_credit": config.temporal_credit,
         }
     except torch.cuda.OutOfMemoryError as exc:
         # Never surface a bare allocator OOM: attach the live shape, allocator

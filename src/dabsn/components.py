@@ -583,9 +583,14 @@ class ComponentCapabilities:
     world_builder: bool = False
     dabsn_memory_owner: bool = False
     deterministic: bool | None = None
+    temporal_credit: str = "unsupported"
     parallel_plan: ParallelPlan | None = None
 
     def __post_init__(self) -> None:
+        if self.temporal_credit not in {"unsupported", "stateless", "dabsn"}:
+            raise ValueError(
+                "temporal_credit capability must be unsupported, stateless, or dabsn"
+            )
         if self.parallel_plan is not None and not self.distributed:
             raise ValueError("a parallel plan requires distributed=True")
         if (

@@ -5,9 +5,24 @@ from __future__ import annotations
 import json
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Mapping, Sequence
+from typing import Literal, Mapping, Sequence, TypeAlias
 
 DABSN_ARCH = "dabsn"
+TemporalCreditMode: TypeAlias = Literal["bptt", "online"]
+TemporalStreamPolicy: TypeAlias = Literal["reset_each_batch", "carry_lanes"]
+EligibilityBatchMode: TypeAlias = Literal["vectorized", "lane_grouped"]
+
+
+def _validate_temporal_credit(value: object) -> None:
+    if value not in {"bptt", "online"}:
+        raise ValueError("temporal_credit must be bptt or online")
+
+
+def _validate_temporal_stream_policy(value: object) -> None:
+    if value not in {"reset_each_batch", "carry_lanes"}:
+        raise ValueError(
+            "temporal_stream_policy must be reset_each_batch or carry_lanes"
+        )
 
 
 def _validate_middle_mlp(
@@ -195,6 +210,7 @@ class DABSNConfig:
     mlp_ratio: float | None = None
     mlp_middle_depth: int = 0
     mlp_depth_index: int = 0
+    temporal_credit: TemporalCreditMode = "bptt"
 
     def __post_init__(self) -> None:
         if self.input_dim <= 0 or self.out_dim <= 0:
@@ -205,6 +221,7 @@ class DABSNConfig:
             raise ValueError("geometry must be seq, field, or hybrid")
         if self.mlp_ratio is not None and float(self.mlp_ratio) <= 0:
             raise ValueError("mlp_ratio must be positive or None")
+        _validate_temporal_credit(self.temporal_credit)
         _validate_middle_mlp(
             mlp_ratio=self.mlp_ratio,
             mlp_middle_depth=self.mlp_middle_depth,
@@ -284,6 +301,11 @@ class DABSNPretrainConfig:
     # Block-time activation chunking: 0 = auto (engage under memory pressure),
     # -1 = force off, >0 = explicit chunk width. Mirrors env DABSN_BLOCK_CHUNK_T.
     block_chunk_t: int = 0
+    temporal_credit: TemporalCreditMode = "bptt"
+    temporal_stream_policy: TemporalStreamPolicy = "reset_each_batch"
+    temporal_chunk_size: int = 0
+    eligibility_batch_mode: EligibilityBatchMode = "vectorized"
+    eligibility_lane_group_size: int | None = None
 
     def __post_init__(self) -> None:
         if bool(self.corpus_bin) == bool(self.corpus_text):
@@ -331,6 +353,24 @@ class DABSNPretrainConfig:
             raise ValueError("precision must be auto, fp32, fp16, or bf16")
         if self.mlp_ratio is not None and float(self.mlp_ratio) <= 0:
             raise ValueError("mlp_ratio must be positive or None")
+        _validate_temporal_credit(self.temporal_credit)
+        _validate_temporal_stream_policy(self.temporal_stream_policy)
+        if int(self.temporal_chunk_size) < 0:
+            raise ValueError("temporal_chunk_size must be non-negative")
+        if self.eligibility_batch_mode not in {"vectorized", "lane_grouped"}:
+            raise ValueError("eligibility_batch_mode must be vectorized or lane_grouped")
+        if self.eligibility_batch_mode == "vectorized":
+            if self.eligibility_lane_group_size is not None:
+                raise ValueError(
+                    "eligibility_lane_group_size requires eligibility_batch_mode=lane_grouped"
+                )
+        elif (
+            self.eligibility_lane_group_size is None
+            or int(self.eligibility_lane_group_size) <= 0
+        ):
+            raise ValueError(
+                "eligibility_lane_group_size must be positive for lane_grouped mode"
+            )
         _validate_middle_mlp(
             mlp_ratio=self.mlp_ratio,
             mlp_middle_depth=self.mlp_middle_depth,

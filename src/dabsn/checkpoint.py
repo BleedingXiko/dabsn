@@ -12,7 +12,7 @@ from typing import Any, Mapping, Sequence, TypedDict, cast
 import torch
 from torch import Tensor
 
-from .config import DABSNConfig, DABSNLayerSpec
+from .config import DABSNConfig, DABSNLayerSpec, TemporalCreditMode
 from .events import EventCode, emit_event
 from .graph import DABSNGraph
 from .model import (
@@ -71,6 +71,7 @@ def _introspect_config(model: DABSNModel | DABSNTaskModel) -> DABSNConfig:
             mlp_ratio=backbone.mlp_ratio,
             mlp_middle_depth=backbone.mlp_middle_depth,
             mlp_depth_index=backbone.mlp_depth_index,
+            temporal_credit=model.temporal_credit,
         )
     return DABSNConfig(
         input_dim=int(model.input_dim),
@@ -83,6 +84,7 @@ def _introspect_config(model: DABSNModel | DABSNTaskModel) -> DABSNConfig:
         mlp_ratio=model.backbone.mlp_ratio,
         mlp_middle_depth=model.backbone.mlp_middle_depth,
         mlp_depth_index=model.backbone.mlp_depth_index,
+        temporal_credit=model.temporal_credit,
     )
 
 
@@ -97,6 +99,7 @@ def dabsn_config_dict(model: Model) -> dict[str, object]:
                 "hidden_dim": int(model.hidden_dim),
                 "tie_embeddings": bool(model.tie_embeddings),
                 "grad_checkpoint": bool(model.backbone.grad_checkpoint),
+                "temporal_credit": model.temporal_credit,
             }
         return {
             "model_kind": "sequence_lm",
@@ -111,6 +114,7 @@ def dabsn_config_dict(model: Model) -> dict[str, object]:
             "mlp_ratio": model.mlp_ratio,
             "mlp_middle_depth": int(model.mlp_middle_depth),
             "mlp_depth_index": int(model.mlp_depth_index),
+            "temporal_credit": model.temporal_credit,
         }
     config = getattr(model, "_dabsn_config", None) or _introspect_config(model)
     data = {name: getattr(config, name) for name in DABSNConfig.__dataclass_fields__}
@@ -236,6 +240,7 @@ def build_dabsn_from_checkpoint_config(
             graph,
             vocab=_int(config["vocab"]),
             tie_embeddings=bool(config.get("tie_embeddings", False)),
+            temporal_credit=cast(Any, config.get("temporal_credit", "bptt")),
         )
         model.backbone.grad_checkpoint = bool(config.get("grad_checkpoint", False))
         model.backbone.graph.set_activation_checkpointing(model.backbone.grad_checkpoint)
@@ -255,6 +260,7 @@ def build_dabsn_from_checkpoint_config(
             mlp_ratio=None if ratio is None else _float(ratio),
             mlp_middle_depth=_int(config.get("mlp_middle_depth", 0)),
             mlp_depth_index=_int(config.get("mlp_depth_index", 0)),
+            temporal_credit=cast(Any, config.get("temporal_credit", "bptt")),
         )
     state_dim = config.get("state_dim")
     task = config.get("task")
@@ -276,6 +282,7 @@ def build_dabsn_from_checkpoint_config(
             mlp_ratio=None if ratio is None else _float(ratio),
             mlp_middle_depth=_int(config.get("mlp_middle_depth", 0)),
             mlp_depth_index=_int(config.get("mlp_depth_index", 0)),
+            temporal_credit=cast(Any, config.get("temporal_credit", "bptt")),
         ),
         grad_checkpoint=bool(config.get("grad_checkpoint", False)),
     )
@@ -645,6 +652,7 @@ def load_dabsn(
     map_location: str | torch.device | None = None,
     strict: bool = True,
     trusted_providers: Sequence[str] = (),
+    temporal_credit: TemporalCreditMode | None = None,
 ) -> Model:
     """Load only the clean DABSN SafeTensors format; no legacy pickle fallback."""
 
@@ -655,12 +663,17 @@ def load_dabsn(
     if metadata["config"].get("model_kind") == "graph":
         raise TypeError("raw graph artifact requires load_graph(), not load_dabsn()")
     device = torch.device("cpu" if map_location is None else map_location)
+    config = dict(metadata["config"])
+    if temporal_credit is not None:
+        if temporal_credit not in {"bptt", "online"}:
+            raise ValueError("temporal_credit must be bptt or online")
+        config["temporal_credit"] = temporal_credit
     raw_graph = metadata["manifest"].get("graph")
     graph_components = (
         None if raw_graph is None else cast(Sequence[Mapping[str, object]], raw_graph)
     )
     model = build_dabsn_from_checkpoint_config(
-        metadata["config"],
+        config,
         graph_components=graph_components,
         trusted_providers=trusted_providers,
     ).to(device)

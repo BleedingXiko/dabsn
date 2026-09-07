@@ -164,6 +164,7 @@ def test_non_distributed_sharded_training_checkpoint(tmp_path):
         state,
         step=23,
         extra={"kind": "test"},
+        training_state={"online_marker": torch.tensor([3.0, 7.0])},
     )
     restored = DABSNModel(
         4,
@@ -176,11 +177,13 @@ def test_non_distributed_sharded_training_checkpoint(tmp_path):
     restored_groups = dabsn_adamw_param_groups(restored, 0.1)
     restored_wrapped = prepare_distributed_model(restored, state)
     restored_optimizer = torch.optim.AdamW(restored_groups, lr=1e-3)
+    restored_training_state = {}
     manifest = load_sharded_training_checkpoint(
         restored_wrapped,
         restored_optimizer,
         path,
         state,
+        training_state=restored_training_state,
     )
     assert manifest["step"] == 23
     assert manifest["extra"] == {"kind": "test"}
@@ -189,6 +192,9 @@ def test_non_distributed_sharded_training_checkpoint(tmp_path):
     for expected, actual in zip(model.parameters(), restored.parameters()):
         torch.testing.assert_close(actual, expected, atol=0, rtol=0)
     assert restored_optimizer.state_dict()["state"]
+    torch.testing.assert_close(
+        restored_training_state["online_marker"], torch.tensor([3.0, 7.0])
+    )
 
 
 def test_nested_fsdp_state_names_normalize_to_portable_model_keys():

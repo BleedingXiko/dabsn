@@ -47,14 +47,35 @@ import torch.nn as nn
 from torch import Tensor
 
 from .model import DABSNBackbone, DABSNBlock, DABSNSequenceLM
+from .prepared_memory import (
+    FORMAT as PREPARED_FORMAT,
+    PreparedAdmittedBank,
+    PreparedBankPage,
+    PreparedDABSNMemory,
+    PreparedLayerMemory,
+    append_prepared_bank,
+    load_prepared_payload,
+    prepare_admitted_bank,
+    prepared_memory_bytes,
+    read_parameter_identity,
+    save_prepared,
+)
 
 __all__ = [
     "DABSNMemory",
     "LayerMemory",
+    "PreparedAdmittedBank",
+    "PreparedBankPage",
+    "PreparedDABSNMemory",
+    "PreparedLayerMemory",
     "ingest",
     "forward_with_memory",
+    "prepare_for_inference",
+    "prepared_memory_bytes",
     "save",
     "load",
+    "save_prepared",
+    "load_prepared",
     "embed_in_checkpoint",
     "extract_from_checkpoint",
 ]
@@ -181,6 +202,23 @@ def _check_fingerprint(memory: DABSNMemory, model: DABSNSequenceLM) -> None:
         raise ValueError("memory was built by a different architecture: " + "; ".join(mismatched))
 
 
+def _check_prepared_memory(memory: PreparedDABSNMemory, model: DABSNSequenceLM) -> None:
+    if memory.format != PREPARED_FORMAT:
+        raise ValueError(f"unsupported prepared memory format {memory.format!r}")
+    _check_fingerprint(cast(DABSNMemory, memory), model)
+    blocks = cast(list[DABSNBlock], list(_legacy_backbone(model).blocks))
+    if len(memory.layers) != len(blocks):
+        raise ValueError(
+            f"prepared memory has {len(memory.layers)} layers but model has {len(blocks)}"
+        )
+    for index, (layer, block) in enumerate(zip(memory.layers, blocks)):
+        expected = read_parameter_identity(block.read)
+        if layer.bank.identity.get("read_parameters") != expected:
+            raise ValueError(
+                f"prepared memory layer {index} read parameters do not match the current model"
+            )
+
+
 def _require_seq_geometry(model: DABSNSequenceLM) -> None:
     backbone = _legacy_backbone(model)
     bad = [
@@ -290,14 +328,107 @@ def _ingest_block(
     return hidden, LayerMemory(bank=bank, core=final_core, long=final_long)
 
 
-def _run(
+def _ingest_prepared_block(
+    block: DABSNBlock,
+    inputs: Tensor,
+    layer: PreparedLayerMemory,
+    position: int,
+) -> tuple[Tensor, PreparedLayerMemory]:
+    """Run one block while functionally extending its paged admitted bank."""
+    result, final_core = block.core.forward_from_state(
+        inputs,
+        initial_state=layer.core,
+        return_writes=True,
+        return_cocktail=True,
+        return_final_state=True,
+    )
+    trajectory, novelty, plasticity, expression, write, energy, saturation = result
+    y, budget = trajectory.split(block.state_dim, dim=-1)
+    bank = append_prepared_bank(
+        layer.bank,
+        block.read,
+        write,
+        novelty.mean(dim=-1),
+        plasticity.mean(dim=-1),
+        energy.mean(dim=-1),
+        saturation.mean(dim=-1),
+    )
+    retrieved, final_long = block.read.forward_query_prepared(
+        y,
+        budget,
+        expression,
+        write,
+        novelty,
+        plasticity,
+        energy,
+        saturation,
+        bank=bank,
+        query_start=position,
+        initial_long_state=layer.long,
+        return_long_state=True,
+    )
+    dabsn_output = block.state_to_hidden(y + block.read_gain * retrieved)
+    hidden = block._finish_block(inputs, dabsn_output)
+    hidden = block.forward_mlp(hidden)
+    return hidden, PreparedLayerMemory(bank=bank, core=final_core, long=final_long)
+
+
+def _run_prepared(
     model: DABSNSequenceLM,
     ids: Tensor,
-    memory: DABSNMemory | None,
+    memory: PreparedDABSNMemory,
     *,
     chunk_size: int | None,
     extend: bool,
-) -> tuple[Tensor, DABSNMemory]:
+) -> tuple[Tensor, PreparedDABSNMemory]:
+    _require_seq_geometry(model)
+    _check_prepared_memory(memory, model)
+    backbone = _legacy_backbone(model)
+    if ids.dim() != 2:
+        raise ValueError(f"ids must be [B, T]; got {tuple(ids.shape)}")
+    if memory.batch_size != int(ids.shape[0]):
+        raise ValueError(
+            f"memory holds batch {memory.batch_size} but ids are batch {int(ids.shape[0])}; "
+            "a bank is per-lane and cannot be rebatched"
+        )
+    blocks = cast(list[DABSNBlock], list(backbone.blocks))
+    state = list(memory.layers)
+    position = memory.position
+    outputs: list[Tensor] = []
+    with torch.no_grad():
+        for start, stop in _chunks(int(ids.shape[1]), chunk_size):
+            hidden = model.embed(ids[:, start:stop])
+            for index, block in enumerate(blocks):
+                hidden, state[index] = _ingest_prepared_block(
+                    block, hidden, state[index], position
+                )
+                if index == backbone.mlp_depth_index:
+                    for mlp in cast(list[nn.Module], list(backbone.middle_mlps)):
+                        hidden = mlp(hidden)
+            outputs.append(hidden)
+            position += stop - start
+    result = PreparedDABSNMemory(
+        layers=tuple(state),
+        position=position,
+        batch_size=memory.batch_size,
+        fingerprint=dict(memory.fingerprint),
+        source_format=memory.source_format,
+    )
+    if not extend:
+        result = memory
+    return torch.cat(outputs, dim=1), result
+
+
+def _run(
+    model: DABSNSequenceLM,
+    ids: Tensor,
+    memory: DABSNMemory | PreparedDABSNMemory | None,
+    *,
+    chunk_size: int | None,
+    extend: bool,
+) -> tuple[Tensor, DABSNMemory | PreparedDABSNMemory]:
+    if isinstance(memory, PreparedDABSNMemory):
+        return _run_prepared(model, ids, memory, chunk_size=chunk_size, extend=extend)
     _require_seq_geometry(model)
     backbone = _legacy_backbone(model)
     if ids.dim() != 2:
@@ -350,10 +481,10 @@ def _run(
 def ingest(
     model: DABSNSequenceLM,
     ids: Tensor,
-    memory: DABSNMemory | None = None,
+    memory: DABSNMemory | PreparedDABSNMemory | None = None,
     *,
     chunk_size: int | None = 512,
-) -> DABSNMemory:
+) -> DABSNMemory | PreparedDABSNMemory:
     """Read ``ids`` into memory, extending ``memory`` when one is supplied.
 
     ``chunk_size`` bounds the activation working set: ingest never materializes
@@ -368,12 +499,12 @@ def ingest(
 def forward_with_memory(
     model: DABSNSequenceLM,
     ids: Tensor,
-    memory: DABSNMemory | None = None,
+    memory: DABSNMemory | PreparedDABSNMemory | None = None,
     *,
     chunk_size: int | None = None,
     extend: bool = False,
     return_hidden: bool = False,
-) -> tuple[Tensor, DABSNMemory]:
+) -> tuple[Tensor, DABSNMemory | PreparedDABSNMemory]:
     """Score ``ids`` against carried ``memory``.
 
     Returns ``(logits, memory)`` with logits shaped ``[B, T, vocab]``. With
@@ -478,6 +609,8 @@ def load(
     payload = torch.load(Path(path), map_location=map_location, weights_only=False)
     if isinstance(payload, dict) and "dabsn_memory" in payload:
         payload = payload["dabsn_memory"]
+    if isinstance(payload, Mapping) and payload.get("format") == PREPARED_FORMAT:
+        raise ValueError("prepared v2 memory must be loaded with load_prepared()")
     memory = _from_payload(payload)
     if model is not None:
         _check_fingerprint(memory, model)
@@ -486,6 +619,61 @@ def load(
             device=device if device is not None else reference.device,
             dtype=dtype if dtype is not None else reference.dtype,
         )
+    elif device is not None or dtype is not None:
+        memory = memory.to(device=device, dtype=dtype)
+    return memory
+
+
+def prepare_for_inference(
+    model: DABSNSequenceLM,
+    memory: DABSNMemory,
+    *,
+    page_size: int = 256,
+) -> PreparedDABSNMemory:
+    """Prepare a legacy bank once without modifying or overwriting it."""
+    _require_seq_geometry(model)
+    _check_fingerprint(memory, model)
+    if memory.batch_size <= 0 or not memory.layers:
+        raise ValueError("cannot prepare an empty DABSN memory")
+    blocks = cast(list[DABSNBlock], list(_legacy_backbone(model).blocks))
+    if len(memory.layers) != len(blocks):
+        raise ValueError(
+            f"memory has {len(memory.layers)} layers but model has {len(blocks)}"
+        )
+    layers = tuple(
+        PreparedLayerMemory(
+            bank=prepare_admitted_bank(block.read, layer.bank, page_size=page_size),
+            core=tuple(tensor.clone() for tensor in layer.core),
+            long=tuple(tensor.clone() for tensor in layer.long),
+        )
+        for block, layer in zip(blocks, memory.layers)
+    )
+    return PreparedDABSNMemory(
+        layers=layers,
+        position=memory.position,
+        batch_size=memory.batch_size,
+        fingerprint=dict(memory.fingerprint),
+        source_format=FORMAT,
+    )
+
+
+def load_prepared(
+    path: str | Path,
+    *,
+    model: DABSNSequenceLM | None = None,
+    map_location="cpu",
+    device=None,
+    dtype=None,
+) -> PreparedDABSNMemory:
+    """Load an explicit v2 prepared-memory file."""
+    memory = load_prepared_payload(path, map_location=map_location)
+    if model is not None:
+        reference = next(model.parameters())
+        memory = memory.to(
+            device=device if device is not None else reference.device,
+            dtype=dtype if dtype is not None else reference.dtype,
+        )
+        _check_prepared_memory(memory, model)
     elif device is not None or dtype is not None:
         memory = memory.to(device=device, dtype=dtype)
     return memory

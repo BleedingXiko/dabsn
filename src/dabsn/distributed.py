@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import os
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from itertools import product
@@ -228,7 +228,17 @@ class DABSNSequenceModule(nn.Module):
         positions: Tensor | None = None,
         *,
         with_terms: bool = False,
-    ) -> Tensor | ComponentOutput:
+        temporal_state=None,
+    ) -> Tensor | ComponentOutput | tuple[Tensor, object]:
+        if temporal_state is not None:
+            if positions is not None or with_terms:
+                raise ValueError(
+                    "online temporal_state is incompatible with positions or with_terms"
+                )
+            forward_online = getattr(self.body, "forward_sequence_online", None)
+            if not callable(forward_online):
+                raise TypeError("prepared module does not implement forward_sequence_online")
+            return forward_online(inputs, temporal_state, with_terms=with_terms)
         if with_terms:
             if positions is not None:
                 raise ValueError("positions and with_terms are mutually exclusive")
@@ -959,6 +969,7 @@ def save_distributed_dabsn(
     step: int | None = None,
     extra: dict[str, object] | None = None,
     scaler: StatefulTrainingObject | None = None,
+    training_state: Mapping[str, object] | None = None,
 ) -> Path | None:
     """Save one portable SafeTensors model and optional optimizer sidecar.
 
@@ -1020,6 +1031,7 @@ def save_distributed_dabsn(
                     "step": step,
                     "extra": checkpoint_extra,
                     "scaler": None if scaler is None else scaler.state_dict(),
+                    "training_state": dict(training_state or {}),
                 },
                 temporary,
             )
@@ -1034,6 +1046,10 @@ def _training_manifest_path(path: str | Path) -> Path:
 
 def _training_commit_path(path: str | Path) -> Path:
     return Path(path) / "COMMITTED.json"
+
+
+def _worker_training_state_path(path: str | Path, rank: int) -> Path:
+    return Path(path) / f"dabsn-worker-training-state-{int(rank):05d}.pt"
 
 
 def _committed_checkpoint_source(path: str | Path) -> Path:
@@ -1106,6 +1122,7 @@ def save_sharded_training_checkpoint(
     extra: dict[str, object] | None = None,
     scaler: StatefulTrainingObject | None = None,
     scheduler: StatefulTrainingObject | None = None,
+    training_state: Mapping[str, object] | None = None,
 ) -> Path | None:
     """Save reshardable model and optimizer state without a rank-zero gather."""
 
@@ -1152,6 +1169,14 @@ def save_sharded_training_checkpoint(
         checkpoint_id=staging,
         no_dist=not state.enabled,
     )
+    if training_state is not None:
+        worker_state = _worker_training_state_path(staging, state.rank)
+        temporary_worker_state = worker_state.with_suffix(".tmp")
+        torch.save(dict(training_state), temporary_worker_state)
+        with temporary_worker_state.open("rb") as handle:
+            os.fsync(handle.fileno())
+        os.replace(temporary_worker_state, worker_state)
+    barrier(state)
     if state.is_main:
         raw = unwrap_dabsn_artifact(model)
         graph = raw if isinstance(raw, DABSNGraph) else getattr(raw, "graph", None)
@@ -1188,6 +1213,7 @@ def save_sharded_training_checkpoint(
             "rng_cuda_bytes": int(rng_state["cuda"].shape[1]),
             "has_scaler_state": scaler is not None,
             "has_scheduler_state": scheduler is not None,
+            "has_worker_training_state": training_state is not None,
         }
         manifest["digests"] = _checkpoint_file_digests(staging)
         manifest_path = _training_manifest_path(staging)
@@ -1318,6 +1344,8 @@ def load_sharded_training_checkpoint(
     scheduler: StatefulTrainingObject | None = None,
     restore_rng: bool = True,
     allow_topology_change: bool = False,
+    training_state: dict[str, object] | None = None,
+    validate_training_state: Callable[[Mapping[str, object]], None] | None = None,
 ) -> dict[str, object]:
     """Restore model and optimizer state, resharding for the active workers."""
 
@@ -1335,6 +1363,25 @@ def load_sharded_training_checkpoint(
         allow_topology_change=allow_topology_change,
         restore_rng=restore_rng,
     )
+    if manifest.get("has_worker_training_state"):
+        if training_state is None:
+            raise ValueError(
+                "checkpoint contains worker training state; provide training_state for exact resume"
+            )
+        worker_path = _worker_training_state_path(
+            _committed_checkpoint_source(path), state.rank
+        )
+        if not worker_path.is_file():
+            raise ValueError(f"checkpoint is missing worker training state for rank {state.rank}")
+        raw_training_state = torch.load(
+            worker_path, map_location="cpu", weights_only=False
+        )
+        if not isinstance(raw_training_state, dict):
+            raise ValueError("checkpoint worker training state must be an object")
+        restored_training_state = cast(dict[str, object], raw_training_state)
+        if validate_training_state is not None:
+            validate_training_state(restored_training_state)
+        training_state.update(restored_training_state)
     options = StateDictOptions(full_state_dict=False, cpu_offload=True, strict=False)
     model_state, optimizer_state = get_state_dict(model, optimizer, options=options)
     state_dict: dict[str, Any] = {
@@ -1445,6 +1492,7 @@ def load_distributed_optimizer(
     state: DistributedState,
     *,
     scaler: StatefulTrainingObject | None = None,
+    training_state: dict[str, object] | None = None,
 ) -> int | None:
     """Restore an optimizer sidecar, scattering a full FSDP state from rank zero."""
 
@@ -1507,6 +1555,16 @@ def load_distributed_optimizer(
     else:
         scaler_state = None
         step = None
+    if training_state is not None:
+        if state.enabled:
+            objects = [None if not state.is_main else payload.get("training_state", {})]
+            torch_dist.broadcast_object_list(objects, src=0, device=state.device)
+            restored_training_state = objects[0]
+        else:
+            restored_training_state = payload.get("training_state", {})
+        if not isinstance(restored_training_state, dict):
+            raise ValueError("optimizer sidecar training_state must be an object")
+        training_state.update(cast(dict[str, object], restored_training_state))
     if state.enabled:
         objects = [scaler_state]
         torch_dist.broadcast_object_list(objects, src=0, device=state.device)

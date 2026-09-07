@@ -522,22 +522,27 @@ def test_compact_dense_bmm_registered_cuda_matches_deployed_dense_bmm(mode, dtyp
         )
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA fullgraph gate")
-def test_compact_dense_bmm_registered_cuda_fullgraph_forward_backward():
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_compact_dense_bmm_registered_cuda_fullgraph_forward_backward(device):
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA fullgraph gate")
     inputs = tuple(
-        value.detach().cuda().requires_grad_(value.requires_grad)
+        value.detach().to(device).requires_grad_(value.requires_grad)
         if isinstance(value, torch.Tensor)
         else value
         for value in _compact_admitted_inputs(mode=0, dtype=torch.float32)
     )
 
-    def forward_backward(*values):
-        output = _compact_dense_bmm_op(*values)
-        return torch.autograd.grad(output.square().mean(), values[:9] + values[12:16])
-
-    compiled = torch.compile(forward_backward, fullgraph=True)
-    eager = forward_backward(*inputs)
-    observed = compiled(*inputs)
+    # Compile the differentiable forward; autograd then executes its AOT-compiled
+    # backward. Torch 2.10 intentionally refuses tracing torch.autograd.grad
+    # itself, which is not a requirement of this registered operator's contract.
+    compiled = torch.compile(_compact_dense_bmm_op, fullgraph=True)
+    eager_output = _compact_dense_bmm_op(*inputs)
+    actual_output = compiled(*inputs)
+    torch.testing.assert_close(actual_output, eager_output, rtol=1e-5, atol=1e-6)
+    differentiable = inputs[:9] + inputs[12:16]
+    eager = torch.autograd.grad(eager_output.square().mean(), differentiable)
+    observed = torch.autograd.grad(actual_output.square().mean(), differentiable)
     for actual, expected in zip(observed, eager):
         torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
 

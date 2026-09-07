@@ -417,7 +417,10 @@ class ExpertParallelExpertGroup(nn.Module):
         )
         input_splits = [int(value) for value in send_counts.tolist()]
         output_splits = [int(value) for value in receive_counts.tolist()]
-        received_inputs = collectives.all_to_all_single(
+        # The plain collective only gained autograd support in newer Torch.
+        # Floating payloads need the explicit differentiable variant on 2.6–2.10;
+        # integer counts and routing IDs above/below remain ordinary exchanges.
+        received_inputs = collectives.all_to_all_single_autograd(
             send_inputs,
             output_splits,
             input_splits,
@@ -446,7 +449,7 @@ class ExpertParallelExpertGroup(nn.Module):
             local_offsets,
         )
         received_outputs = sorted_outputs.index_select(0, local_inverse)
-        returned = collectives.all_to_all_single(
+        returned = collectives.all_to_all_single_autograd(
             received_outputs,
             input_splits,
             output_splits,

@@ -110,6 +110,48 @@ def test_v2_legacy_wrapper_manifest_is_complete_and_roundtrips(tmp_path):
     torch.testing.assert_close(restored.forward_sequence(ids), expected, atol=0, rtol=0)
 
 
+def test_temporal_credit_roundtrips_as_nonstructural_checkpoint_policy(tmp_path):
+    bptt = _legacy_model()
+    online = _legacy_model()
+    online._temporal_credit = "online"
+    bptt_path = tmp_path / "bptt.safetensors"
+    online_path = tmp_path / "online.safetensors"
+    save_dabsn(bptt, bptt_path)
+    save_dabsn(online, online_path)
+
+    bptt_metadata = inspect_dabsn(bptt_path)
+    online_metadata = inspect_dabsn(online_path)
+    assert bptt_metadata["config"]["temporal_credit"] == "bptt"
+    assert online_metadata["config"]["temporal_credit"] == "online"
+    assert (
+        bptt_metadata["manifest"]["contract_fingerprint"]
+        == online_metadata["manifest"]["contract_fingerprint"]
+    )
+    assert load_dabsn(bptt_path).temporal_credit == "bptt"
+    assert load_dabsn(online_path).temporal_credit == "online"
+
+
+def test_weights_only_checkpoint_can_override_temporal_credit_mode(tmp_path):
+    model = DABSNSequenceLM(
+        vocab=23,
+        hidden_dim=6,
+        depth=1,
+        layer_geometries="seq",
+        temporal_credit="online",
+    ).eval()
+    path = tmp_path / "mode-agnostic-weights.safetensors"
+    save_dabsn(model, path)
+    ids = torch.randint(0, 23, (2, 5))
+
+    online = load_dabsn(path, temporal_credit="online").eval()
+    bptt = load_dabsn(path, temporal_credit="bptt").eval()
+    assert online.temporal_credit == "online"
+    assert bptt.temporal_credit == "bptt"
+    torch.testing.assert_close(
+        online.forward_sequence(ids), bptt.forward_sequence(ids), atol=0, rtol=0
+    )
+
+
 def test_first_class_portable_graph_reconstructs_from_registered_providers(tmp_path):
     model = _portable_graph_model()
     model.backbone.grad_checkpoint = True

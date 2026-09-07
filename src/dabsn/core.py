@@ -253,6 +253,9 @@ class DABSNCore(nn.Module):
         return_writes: bool = False,
         return_cocktail: bool = False,
         return_final_state: bool = False,
+        temporal_credit: str = "bptt",
+        eligibility_state=None,
+        online_frame=None,
     ):
         """Run the canonical registered core scan with optional carried state."""
 
@@ -275,43 +278,65 @@ class DABSNCore(nn.Module):
                 raise ValueError(f"initial_state tensors must have shape {expected}, got {shapes}")
             initial_state = (state_values[0], state_values[1], state_values[2])
 
-        from .kernels.batched_runtime import dabsn_core_scan_batched
+        if temporal_credit not in {"bptt", "online"}:
+            raise ValueError("temporal_credit must be bptt or online")
+        online = temporal_credit == "online"
+        if online:
+            if eligibility_state is None or online_frame is None:
+                raise ValueError(
+                    "online temporal credit requires eligibility_state and online_frame"
+                )
+            from .temporal_credit import core_online_autograd
 
-        outputs = dabsn_core_scan_batched(
-            self.W(inputs),
-            self.Wg(inputs),
-            self.Ug.weight,
-            self.A.weight,
-            self.beta,
-            self.log_kappa,
-            self.logit_recover,
-            self.k_s,
-            self.k_y,
-            self.k_b,
-            self.k_n,
-            self.k_bias,
-            self.r_s,
-            self.r_y,
-            self.r_b,
-            self.r_n,
-            self.r_bias,
-            self.logit_saturation_decay.expand(self.hidden_dim),
-            self.k_saturation,
-            self.r_saturation,
-            self.logit_alpha.reshape(()),
-            self.log_lambda.reshape(()),
-            self.logit_saturation_suppress.reshape(()),
-            return_tape=return_cocktail,
-            initial_state=initial_state,
-            return_final_state=return_final_state,
-        )
+            outputs = core_online_autograd(
+                self,
+                inputs,
+                initial_state,
+                eligibility_state,
+                online_frame,
+            )
+        else:
+            if eligibility_state is not None or online_frame is not None:
+                raise ValueError("BPTT mode does not accept online eligibility state")
+            from .kernels.batched_runtime import dabsn_core_scan_batched
+
+            outputs = dabsn_core_scan_batched(
+                self.W(inputs),
+                self.Wg(inputs),
+                self.Ug.weight,
+                self.A.weight,
+                self.beta,
+                self.log_kappa,
+                self.logit_recover,
+                self.k_s,
+                self.k_y,
+                self.k_b,
+                self.k_n,
+                self.k_bias,
+                self.r_s,
+                self.r_y,
+                self.r_b,
+                self.r_n,
+                self.r_bias,
+                self.logit_saturation_decay.expand(self.hidden_dim),
+                self.k_saturation,
+                self.r_saturation,
+                self.logit_alpha.reshape(()),
+                self.log_lambda.reshape(()),
+                self.logit_saturation_suppress.reshape(()),
+                return_tape=return_cocktail,
+                initial_state=initial_state,
+                return_final_state=return_final_state,
+            )
         if not torch.compiler.is_compiling():
             if (
                 inputs.device.type == "cpu"
                 and outputs[0].dtype == torch.float32
                 and bool(getattr(type(self), "_cpu_native_enabled", False))
             ):
-                self._last_core_backend = "cpu_native_cpp"
+                self._last_core_backend = (
+                    "cpu_native_cpp_online" if online else "cpu_native_cpp"
+                )
             elif inputs.device.type == "cuda" and bool(
                 getattr(type(self), "_cuda_native_enabled", False)
             ):
@@ -338,6 +363,8 @@ class DABSNCore(nn.Module):
             result = trajectory, novelty, plasticity
             final_offset = 5
         if return_final_state:
+            if online:
+                final_offset = 7
             return result, tuple(outputs[final_offset : final_offset + 3])
         return result
 

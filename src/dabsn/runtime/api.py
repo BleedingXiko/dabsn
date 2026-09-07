@@ -180,7 +180,38 @@ def train_step(
     clip_grad_norm: float | None = None,
     distributed_state: Any | None = None,
     metrics_callback: Callable[[dict[str, Tensor]], None] | None = None,
-) -> float:
+    temporal_state: Any | None = None,
+    temporal_chunk_size: int | None = None,
+    stream_ids: tuple[str | int, ...] | None = None,
+    stream_reset_mask: Tensor | None = None,
+    eligibility_batch_mode: str = "vectorized",
+    eligibility_lane_group_size: int | None = None,
+):
+    if temporal_state is not None:
+        return _online_train_step(
+            model,
+            inputs,
+            targets,
+            optimizer,
+            loss_fn=loss_fn,
+            clip_grad_norm=clip_grad_norm,
+            distributed_state=distributed_state,
+            metrics_callback=metrics_callback,
+            temporal_state=temporal_state,
+            temporal_chunk_size=temporal_chunk_size,
+            stream_ids=stream_ids,
+            stream_reset_mask=stream_reset_mask,
+            eligibility_batch_mode=eligibility_batch_mode,
+            eligibility_lane_group_size=eligibility_lane_group_size,
+        )
+    if (
+        temporal_chunk_size is not None
+        or stream_ids is not None
+        or stream_reset_mask is not None
+        or eligibility_batch_mode != "vectorized"
+        or eligibility_lane_group_size is not None
+    ):
+        raise ValueError("online chunk/stream arguments require temporal_state")
     model.train()
     optimizer.zero_grad(set_to_none=True)
     result = _training_forward(model, inputs)
@@ -202,6 +233,214 @@ def train_step(
     if metrics_callback is not None:
         metrics_callback(metrics)
     return reduced_loss
+
+
+def _online_train_step(
+    model: nn.Module,
+    inputs: object,
+    targets: object,
+    optimizer: torch.optim.Optimizer,
+    *,
+    loss_fn: LossFunction | None,
+    clip_grad_norm: float | None,
+    distributed_state: Any | None,
+    metrics_callback: Callable[[dict[str, Tensor]], None] | None,
+    temporal_state,
+    temporal_chunk_size: int | None,
+    stream_ids: tuple[str | int, ...] | None,
+    stream_reset_mask: Tensor | None,
+    eligibility_batch_mode: str,
+    eligibility_lane_group_size: int | None,
+):
+    """Execute one bounded online-credit update using the normal optimizer."""
+
+    from ..temporal_credit import OnlineTemporalState
+
+    if not isinstance(temporal_state, OnlineTemporalState):
+        raise TypeError("temporal_state must be OnlineTemporalState")
+    model.train()
+    optimizer.zero_grad(set_to_none=True)
+    primary_loss, next_state, output = _online_backward_step(
+        model,
+        inputs,
+        targets,
+        loss_fn=loss_fn,
+        temporal_state=temporal_state,
+        temporal_chunk_size=temporal_chunk_size,
+        stream_ids=stream_ids,
+        stream_reset_mask=stream_reset_mask,
+        eligibility_batch_mode=eligibility_batch_mode,
+        eligibility_lane_group_size=eligibility_lane_group_size,
+    )
+    if clip_grad_norm is not None:
+        distributed_clip_grad_norm(model, float(clip_grad_norm))
+    apply_optimizer_step(model, optimizer)
+    result = output
+    reduced_loss, metrics = _reduced_step_metrics(
+        model,
+        primary_loss.detach(),
+        result,
+        distributed_state,
+    )
+    if metrics_callback is not None:
+        metrics_callback(metrics)
+    return reduced_loss, next_state
+
+
+def _online_backward_step(
+    model: nn.Module,
+    inputs: object,
+    targets: object,
+    *,
+    temporal_state,
+    loss_fn: LossFunction | None = None,
+    temporal_chunk_size: int | None = None,
+    stream_ids: tuple[str | int, ...] | None = None,
+    stream_reset_mask: Tensor | None = None,
+    eligibility_batch_mode: str = "vectorized",
+    eligibility_lane_group_size: int | None = None,
+    loss_scale: float = 1.0,
+    accumulation_position: int | None = None,
+):
+    """Backpropagate one online microbatch without touching optimizer state."""
+
+    from ..temporal_credit import (
+        OnlineTemporalState,
+        _merge_online_temporal_states,
+        _slice_online_temporal_state,
+        bind_online_temporal_contract,
+        finalize_online_temporal_state,
+        prepare_online_temporal_state,
+    )
+
+    if not isinstance(temporal_state, OnlineTemporalState):
+        raise TypeError("temporal_state must be OnlineTemporalState")
+    if not isinstance(inputs, Tensor) or not isinstance(targets, Tensor):
+        raise TypeError("online training currently requires tensor inputs and targets")
+    if inputs.dim() < 2 or targets.shape[:2] != inputs.shape[:2]:
+        raise ValueError("online inputs and targets must share [B,T]")
+    batch, total_steps = int(inputs.shape[0]), int(inputs.shape[1])
+    if batch != temporal_state.batch_size or total_steps <= 0:
+        raise ValueError("online input shape does not match temporal state")
+    chunk_size = total_steps if temporal_chunk_size is None else int(temporal_chunk_size)
+    if chunk_size <= 0:
+        raise ValueError("temporal_chunk_size must be positive")
+    from ..temporal_credit import _online_blocks
+
+    blocks = _online_blocks(model)
+    if chunk_size < total_steps:
+        bad = [index for index, block in enumerate(blocks) if block.read_geometry != "seq"]
+        if bad:
+            raise ValueError(
+                "bounded multi-chunk online training requires seq read geometry; "
+                f"noncausal field/hybrid blocks: {bad}"
+            )
+    if stream_ids is None:
+        if temporal_state.stream_policy == "carry_lanes":
+            raise ValueError("carry_lanes requires explicit stream_ids on every update")
+        resolved_stream_ids = temporal_state.stream_ids
+    else:
+        resolved_stream_ids = tuple(stream_ids)
+    prepared = prepare_online_temporal_state(
+        model,
+        temporal_state,
+        stream_ids=resolved_stream_ids,
+        stream_reset_mask=stream_reset_mask,
+    )
+    if eligibility_batch_mode not in {"vectorized", "lane_grouped"}:
+        raise ValueError("eligibility_batch_mode must be vectorized or lane_grouped")
+    if eligibility_batch_mode == "vectorized":
+        if eligibility_lane_group_size is not None:
+            raise ValueError("eligibility_lane_group_size requires lane_grouped mode")
+        group_size = batch
+    else:
+        if eligibility_lane_group_size is None or int(eligibility_lane_group_size) <= 0:
+            raise ValueError("lane_grouped mode requires a positive eligibility_lane_group_size")
+        group_size = min(batch, int(eligibility_lane_group_size))
+    prepared = bind_online_temporal_contract(
+        prepared,
+        temporal_chunk_size=chunk_size,
+        eligibility_batch_mode=eligibility_batch_mode,
+        eligibility_lane_group_size=eligibility_lane_group_size,
+    )
+    if not torch.isfinite(torch.tensor(float(loss_scale))) or float(loss_scale) < 0:
+        raise ValueError("loss_scale must be finite and non-negative")
+
+    forward_online = getattr(model, "forward_sequence_online", None)
+    loss_declarations, _ = _result_declarations(model)
+    group_states = []
+    group_outputs = []
+    weighted_losses: list[Tensor] = []
+    weighted_terms: list[list[Tensor]] = [[] for _ in loss_declarations]
+    for lane_start in range(0, batch, group_size):
+        lane_stop = min(batch, lane_start + group_size)
+        next_state = _slice_online_temporal_state(prepared, lane_start, lane_stop)
+        output = None
+        for start in range(0, total_steps, chunk_size):
+            stop = min(total_steps, start + chunk_size)
+            chunk_inputs = inputs[lane_start:lane_stop, start:stop]
+            if callable(forward_online):
+                if loss_declarations:
+                    result, pending_state = forward_online(
+                        chunk_inputs, next_state, with_terms=True
+                    )
+                else:
+                    result, pending_state = forward_online(chunk_inputs, next_state)
+            else:
+                result = model(
+                    chunk_inputs,
+                    temporal_state=next_state,
+                    with_terms=bool(loss_declarations),
+                )
+                if not isinstance(result, tuple) or len(result) != 2:
+                    raise TypeError("prepared model did not return online output and state")
+                result, pending_state = result
+            if isinstance(result, ComponentOutput):
+                output = cast(Tensor, result.value)
+                terms = result.loss_terms
+            else:
+                output = result
+                terms = ()
+            if len(terms) != len(loss_declarations):
+                raise RuntimeError("online component loss-term count changed")
+            chunk_targets = targets[lane_start:lane_stop, start:stop]
+            chunk_loss = (loss_fn or _default_loss)(output, chunk_targets)
+            weight = (
+                float(lane_stop - lane_start)
+                / float(batch)
+                * float(stop - start)
+                / float(total_steps)
+            )
+            weighted_loss = chunk_loss * weight
+            weighted_aux = sum(
+                (term * weight for term in terms),
+                weighted_loss.new_zeros(()),
+            )
+            ((weighted_loss + weighted_aux) * float(loss_scale)).backward()
+            weighted_losses.append(weighted_loss.detach())
+            for values, term in zip(weighted_terms, terms):
+                values.append((term * weight).detach())
+            next_state = finalize_online_temporal_state(pending_state)
+        assert output is not None
+        group_outputs.append(output.detach())
+        group_states.append(next_state)
+    completed = _merge_online_temporal_states(tuple(group_states))
+    if accumulation_position is not None:
+        completed = OnlineTemporalState(
+            layers=completed.layers,
+            stream_policy=completed.stream_policy,
+            stream_ids=completed.stream_ids,
+            pending_reset_mask=completed.pending_reset_mask,
+            chunk_position=completed.chunk_position,
+            accumulation_position=int(accumulation_position),
+            temporal_chunk_size=completed.temporal_chunk_size,
+            eligibility_batch_mode=completed.eligibility_batch_mode,
+            eligibility_lane_group_size=completed.eligibility_lane_group_size,
+            schema_version=completed.schema_version,
+        )
+    aggregate_terms = tuple(torch.stack(values).sum() for values in weighted_terms)
+    result = ComponentOutput(torch.cat(group_outputs, dim=0), aggregate_terms)
+    return torch.stack(weighted_losses).sum(), completed, result
 
 
 def train(

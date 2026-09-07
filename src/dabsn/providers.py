@@ -92,6 +92,7 @@ class DABSNBlockProvider:
         world_builder=True,
         dabsn_memory_owner=True,
         deterministic=False,
+        temporal_credit="dabsn",
     )
 
     def capabilities_for_config(
@@ -146,6 +147,7 @@ class DABSNBlockProvider:
             world_builder=True,
             dabsn_memory_owner=True,
             deterministic=False,
+            temporal_credit="dabsn",
             parallel_plan=plan,
         )
 
@@ -312,6 +314,7 @@ class ResidualMLPProvider:
         amp_fp16=True,
         distributed=True,
         deterministic=True,
+        temporal_credit="stateless",
     )
 
     def validate_config(self, config: Mapping[str, object]) -> None:
@@ -347,6 +350,7 @@ class SparseMoEProvider:
         amp_fp16=True,
         distributed=True,
         deterministic=False,
+        temporal_credit="stateless",
     )
     loss_terms = (ResultDeclaration("router_balance", "mean", "framework"),)
     reports = tuple(ResultDeclaration(name, "none", "framework") for name in ROUTER_REPORT_NAMES)
@@ -389,6 +393,7 @@ class SparseMoEProvider:
             amp_fp16=True,
             distributed=True,
             deterministic=False,
+            temporal_credit="stateless",
             parallel_plan=plan,
         )
 

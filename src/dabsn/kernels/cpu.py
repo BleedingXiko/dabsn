@@ -612,7 +612,21 @@ class _DABSNCoreScanFn(torch.autograd.Function):
             float(lam),
             float(saturation_suppress),
         )
-        U, nov, p, ay, write, energy, saturation, bpre, cpre, final_b, final_e, final_c = out
+        (
+            U,
+            nov,
+            p,
+            ay,
+            write,
+            energy,
+            saturation,
+            bpre,
+            cpre,
+            final_b,
+            final_e,
+            final_c,
+            _gate_pre,
+        ) = out
         ctx.save_for_backward(
             bpre,
             energy,
@@ -774,6 +788,210 @@ def native_core_forward_train(core, e_in, *, initial_state=None):
     )
 
 
+def native_core_online_forward(core, inputs, initial_state, eligibility_state):
+    """Run the native CPU value scan and retain its compact online tape."""
+
+    from dabsn.temporal_credit import CoreForwardResult, CoreOnlineTape
+
+    extension = _load_ext(required=True)
+    assert extension is not None
+    hidden = int(core.hidden_dim)
+    initial_b, initial_e, initial_c = _initial_core_state(core, inputs, initial_state)
+    projected = core.W(inputs).float().contiguous()
+    gate_projected = core.Wg(inputs).float().contiguous()
+    outputs = extension.dabsn_core_scan_fwd_train(
+        projected,
+        gate_projected,
+        torch.cat((core.Ug.weight, core.A.weight), dim=0).float().contiguous(),
+        core.beta.float().contiguous(),
+        core.log_kappa.float().contiguous(),
+        core.logit_recover.float().contiguous(),
+        core.k_s.float().contiguous(),
+        core.k_y.float().contiguous(),
+        core.k_b.float().contiguous(),
+        core.k_n.float().contiguous(),
+        core.k_bias.float().contiguous(),
+        core.r_s.float().contiguous(),
+        core.r_y.float().contiguous(),
+        core.r_b.float().contiguous(),
+        core.r_n.float().contiguous(),
+        core.r_bias.float().contiguous(),
+        core.logit_saturation_decay.expand(hidden).float().contiguous(),
+        core.k_saturation.float().contiguous(),
+        core.r_saturation.float().contiguous(),
+        initial_b.float().contiguous(),
+        initial_e.float().contiguous(),
+        initial_c.float().contiguous(),
+        float(torch.sigmoid(core.logit_alpha)),
+        float(torch.nn.functional.softplus(core.log_lambda)),
+        float(torch.sigmoid(core.logit_saturation_suppress)),
+    )
+    (
+        trajectory,
+        novelty,
+        plasticity,
+        expression,
+        write,
+        energy,
+        next_saturation,
+        budget,
+        saturation,
+        final_budget,
+        final_energy,
+        final_saturation,
+        gate_preactivation,
+    ) = outputs
+    y = trajectory[..., :hidden]
+    gate = torch.nn.functional.hardsigmoid(gate_preactivation)
+    novelty_effective = novelty * (
+        1.0 - torch.sigmoid(core.logit_saturation_suppress) * next_saturation
+    )
+    k_signal = (
+        core.k_s * gate
+        + core.k_y * y
+        + core.k_b * torch.tanh(budget)
+        + core.k_n * novelty_effective
+        + core.k_bias
+        + core.k_saturation * next_saturation
+    )
+    r_signal = (
+        core.r_s * gate
+        + core.r_y * y
+        + core.r_b * torch.tanh(budget)
+        + core.r_n * novelty_effective
+        + core.r_bias
+        + core.r_saturation * next_saturation
+    )
+    write_cost = torch.nn.functional.softplus(core.log_kappa) * torch.exp(
+        0.5 * torch.tanh(k_signal)
+    )
+    recovery = torch.clamp(
+        torch.sigmoid(core.logit_recover) * torch.exp(0.5 * torch.tanh(r_signal)),
+        0.0,
+        1.0,
+    )
+    result = CoreForwardResult(
+        trajectory=trajectory,
+        novelty=novelty,
+        plasticity=plasticity,
+        expression=expression,
+        write=write,
+        energy=energy,
+        saturation=next_saturation,
+        final_state=(final_budget, final_energy, final_saturation),
+    )
+    tape = CoreOnlineTape(
+        inputs=inputs.detach(),
+        budget=budget.detach(),
+        energy=energy.detach(),
+        saturation=saturation.detach(),
+        y=y.detach(),
+        expression=expression.detach(),
+        gate_preactivation=gate_preactivation.detach(),
+        gate=gate.detach(),
+        novelty=novelty.detach(),
+        next_saturation=next_saturation.detach(),
+        novelty_effective=novelty_effective.detach(),
+        write_cost=write_cost.detach(),
+        recovery=recovery.detach(),
+        plasticity=plasticity.detach(),
+    )
+    return result, tape
+
+
+def native_core_online_replay(
+    core,
+    tape,
+    signal_grads,
+    eligibility_state,
+    *,
+    required: bool = False,
+):
+    """Run the forward-time full-signal online-credit replay on CPU."""
+
+    from dabsn.temporal_credit import (
+        CoreEligibilityState,
+        CoreSignalGrads,
+        _core_parameter_tuple,
+        core_online_replay_reference,
+    )
+
+    if not isinstance(eligibility_state, CoreEligibilityState):
+        raise TypeError("native online replay requires CoreEligibilityState")
+    if not isinstance(signal_grads, CoreSignalGrads):
+        raise TypeError("native online replay requires CoreSignalGrads")
+    extension = _load_ext(required=required)
+    if extension is None:
+        return core_online_replay_reference(core, tape, signal_grads, eligibility_state)
+    if tape.inputs.device.type != "cpu" or tape.inputs.dtype != torch.float32:
+        if required:
+            raise RuntimeError("native online CPU replay requires CPU float32 tensors")
+        return core_online_replay_reference(core, tape, signal_grads, eligibility_state)
+
+    shape = (tape.batch_size, tape.steps, tape.state_dim)
+
+    def cotangent(name: str) -> Tensor:
+        value = getattr(signal_grads, name)
+        if value is None:
+            return torch.zeros(shape, dtype=torch.float32, device=tape.inputs.device)
+        return value.float().contiguous()
+
+    if core.Wg.bias is None:
+        raise RuntimeError("DABSNCore.Wg must retain its bias for online credit")
+    outputs = extension.dabsn_core_online_replay_cpu(
+        tape.inputs.float().contiguous(),
+        tape.budget.float().contiguous(),
+        tape.energy.float().contiguous(),
+        tape.saturation.float().contiguous(),
+        tape.y.float().contiguous(),
+        tape.expression.float().contiguous(),
+        tape.gate_preactivation.float().contiguous(),
+        cotangent("y"),
+        cotangent("next_budget"),
+        cotangent("novelty"),
+        cotangent("plasticity"),
+        cotangent("expression"),
+        cotangent("write"),
+        cotangent("energy"),
+        cotangent("saturation"),
+        core.W.weight.float().contiguous(),
+        core.A.weight.float().contiguous(),
+        core.Wg.weight.float().contiguous(),
+        core.Ug.weight.float().contiguous(),
+        core.Wg.bias.float().contiguous(),
+        core.beta.float().contiguous(),
+        core.log_kappa.float().contiguous(),
+        core.logit_recover.float().contiguous(),
+        core.k_s.float().contiguous(),
+        core.k_y.float().contiguous(),
+        core.k_b.float().contiguous(),
+        core.k_n.float().contiguous(),
+        core.k_bias.float().contiguous(),
+        core.r_s.float().contiguous(),
+        core.r_y.float().contiguous(),
+        core.r_b.float().contiguous(),
+        core.r_n.float().contiguous(),
+        core.r_bias.float().contiguous(),
+        core.k_saturation.float().contiguous(),
+        core.r_saturation.float().contiguous(),
+        core.logit_alpha.float().contiguous(),
+        core.log_lambda.float().contiguous(),
+        core.logit_saturation_decay.float().contiguous(),
+        core.logit_saturation_suppress.float().contiguous(),
+        *(value.float().contiguous() for value in eligibility_state.tensors()),
+    )
+    next_eligibility = CoreEligibilityState(*outputs[:6])
+    input_gradient = outputs[6].to(dtype=tape.inputs.dtype)
+    parameters = _core_parameter_tuple(core)
+    parameter_gradients = {
+        parameter: gradient.to(dtype=parameter.dtype)
+        for parameter, gradient in zip(parameters, outputs[7:])
+    }
+    if len(parameter_gradients) != len(parameters):
+        raise RuntimeError("native online replay returned an invalid parameter gradient schema")
+    return next_eligibility, parameter_gradients, input_gradient
+
+
 def _registered_cpu_core_scan(*inputs: Tensor) -> tuple[Tensor, ...]:
     """C++ CPU implementation for the fixed registered core-scan schema."""
 
@@ -861,6 +1079,7 @@ def _registered_cpu_core_scan(*inputs: Tensor) -> tuple[Tensor, ...]:
         final_b,
         final_e,
         final_c,
+        _gate_pre,
     ) = outputs
     hidden = wx.shape[-1]
     y = trajectory[..., :hidden]

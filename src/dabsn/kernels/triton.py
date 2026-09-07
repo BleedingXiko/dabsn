@@ -272,9 +272,170 @@ def cuda_core_forward(
     return result
 
 
+def cuda_core_online_forward(core, inputs, initial_state, eligibility_state):
+    """Build the online tape from the native precise Triton forward scan."""
+
+    if not inputs.is_cuda:
+        raise TypeError("CUDA online core forward requires CUDA tensors")
+    from dabsn.temporal_credit import CoreForwardResult, CoreOnlineTape
+
+    runtime = _runtime()
+    compute_dtype = torch.float32
+    projected = core.W(inputs).contiguous()
+    gate_projected = core.Wg(inputs).contiguous()
+    outputs = runtime.dabsn_core_scan_triton_tape(
+        projected,
+        gate_projected,
+        core.Ug.weight.contiguous(),
+        core.A.weight.contiguous(),
+        core.beta.contiguous(),
+        core.log_kappa.contiguous(),
+        core.logit_recover.contiguous(),
+        core.k_s.contiguous(),
+        core.k_y.contiguous(),
+        core.k_b.contiguous(),
+        core.k_n.contiguous(),
+        core.k_bias.contiguous(),
+        core.r_s.contiguous(),
+        core.r_y.contiguous(),
+        core.r_b.contiguous(),
+        core.r_n.contiguous(),
+        core.r_bias.contiguous(),
+        core.logit_saturation_decay.expand(core.hidden_dim).contiguous(),
+        core.k_saturation.contiguous(),
+        core.r_saturation.contiguous(),
+        logit_alpha=core.logit_alpha.reshape(()),
+        log_lambda=core.log_lambda.reshape(()),
+        logit_c_suppress=core.logit_saturation_suppress.reshape(()),
+        tape_dtype=compute_dtype,
+        initial_state=initial_state,
+        return_final_state=True,
+    )
+    trajectory, novelty, plasticity, expression, write, energy, next_saturation, gate = outputs[:8]
+    final_state = tuple(outputs[8:11])
+    state = int(core.hidden_dim)
+    y = trajectory[..., :state]
+    next_budget = trajectory[..., state:]
+    initial_budget, _initial_energy, initial_saturation = (
+        value.to(device=inputs.device, dtype=compute_dtype) for value in initial_state
+    )
+    budget = torch.cat((initial_budget[:, None], next_budget[:, :-1]), dim=1).contiguous()
+    saturation = torch.cat(
+        (initial_saturation[:, None], next_saturation[:, :-1]), dim=1
+    ).contiguous()
+    gate_preactivation = (gate * 6.0 - 3.0).contiguous()
+    suppress = torch.sigmoid(core.logit_saturation_suppress.float())
+    novelty_effective = novelty * (1.0 - suppress * next_saturation)
+    k_signal = (
+        core.k_s.float() * gate
+        + core.k_y.float() * y
+        + core.k_b.float() * torch.tanh(budget)
+        + core.k_n.float() * novelty_effective
+        + core.k_bias.float()
+        + core.k_saturation.float() * next_saturation
+    )
+    r_signal = (
+        core.r_s.float() * gate
+        + core.r_y.float() * y
+        + core.r_b.float() * torch.tanh(budget)
+        + core.r_n.float() * novelty_effective
+        + core.r_bias.float()
+        + core.r_saturation.float() * next_saturation
+    )
+    write_cost = torch.nn.functional.softplus(core.log_kappa.float()) * torch.exp(
+        0.5 * torch.tanh(k_signal)
+    )
+    recovery = torch.clamp(
+        torch.sigmoid(core.logit_recover.float()) * torch.exp(0.5 * torch.tanh(r_signal)),
+        0.0,
+        1.0,
+    )
+    tape = CoreOnlineTape(
+        inputs=inputs.detach(),
+        budget=budget.detach(),
+        energy=energy.detach(),
+        saturation=saturation.detach(),
+        y=y.detach(),
+        expression=expression.detach(),
+        gate_preactivation=gate_preactivation.detach(),
+        gate=gate.detach(),
+        novelty=novelty.detach(),
+        next_saturation=next_saturation.detach(),
+        novelty_effective=novelty_effective.detach(),
+        write_cost=write_cost.detach(),
+        recovery=recovery.detach(),
+        plasticity=plasticity.detach(),
+    )
+    result = CoreForwardResult(
+        trajectory=trajectory.to(inputs.dtype),
+        novelty=novelty.to(inputs.dtype),
+        plasticity=plasticity.to(inputs.dtype),
+        expression=expression.to(inputs.dtype),
+        write=write.to(inputs.dtype),
+        energy=energy.to(inputs.dtype),
+        saturation=next_saturation.to(inputs.dtype),
+        final_state=tuple(value.to(inputs.dtype) for value in final_state),
+    )
+    core._last_core_online_backend = "cuda_triton_forward"
+    return result, tape
+
+
+def cuda_core_online_replay(core, tape, signals, eligibility_state):
+    """Run exact forward-time replay as a required full-graph CUDA compile."""
+
+    if not tape.inputs.is_cuda:
+        raise TypeError("CUDA online core replay requires CUDA tensors")
+    from dabsn.temporal_credit import core_online_replay_analytic
+
+    # The analytic path contains no autograd calls and no data-dependent host
+    # reads. Fullgraph=True makes a graph break a hard failure instead of
+    # silently returning to the per-timestep Python implementation.
+    from .online_compile import call_online_compiled
+
+    result = call_online_compiled(core_online_replay_analytic, core, tape, signals, eligibility_state)
+    core._last_core_online_backend = "cuda_triton_forward_inductor_fused_replay"
+    return result
+
+
+def cuda_long_read_online_forward(
+    read, write, plasticity, novelty, initial_state, eligibility_state
+):
+    """Capture the channelwise long recurrence as a required static CUDA graph."""
+    if not write.is_cuda:
+        raise TypeError("CUDA online long-read forward requires CUDA tensors")
+    from dabsn.temporal_credit import long_read_online_forward
+
+    from .online_compile import call_online_compiled
+
+    result = call_online_compiled(
+        long_read_online_forward, read, write, plasticity, novelty, initial_state, eligibility_state
+    )
+    read._last_long_online_backend = "cuda_inductor_fused_forward"
+    return result
+
+
+def cuda_long_read_online_replay(read, tape, output_gradient, eligibility_state):
+    """Capture analytic eligibility and bounded input replay on CUDA."""
+    if not tape.write.is_cuda:
+        raise TypeError("CUDA online long-read replay requires CUDA tensors")
+    from dabsn.temporal_credit import long_read_online_replay_analytic
+
+    from .online_compile import call_online_compiled
+
+    result = call_online_compiled(
+        long_read_online_replay_analytic, read, tape, output_gradient, eligibility_state
+    )
+    read._last_long_online_backend = "cuda_inductor_fused_forward_replay"
+    return result
+
+
 def _registered_cuda_core_scan(*inputs: Tensor) -> tuple[Tensor, ...]:
     """CUDA implementation for the fixed registered core-scan schema."""
 
+    # The pointer kernels address channel parameters with +h, not tensor strides.
+    # In particular the public core passes logit_saturation_decay.expand(H),
+    # whose zero stride must be materialized before the Triton launch.
+    inputs = tuple(value.contiguous() for value in inputs)
     wx = inputs[0]
     requested = os.environ.get("DABSN_CORE_BACKEND", "auto").lower()
     selected = select_core_backend(
@@ -507,6 +668,7 @@ def enable_triton_kernels(*, required: bool = False) -> dict[str, bool]:
     setattr(DABSNCore, "_cuda_native_required", bool(required))
     setattr(DABSNRead, "_cuda_native_enabled", True)
     setattr(DABSNRead, "_cuda_native_required", bool(required))
+    setattr(DABSNCore, "_cuda_online_enabled", True)
     return {"core_scan": True, "admitted_three_way_read": True}
 
 
@@ -525,6 +687,7 @@ def triton_status() -> dict[str, object]:
         "train_dense_max_scores": int(os.environ.get("DABSN_TRAIN_DENSE_MAX_SCORES", "8388608")),
         "train_read_backend": os.environ.get("DABSN_TRAIN_READ_BACKEND", "dense_chunked"),
         "core_scan_enabled": bool(getattr(DABSNCore, "_cuda_native_enabled", False)),
+        "core_online_enabled": bool(getattr(DABSNCore, "_cuda_online_enabled", False)),
         "admitted_three_way_read_enabled": bool(getattr(DABSNRead, "_cuda_native_enabled", False)),
         "import_error": None if _IMPORT_ERROR is None else repr(_IMPORT_ERROR),
     }

@@ -2,9 +2,27 @@ include ARCHITECTURE.md
 include LICENSE
 include CITATION.cff
 include release.py
+include docs/online-temporal-credit-and-prepared-memory.md
 recursive-include examples *.py
-recursive-include tests *.py
-recursive-include tools *.py *.sh
+recursive-include tests *.py *.json *.toml
+recursive-include scripts *.py
+include tools/release_gate.py
+include tools/scale_bench.py
+include tools/fsdp_check.py
+include tools/fsdp_check.sh
+include tools/cpu_check.sh
+include tools/gpu_check.sh
+exclude tools/online_temporal_credit_t4_gate.py
+exclude tools/prepared_memory_read_gate.py
+exclude tools/sprint_gate.py
+exclude tools/build_sprint_gate.py
+exclude tools/kaggle_sprint_bootstrap.py
+exclude tests/test_sprint_gate.py
+exclude DABSN_SPRINT_KAGGLE_CELL.py
+prune docs/superpowers
+exclude tests/test_5x768_pretrain_notebook.py
+exclude tests/test_fullseq_chat_sft_notebook.py
+exclude tests/test_paper_assets.py
 recursive-include paper1 *.tex *.bib *.bbl *.md *.txt *.csv *.json *.py Makefile
 include paper1/main.pdf
 recursive-include paper1/figs *.pdf *.png

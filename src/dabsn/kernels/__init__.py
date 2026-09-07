@@ -37,6 +37,15 @@ class Primitive:
 
 PRIMITIVES = (
     Primitive(
+        "core_online_temporal_credit",
+        "dabsn.temporal_credit core online oracle",
+        "C++/OpenMP forward-time eligibility replay",
+        "Triton precise forward tape / CUDA forward-time replay",
+        "custom online autograd boundary",
+        ("seq", "field", "hybrid"),
+        "CPU/CUDA forward, full-signal gradient, eligibility, and resume parity",
+    ),
+    Primitive(
         "core_scan",
         "DABSNCore.forward / DABSNCore.forward_from_state",
         "C++/OpenMP",

@@ -10,6 +10,7 @@
 
 #include <torch/extension.h>
 #include <vector>
+#include <array>
 #include <cmath>
 #include <algorithm>
 #include <limits>
@@ -29,6 +30,101 @@ inline float softplusf(float x) {
 inline float hardsigmoidf(float x) {
   // torch F.hardsigmoid == relu6(x+3)/6 == clamp(x+3,0,6)/6
   return std::min(std::max(x + 3.0f, 0.0f), 6.0f) * (1.0f / 6.0f);
+}
+
+struct OnlineDual {
+  float value = 0.0f;
+  std::array<float, 23> derivative{};
+};
+
+inline OnlineDual online_constant(float value) {
+  OnlineDual result;
+  result.value = value;
+  return result;
+}
+
+inline OnlineDual online_basis(float value, int index) {
+  OnlineDual result = online_constant(value);
+  result.derivative[index] = 1.0f;
+  return result;
+}
+
+inline OnlineDual online_add(const OnlineDual& lhs, const OnlineDual& rhs) {
+  OnlineDual result;
+  result.value = lhs.value + rhs.value;
+  for (int i = 0; i < 23; ++i) result.derivative[i] = lhs.derivative[i] + rhs.derivative[i];
+  return result;
+}
+
+inline OnlineDual online_sub(const OnlineDual& lhs, const OnlineDual& rhs) {
+  OnlineDual result;
+  result.value = lhs.value - rhs.value;
+  for (int i = 0; i < 23; ++i) result.derivative[i] = lhs.derivative[i] - rhs.derivative[i];
+  return result;
+}
+
+inline OnlineDual online_mul(const OnlineDual& lhs, const OnlineDual& rhs) {
+  OnlineDual result;
+  result.value = lhs.value * rhs.value;
+  for (int i = 0; i < 23; ++i) {
+    result.derivative[i] = lhs.derivative[i] * rhs.value + lhs.value * rhs.derivative[i];
+  }
+  return result;
+}
+
+inline OnlineDual online_tanh(const OnlineDual& input) {
+  OnlineDual result;
+  result.value = std::tanh(input.value);
+  const float scale = 1.0f - result.value * result.value;
+  for (int i = 0; i < 23; ++i) result.derivative[i] = input.derivative[i] * scale;
+  return result;
+}
+
+inline OnlineDual online_abs(const OnlineDual& input) {
+  OnlineDual result;
+  result.value = std::fabs(input.value);
+  const float scale = input.value > 0.0f ? 1.0f : (input.value < 0.0f ? -1.0f : 0.0f);
+  for (int i = 0; i < 23; ++i) result.derivative[i] = input.derivative[i] * scale;
+  return result;
+}
+
+inline OnlineDual online_exp(const OnlineDual& input) {
+  OnlineDual result;
+  result.value = std::exp(input.value);
+  for (int i = 0; i < 23; ++i) result.derivative[i] = input.derivative[i] * result.value;
+  return result;
+}
+
+inline OnlineDual online_sigmoid(const OnlineDual& input) {
+  OnlineDual result;
+  result.value = sigmoidf(input.value);
+  const float scale = result.value * (1.0f - result.value);
+  for (int i = 0; i < 23; ++i) result.derivative[i] = input.derivative[i] * scale;
+  return result;
+}
+
+inline OnlineDual online_softplus(const OnlineDual& input) {
+  OnlineDual result;
+  result.value = softplusf(input.value);
+  const float scale = sigmoidf(input.value);
+  for (int i = 0; i < 23; ++i) result.derivative[i] = input.derivative[i] * scale;
+  return result;
+}
+
+inline OnlineDual online_hardsigmoid(const OnlineDual& input) {
+  OnlineDual result;
+  result.value = hardsigmoidf(input.value);
+  const float scale = input.value > -3.0f && input.value < 3.0f ? 1.0f / 6.0f : 0.0f;
+  for (int i = 0; i < 23; ++i) result.derivative[i] = input.derivative[i] * scale;
+  return result;
+}
+
+inline OnlineDual online_clamp01(const OnlineDual& input) {
+  OnlineDual result;
+  result.value = std::min(std::max(input.value, 0.0f), 1.0f);
+  const float scale = input.value > 0.0f && input.value < 1.0f ? 1.0f : 0.0f;
+  for (int i = 0; i < 23; ++i) result.derivative[i] = input.derivative[i] * scale;
+  return result;
 }
 
 inline float norm_clamp(const std::vector<float>& x) {
@@ -691,6 +787,7 @@ std::vector<torch::Tensor> dabsn_core_scan_fwd_train(
   torch::Tensor cout  = torch::empty({B, T, H}, opts);   // saturation = post-update c
   torch::Tensor bpre  = torch::empty({B, T, H}, opts);   // b entering step t
   torch::Tensor cpre  = torch::empty({B, T, H}, opts);   // c entering step t
+  torch::Tensor gatepre = torch::empty({B, T, H}, opts); // gate preactivation
   torch::Tensor bfinal = torch::empty({B, H}, opts);
   torch::Tensor efinal = torch::empty({B, H}, opts);
   torch::Tensor cfinal = torch::empty({B, H}, opts);
@@ -717,7 +814,7 @@ std::vector<torch::Tensor> dabsn_core_scan_fwd_train(
   float* Pp = pout.data_ptr<float>(); float* Ap = ayout.data_ptr<float>();
   float* Wp = wout.data_ptr<float>(); float* Ep = eout.data_ptr<float>();
   float* Cp = cout.data_ptr<float>(); float* Bpre = bpre.data_ptr<float>();
-  float* Cpre = cpre.data_ptr<float>();
+  float* Cpre = cpre.data_ptr<float>(); float* Gatepre = gatepre.data_ptr<float>();
   float* Bfinal = bfinal.data_ptr<float>();
   float* Efinal = efinal.data_ptr<float>();
   float* Cfinal = cfinal.data_ptr<float>();
@@ -746,7 +843,9 @@ std::vector<torch::Tensor> dabsn_core_scan_fwd_train(
       torch::Tensor ugay = torch::matmul(y, GA_t);
       torch::Tensor ug = ugay.slice(1, 0, H);
       torch::Tensor ay = ugay.slice(1, H, 2 * H);
-      torch::Tensor s = torch::clamp(wgx + ug + 3.0, 0.0, 6.0) * (1.0 / 6.0);
+      torch::Tensor gate_pre = wgx + ug;
+      gatepre.select(1, t).copy_(gate_pre);
+      torch::Tensor s = torch::clamp(gate_pre + 3.0, 0.0, 6.0) * (1.0 / 6.0);
       torch::Tensor novelty = torch::tanh(torch::abs(ay - b));
       torch::Tensor stress = novelty * (1.0 - e);
       c = c_decay * c + (1.0 - c_decay) * stress;
@@ -775,7 +874,7 @@ std::vector<torch::Tensor> dabsn_core_scan_fwd_train(
       b = bn;
       e = en;
     }
-    return {U, novel, pout, ayout, wout, eout, cout, bpre, cpre, b, e, c};
+    return {U, novel, pout, ayout, wout, eout, cout, bpre, cpre, b, e, c, gatepre};
   }
 
   #pragma omp parallel for schedule(static) if (B > 1)
@@ -803,7 +902,9 @@ std::vector<torch::Tensor> dabsn_core_scan_fwd_train(
       for (int64_t i = 0; i < H; ++i) {
         float b0 = b[i], e0 = e[i], c0 = c[i];
         Bpre[off + i] = b0; Cpre[off + i] = c0; Ep[off + i] = e0;
-        float s = hardsigmoidf(wgx[i] + ug[i]);
+        float gate_pre = wgx[i] + ug[i];
+        Gatepre[off + i] = gate_pre;
+        float s = hardsigmoidf(gate_pre);
         float novelty = std::tanh(std::fabs(ay[i] - b0));
         float c_decay = sigmoidf(lcd[i]);
         float stress = novelty * (1.0f - e0);
@@ -833,7 +934,7 @@ std::vector<torch::Tensor> dabsn_core_scan_fwd_train(
       Cfinal[bi * H + i] = c[i];
     }
   }
-  return {U, novel, pout, ayout, wout, eout, cout, bpre, cpre, bfinal, efinal, cfinal};
+  return {U, novel, pout, ayout, wout, eout, cout, bpre, cpre, bfinal, efinal, cfinal, gatepre};
 }
 
 // Backward: reverse-time scan. Grad inputs are for the 7 forward outputs
@@ -1072,6 +1173,319 @@ std::vector<torch::Tensor> dabsn_core_scan_bwd(
           dscal[0], dscal[1], dscal[2]};
 }
 
+// Forward-time online temporal-credit replay. This consumes only saved local
+// values and current-step output cotangents. It never performs reverse-time
+// recurrence and never reconstructs the four forward matrix-vector products.
+std::vector<torch::Tensor> dabsn_core_online_replay_cpu(
+    torch::Tensor inputs, torch::Tensor bpre, torch::Tensor epre, torch::Tensor cpre,
+    torch::Tensor y_tape, torch::Tensor ay_tape, torch::Tensor gate_pre_tape,
+    torch::Tensor gy_out, torch::Tensor gbn_out, torch::Tensor gnov_out,
+    torch::Tensor gp_out, torch::Tensor gay_out, torch::Tensor gwrite_out,
+    torch::Tensor ge_out, torch::Tensor gcpost_out,
+    torch::Tensor W, torch::Tensor A, torch::Tensor Wg, torch::Tensor Ug,
+    torch::Tensor Wg_bias, torch::Tensor beta, torch::Tensor log_kappa,
+    torch::Tensor logit_recover, torch::Tensor k_s, torch::Tensor k_y,
+    torch::Tensor k_b, torch::Tensor k_n, torch::Tensor k_bias,
+    torch::Tensor r_s, torch::Tensor r_y, torch::Tensor r_b, torch::Tensor r_n,
+    torch::Tensor r_bias, torch::Tensor k_c, torch::Tensor r_c,
+    torch::Tensor logit_alpha, torch::Tensor log_lambda,
+    torch::Tensor logit_c_decay, torch::Tensor logit_c_suppress,
+    torch::Tensor w_elig, torch::Tensor a_elig, torch::Tensor wg_elig,
+    torch::Tensor ug_elig, torch::Tensor local_elig, torch::Tensor global_elig) {
+
+  inputs = inputs.contiguous(); bpre = bpre.contiguous(); epre = epre.contiguous();
+  cpre = cpre.contiguous(); y_tape = y_tape.contiguous(); ay_tape = ay_tape.contiguous();
+  gate_pre_tape = gate_pre_tape.contiguous(); gy_out = gy_out.contiguous();
+  gbn_out = gbn_out.contiguous(); gnov_out = gnov_out.contiguous();
+  gp_out = gp_out.contiguous(); gay_out = gay_out.contiguous();
+  gwrite_out = gwrite_out.contiguous(); ge_out = ge_out.contiguous();
+  gcpost_out = gcpost_out.contiguous(); W = W.contiguous(); A = A.contiguous();
+  Wg = Wg.contiguous(); Ug = Ug.contiguous(); Wg_bias = Wg_bias.contiguous();
+  w_elig = w_elig.contiguous(); a_elig = a_elig.contiguous();
+  wg_elig = wg_elig.contiguous(); ug_elig = ug_elig.contiguous();
+  local_elig = local_elig.contiguous(); global_elig = global_elig.contiguous();
+
+  TORCH_CHECK(inputs.scalar_type() == torch::kFloat32, "online CPU replay requires float32");
+  const int64_t B = inputs.size(0), T = inputs.size(1), I = inputs.size(2);
+  const int64_t H = y_tape.size(2);
+  TORCH_CHECK(bpre.sizes() == torch::IntArrayRef({B, T, H}), "invalid budget tape shape");
+  TORCH_CHECK(epre.sizes() == bpre.sizes() && cpre.sizes() == bpre.sizes(), "invalid state tape shape");
+  TORCH_CHECK(W.sizes() == torch::IntArrayRef({H, I}), "invalid W shape");
+  TORCH_CHECK(A.sizes() == torch::IntArrayRef({H, H}), "invalid A shape");
+  TORCH_CHECK(Wg.sizes() == torch::IntArrayRef({H, I}), "invalid Wg shape");
+  TORCH_CHECK(Ug.sizes() == torch::IntArrayRef({H, H}), "invalid Ug shape");
+  TORCH_CHECK(w_elig.sizes() == torch::IntArrayRef({B, H, I}), "invalid W eligibility shape");
+  TORCH_CHECK(a_elig.sizes() == torch::IntArrayRef({B, H, H}), "invalid A eligibility shape");
+  TORCH_CHECK(wg_elig.sizes() == torch::IntArrayRef({B, H, I}), "invalid Wg eligibility shape");
+  TORCH_CHECK(ug_elig.sizes() == torch::IntArrayRef({B, H, H}), "invalid Ug eligibility shape");
+  TORCH_CHECK(local_elig.sizes() == torch::IntArrayRef({B, H, 3, 16}), "invalid local eligibility shape");
+  TORCH_CHECK(global_elig.sizes() == torch::IntArrayRef({B, H, 3, 4}), "invalid global eligibility shape");
+
+  auto opts = inputs.options().dtype(torch::kFloat32);
+  torch::Tensor next_w_elig = w_elig.clone();
+  torch::Tensor next_a_elig = a_elig.clone();
+  torch::Tensor next_wg_elig = wg_elig.clone();
+  torch::Tensor next_ug_elig = ug_elig.clone();
+  torch::Tensor next_local_elig = local_elig.clone();
+  torch::Tensor next_global_elig = global_elig.clone();
+  torch::Tensor grad_input = torch::zeros({B, T, I}, opts);
+  torch::Tensor dW = torch::zeros({H, I}, opts);
+  torch::Tensor dA = torch::zeros({H, H}, opts);
+  torch::Tensor dWg = torch::zeros({H, I}, opts);
+  torch::Tensor dUg = torch::zeros({H, H}, opts);
+  torch::Tensor dWg_bias = torch::zeros({H}, opts);
+  torch::Tensor dlocal = torch::zeros({16, H}, opts);
+  torch::Tensor dglobal = torch::zeros({4}, opts);
+
+  const float* xp = inputs.data_ptr<float>();
+  const float* bp = bpre.data_ptr<float>(); const float* ep = epre.data_ptr<float>();
+  const float* cp = cpre.data_ptr<float>(); const float* yp = y_tape.data_ptr<float>();
+  const float* ayp = ay_tape.data_ptr<float>(); const float* gateprep = gate_pre_tape.data_ptr<float>();
+  const float* gyop = gy_out.data_ptr<float>(); const float* gbnop = gbn_out.data_ptr<float>();
+  const float* gnop = gnov_out.data_ptr<float>(); const float* gpop = gp_out.data_ptr<float>();
+  const float* gayop = gay_out.data_ptr<float>(); const float* gwop = gwrite_out.data_ptr<float>();
+  const float* geop = ge_out.data_ptr<float>(); const float* gcop = gcpost_out.data_ptr<float>();
+  const float* Wp = W.data_ptr<float>(); const float* Ap = A.data_ptr<float>();
+  const float* Wgp = Wg.data_ptr<float>(); const float* Ugp = Ug.data_ptr<float>();
+  const float* Wgbp = Wg_bias.data_ptr<float>(); const float* betap = beta.data_ptr<float>();
+  const float* logkp = log_kappa.data_ptr<float>(); const float* logrp = logit_recover.data_ptr<float>();
+  const float* ksp = k_s.data_ptr<float>(); const float* kyp = k_y.data_ptr<float>();
+  const float* kbp = k_b.data_ptr<float>(); const float* knp = k_n.data_ptr<float>();
+  const float* kbiasp = k_bias.data_ptr<float>(); const float* rsp = r_s.data_ptr<float>();
+  const float* ryp = r_y.data_ptr<float>(); const float* rbp = r_b.data_ptr<float>();
+  const float* rnp = r_n.data_ptr<float>(); const float* rbiasp = r_bias.data_ptr<float>();
+  const float* kcp = k_c.data_ptr<float>(); const float* rcp = r_c.data_ptr<float>();
+  const float alpha_logit = logit_alpha.reshape({}).item<float>();
+  const float lambda_log = log_lambda.reshape({}).item<float>();
+  const float decay_logit = logit_c_decay.reshape({}).item<float>();
+  const float suppress_logit = logit_c_suppress.reshape({}).item<float>();
+  const float alpha = sigmoidf(alpha_logit), lam = softplusf(lambda_log);
+  const float decay = sigmoidf(decay_logit), suppress = sigmoidf(suppress_logit);
+
+  float* wep = next_w_elig.data_ptr<float>(); float* aep = next_a_elig.data_ptr<float>();
+  float* wgep = next_wg_elig.data_ptr<float>(); float* ugep = next_ug_elig.data_ptr<float>();
+  float* lep = next_local_elig.data_ptr<float>(); float* gep = next_global_elig.data_ptr<float>();
+  float* gxp = grad_input.data_ptr<float>(); float* dWp = dW.data_ptr<float>();
+  float* dAp = dA.data_ptr<float>(); float* dWgp = dWg.data_ptr<float>();
+  float* dUgp = dUg.data_ptr<float>(); float* dWgbp = dWg_bias.data_ptr<float>();
+  float* dlp = dlocal.data_ptr<float>(); float* dgp = dglobal.data_ptr<float>();
+
+  for (int64_t bi = 0; bi < B; ++bi) {
+    for (int64_t ti = 0; ti < T; ++ti) {
+      const int64_t step_off = (bi * T + ti) * H;
+      const int64_t x_off = (bi * T + ti) * I;
+      for (int64_t h = 0; h < H; ++h) {
+        const int64_t off = step_off + h;
+        const float b0 = bp[off], e0 = ep[off], c0 = cp[off];
+        const float y = yp[off], ay = ayp[off], gate_pre = gateprep[off];
+        const float gate = hardsigmoidf(gate_pre);
+        const float novelty = std::tanh(std::fabs(ay - b0));
+        const float stress = novelty * (1.0f - e0);
+        const float cpost = decay * c0 + (1.0f - decay) * stress;
+        const float p = gate * e0;
+
+        // Exact current-step local VJP for all public DABSNCore signals.
+        const float gbn = gbnop[off];
+        float gb0 = gbn * (1.0f - alpha);
+        float ge0 = geop[off];
+        float gc0 = 0.0f;
+        float gy = gyop[off];
+        float gay = gayop[off];
+        float gnov = gnop[off];
+        float gp = gpop[off];
+        float gcpost = gcop[off];
+        dlp[1 * H + h] += gbn;
+        dgp[0] += gbn * (-b0) * alpha * (1.0f - alpha);
+        dgp[1] += gbn * (p * ay) * sigmoidf(lambda_log);
+        const float gwrite = gwop[off] + gbn * lam;
+        gp += gwrite * ay;
+        gay += gwrite * p;
+        float gs = gp * e0;
+        ge0 += gp * gate;
+        gc0 += gcpost * decay;
+        const float gstress = gcpost * (1.0f - decay);
+        dgp[2] += gcpost * (c0 - stress) * decay * (1.0f - decay);
+        gnov += gstress * (1.0f - e0);
+        ge0 -= gstress * novelty;
+        const float diff = ay - b0;
+        const float sign = diff > 0.0f ? 1.0f : (diff < 0.0f ? -1.0f : 0.0f);
+        const float gdiff = gnov * (1.0f - novelty * novelty) * sign;
+        gay += gdiff;
+        gb0 -= gdiff;
+        const float hsp = gate_pre > -3.0f && gate_pre < 3.0f ? 1.0f / 6.0f : 0.0f;
+        const float ggate = gs * hsp;
+        dWgbp[h] += ggate;
+        for (int64_t j = 0; j < H; ++j) {
+          dAp[h * H + j] += gay * y_tape.data_ptr<float>()[step_off + j];
+          dUgp[h * H + j] += ggate * y_tape.data_ptr<float>()[step_off + j];
+        }
+        // The y cotangent receives A^T@gay and Ug^T@ggate from every output row.
+        // Build those row cotangents directly so no forward matvec is replayed.
+        float recurrent_y = 0.0f;
+        for (int64_t row = 0; row < H; ++row) {
+          const int64_t row_off = step_off + row;
+          float row_gay = gayop[row_off];
+          float row_gp = gpop[row_off];
+          const float row_gate = hardsigmoidf(gateprep[row_off]);
+          const float row_p = row_gate * ep[row_off];
+          const float row_gbn = gbnop[row_off];
+          const float row_gwrite = gwop[row_off] + row_gbn * lam;
+          row_gp += row_gwrite * ayp[row_off];
+          row_gay += row_gwrite * row_p;
+          const float row_novelty = std::tanh(std::fabs(ayp[row_off] - bp[row_off]));
+          const float row_stress = row_novelty * (1.0f - ep[row_off]);
+          const float row_cpost = decay * cp[row_off] + (1.0f - decay) * row_stress;
+          (void)row_cpost;
+          float row_gnov = gnop[row_off] + gcop[row_off] * (1.0f - decay) * (1.0f - ep[row_off]);
+          const float row_diff = ayp[row_off] - bp[row_off];
+          const float row_sign = row_diff > 0.0f ? 1.0f : (row_diff < 0.0f ? -1.0f : 0.0f);
+          row_gay += row_gnov * (1.0f - row_novelty * row_novelty) * row_sign;
+          const float row_gs = row_gp * ep[row_off];
+          const float row_hsp = gateprep[row_off] > -3.0f && gateprep[row_off] < 3.0f ? 1.0f / 6.0f : 0.0f;
+          const float row_ggate = row_gs * row_hsp;
+          recurrent_y += Ap[row * H + h] * row_gay + Ugp[row * H + h] * row_ggate;
+        }
+        gy += recurrent_y;
+        const float ypre_grad = gy * (1.0f - y * y);
+        const float incoming[3] = {gb0 + ypre_grad, ge0, gc0};
+
+        // Eligibility contraction uses the state entering this step.
+        const int64_t wbase = (bi * H + h) * I;
+        const int64_t hbase = (bi * H + h) * H;
+        for (int64_t i = 0; i < I; ++i) {
+          dWp[h * I + i] += incoming[0] * wep[wbase + i] + ypre_grad * xp[x_off + i];
+          dWgp[h * I + i] += incoming[0] * wgep[wbase + i] + ggate * xp[x_off + i];
+          gxp[x_off + i] += ypre_grad * Wp[h * I + i] + ggate * Wgp[h * I + i];
+        }
+        for (int64_t j = 0; j < H; ++j) {
+          dAp[h * H + j] += incoming[0] * aep[hbase + j];
+          dUgp[h * H + j] += incoming[0] * ugep[hbase + j];
+        }
+        const int64_t lbase = ((bi * H + h) * 3) * 16;
+        const int64_t gbase = ((bi * H + h) * 3) * 4;
+        for (int pindex = 0; pindex < 16; ++pindex) {
+          float value = 0.0f;
+          for (int state_index = 0; state_index < 3; ++state_index) {
+            value += incoming[state_index] * lep[lbase + state_index * 16 + pindex];
+          }
+          dlp[pindex * H + h] += value;
+        }
+        for (int pindex = 0; pindex < 4; ++pindex) {
+          float value = 0.0f;
+          for (int state_index = 0; state_index < 3; ++state_index) {
+            value += incoming[state_index] * gep[gbase + state_index * 4 + pindex];
+          }
+          dgp[pindex] += value;
+        }
+
+        // Advance the full hybrid trace exactly once, after contraction.
+        OnlineDual budget_d = online_basis(b0, 0);
+        OnlineDual energy_d = online_basis(e0, 1);
+        OnlineDual saturation_d = online_basis(c0, 2);
+        OnlineDual local[16] = {
+          online_basis(Wgbp[h], 3), online_basis(betap[h], 4),
+          online_basis(logkp[h], 5), online_basis(logrp[h], 6),
+          online_basis(ksp[h], 7), online_basis(kyp[h], 8),
+          online_basis(kbp[h], 9), online_basis(knp[h], 10),
+          online_basis(kbiasp[h], 11), online_basis(rsp[h], 12),
+          online_basis(ryp[h], 13), online_basis(rbp[h], 14),
+          online_basis(rnp[h], 15), online_basis(rbiasp[h], 16),
+          online_basis(kcp[h], 17), online_basis(rcp[h], 18)
+        };
+        OnlineDual globals[4] = {
+          online_basis(alpha_logit, 19), online_basis(lambda_log, 20),
+          online_basis(decay_logit, 21), online_basis(suppress_logit, 22)
+        };
+        OnlineDual y_d = online_constant(y);
+        for (int d = 0; d < 23; ++d) y_d.derivative[d] = budget_d.derivative[d] * (1.0f - y * y);
+        OnlineDual ay_d = online_constant(ay);
+        OnlineDual gate_pre_d = online_constant(gate_pre);
+        for (int d = 0; d < 23; ++d) {
+          ay_d.derivative[d] = Ap[h * H + h] * y_d.derivative[d];
+          gate_pre_d.derivative[d] = Ugp[h * H + h] * y_d.derivative[d] + local[0].derivative[d];
+        }
+        OnlineDual gate_d = online_hardsigmoid(gate_pre_d);
+        OnlineDual novelty_d = online_tanh(online_abs(online_sub(ay_d, budget_d)));
+        OnlineDual decay_d = online_sigmoid(globals[2]);
+        OnlineDual stress_d = online_mul(novelty_d, online_sub(online_constant(1.0f), energy_d));
+        OnlineDual cpost_d = online_add(
+            online_mul(decay_d, saturation_d),
+            online_mul(online_sub(online_constant(1.0f), decay_d), stress_d));
+        OnlineDual suppress_d = online_sigmoid(globals[3]);
+        OnlineDual novel_eff_d = online_mul(
+            novelty_d,
+            online_sub(online_constant(1.0f), online_mul(suppress_d, cpost_d)));
+        OnlineDual ksignal_d = online_add(
+            online_add(online_add(online_mul(local[4], gate_d), online_mul(local[5], y_d)),
+                       online_add(online_mul(local[6], online_tanh(budget_d)), online_mul(local[7], novel_eff_d))),
+            online_add(local[8], online_mul(local[14], cpost_d)));
+        OnlineDual rsignal_d = online_add(
+            online_add(online_add(online_mul(local[9], gate_d), online_mul(local[10], y_d)),
+                       online_add(online_mul(local[11], online_tanh(budget_d)), online_mul(local[12], novel_eff_d))),
+            online_add(local[13], online_mul(local[15], cpost_d)));
+        OnlineDual write_cost_d = online_mul(
+            online_softplus(local[2]), online_exp(online_mul(online_constant(0.5f), online_tanh(ksignal_d))));
+        OnlineDual recovery_d = online_clamp01(online_mul(
+            online_sigmoid(local[3]), online_exp(online_mul(online_constant(0.5f), online_tanh(rsignal_d)))));
+        OnlineDual plasticity_d = online_mul(gate_d, energy_d);
+        OnlineDual alpha_d = online_sigmoid(globals[0]);
+        OnlineDual lambda_d = online_softplus(globals[1]);
+        OnlineDual next_budget_d = online_add(
+            online_add(online_mul(online_sub(online_constant(1.0f), alpha_d), budget_d), local[1]),
+            online_mul(lambda_d, online_mul(plasticity_d, ay_d)));
+        OnlineDual next_energy_d = online_clamp01(online_sub(
+            online_add(energy_d, online_mul(recovery_d, online_sub(online_constant(1.0f), energy_d))),
+            online_mul(write_cost_d, plasticity_d)));
+        const OnlineDual states[3] = {next_budget_d, next_energy_d, cpost_d};
+        float jacobian[3][3];
+        for (int out_state = 0; out_state < 3; ++out_state) {
+          for (int in_state = 0; in_state < 3; ++in_state) {
+            jacobian[out_state][in_state] = states[out_state].derivative[in_state];
+          }
+        }
+        float old_local[3][16]; float old_global[3][4];
+        for (int si = 0; si < 3; ++si) {
+          for (int pi = 0; pi < 16; ++pi) old_local[si][pi] = lep[lbase + si * 16 + pi];
+          for (int pi = 0; pi < 4; ++pi) old_global[si][pi] = gep[gbase + si * 4 + pi];
+        }
+        for (int out_state = 0; out_state < 3; ++out_state) {
+          for (int pi = 0; pi < 16; ++pi) {
+            float value = states[out_state].derivative[3 + pi];
+            for (int in_state = 0; in_state < 3; ++in_state) value += jacobian[out_state][in_state] * old_local[in_state][pi];
+            lep[lbase + out_state * 16 + pi] = value;
+          }
+          for (int pi = 0; pi < 4; ++pi) {
+            float value = states[out_state].derivative[19 + pi];
+            for (int in_state = 0; in_state < 3; ++in_state) value += jacobian[out_state][in_state] * old_global[in_state][pi];
+            gep[gbase + out_state * 4 + pi] = value;
+          }
+        }
+        const float jbb = next_budget_d.derivative[0];
+        const float dy = 1.0f - y * y;
+        const float common = lam * e0;
+        const float direct_common = ay * hsp * Ugp[h * H + h] + gate * Ap[h * H + h];
+        for (int64_t i = 0; i < I; ++i) {
+          wep[wbase + i] = jbb * wep[wbase + i] + common * dy * xp[x_off + i] * direct_common;
+          wgep[wbase + i] = jbb * wgep[wbase + i] + common * ay * hsp * xp[x_off + i];
+        }
+        for (int64_t j = 0; j < H; ++j) {
+          aep[hbase + j] = jbb * aep[hbase + j] + common * gate * yp[step_off + j];
+          ugep[hbase + j] = jbb * ugep[hbase + j] + common * ay * hsp * yp[step_off + j];
+        }
+      }
+    }
+  }
+
+  return {
+      next_w_elig, next_a_elig, next_wg_elig, next_ug_elig, next_local_elig,
+      next_global_elig, grad_input, dW, dA, dWg, dUg, dWg_bias + dlocal[0],
+      dlocal[1], dglobal[0].reshape_as(logit_alpha), dglobal[1].reshape_as(log_lambda),
+      dlocal[2], dlocal[3], dlocal[4], dlocal[5], dlocal[6], dlocal[7], dlocal[8],
+      dlocal[9], dlocal[10], dlocal[11], dlocal[12], dlocal[13],
+      dglobal[2].reshape_as(logit_c_decay), dlocal[14], dlocal[15],
+      dglobal[3].reshape_as(logit_c_suppress)};
+}
+
 torch::Tensor permanent_delta_scan_cpu(
     torch::Tensor key, torch::Tensor value, torch::Tensor beta) {
   key = key.contiguous(); value = value.contiguous(); beta = beta.contiguous();
@@ -1250,6 +1664,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "DABSN core scan forward-train with state trajectory");
   m.def("dabsn_core_scan_bwd", &dabsn_core_scan_bwd,
         "DABSN core reverse-time backward");
+  m.def("dabsn_core_online_replay_cpu", &dabsn_core_online_replay_cpu,
+        "DABSN core forward-time online temporal-credit replay (CPU/OpenMP, fp32)");
   m.def("permanent_delta_scan_cpu", &permanent_delta_scan_cpu,
         "DABSN permanent delta scan (CPU/OpenMP)");
   m.def("permanent_delta_scan_bwd_cpu", &permanent_delta_scan_bwd_cpu,

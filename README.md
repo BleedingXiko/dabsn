@@ -24,6 +24,32 @@ Multi-GPU execution offers DDP and block-wrapped FSDP with full parameter,
 gradient, and optimizer sharding, plus tensor parallelism over the recurrent
 hidden dimension and expert parallelism over MoE experts.
 
+## New: online temporal credit and prepared memory
+
+The current source adds two framework capabilities:
+
+- **Architecture-specific online temporal credit:** `temporal_credit="online"`
+  runs the DABSN core with carried eligibility state and bounded autograd chunks.
+  It includes native C++ core replay and a CUDA path using a precise Triton
+  forward tape and compiled analytic replay. The long-memory recurrence also
+  carries eligibility. MLPs, MoEs, projections and heads keep ordinary spatial
+  autograd; they are not part of `DABSNCore`.
+- **Prepared dynamic inference memory:** prepare an existing memory once, then
+  query or extend admitted-event pages without rebuilding historical admission.
+  Each page computes its query/content score once for all three reads, preserving
+  the existing admission and chronological-successor semantics. No fixed top-k,
+  eviction, ANN or lossy compression is introduced. Existing training reads and
+  the default BPTT path remain unchanged.
+
+See the [API examples and contracts](docs/online-temporal-credit-and-prepared-memory.md)
+for state handling, native backends, checkpoint resume, and prepared `.dmem` files.
+
+The online core uses DABSN's structured eligibility rule; it is not a claim of
+generic exact RTRL or full-stack BPTT gradient equivalence. Eligibility storage
+is independent of elapsed context at fixed batch/parameter dimensions, but
+retained read-bank storage can still grow. Prepared carried-memory inference
+currently follows the existing sequence-geometry memory contract.
+
 ### What this is, and what it is not
 
 DABSN is a **model and runtime library, not a training framework.** Every model

@@ -123,7 +123,13 @@ class DABSNRead(nn.Module):
         energy: Tensor,
         saturation: Tensor,
         field_shape: tuple[int, int] | None = None,
-    ) -> Tensor:
+        *,
+        temporal_credit: str = "bptt",
+        initial_long_state: tuple[Tensor, Tensor, Tensor] | None = None,
+        long_eligibility_state=None,
+        online_long_frame=None,
+        return_long_state: bool = False,
+    ):
         return self._unified_forward(
             y,
             budget,
@@ -134,6 +140,11 @@ class DABSNRead(nn.Module):
             energy,
             saturation,
             field_shape,
+            temporal_credit=temporal_credit,
+            initial_long_state=initial_long_state,
+            long_eligibility_state=long_eligibility_state,
+            online_long_frame=online_long_frame,
+            return_long_state=return_long_state,
         )
 
     def _unified_forward(
@@ -147,7 +158,13 @@ class DABSNRead(nn.Module):
         energy: Tensor,
         saturation: Tensor,
         field_shape: tuple[int, int] | None = None,
-    ) -> Tensor:
+        *,
+        temporal_credit: str = "bptt",
+        initial_long_state: tuple[Tensor, Tensor, Tensor] | None = None,
+        long_eligibility_state=None,
+        online_long_frame=None,
+        return_long_state: bool = False,
+    ):
         del field_shape
         read_parameters = self.short_read
         batch, seq_len, hidden = expression.shape
@@ -223,7 +240,10 @@ class DABSNRead(nn.Module):
         capturing = expression.is_cuda and _stream_is_capturing()
         capture_safe_bank = bool(getattr(self, "_capture_safe_bank", False)) or capturing
         fake_tensor = not compiling and is_fake(expression)
-        if fake_tensor:
+        if compiling or fake_tensor:
+            # Full-graph compilation needs a static buffer capacity. Admission
+            # remains data-dependent on device through seq_valid; eager reads
+            # still compact to counts.max(). Avoid unbacked item()/SymMax sizes.
             n_max = seq_len
         elif capture_safe_bank:
             cap = getattr(self, "_capture_bank_width", None)
@@ -433,9 +453,48 @@ class DABSNRead(nn.Module):
             )
 
         output = read_parameters.out(torch.cat([y, budget, retrieved], dim=-1))
-        long = self._long_scan(write, plasticity, novelty)
+        if temporal_credit == "online":
+            if (
+                initial_long_state is None
+                or long_eligibility_state is None
+                or online_long_frame is None
+            ):
+                raise ValueError(
+                    "online long read requires recurrent state, eligibility, and frame"
+                )
+            from .temporal_credit import long_read_online_autograd
+
+            long, final_long_state = long_read_online_autograd(
+                self,
+                write,
+                plasticity,
+                novelty,
+                initial_long_state,
+                long_eligibility_state,
+                online_long_frame,
+            )
+        elif temporal_credit == "bptt":
+            if long_eligibility_state is not None or online_long_frame is not None:
+                raise ValueError("BPTT long read does not accept online eligibility state")
+            long_result = self._long_scan_from_state(
+                write,
+                plasticity,
+                novelty,
+                initial_state=initial_long_state,
+                return_final_state=return_long_state,
+            )
+            if return_long_state:
+                long, final_long_state = long_result
+            else:
+                long = long_result
+                final_long_state = None
+        else:
+            raise ValueError("temporal_credit must be bptt or online")
         self.last_long_scan_norm = float(long.detach().norm().cpu()) if trace_enabled else None
-        return output + self.long_gain * long
+        result = output + self.long_gain * long
+        if return_long_state:
+            return result, final_long_state
+        return result
 
     def _admitted_read(
         self,
@@ -666,9 +725,14 @@ class DABSNRead(nn.Module):
         bank_p: Tensor,
         bank_energy: Tensor,
         bank_saturation: Tensor,
-        query_start: int,
+        query_start: int | Tensor,
+        bank_valid_mask: Tensor | None = None,
+        bank_positions: Tensor | None = None,
         initial_long_state: tuple[Tensor, Tensor, Tensor] | None = None,
         return_long_state: bool = False,
+        temporal_credit: str = "bptt",
+        long_eligibility_state=None,
+        online_long_frame=None,
     ):
         del bank_y, bank_b, bank_ay
         if self.read_geometry != "seq":
@@ -678,7 +742,32 @@ class DABSNRead(nn.Module):
         bank_len = bank_write.shape[1]
         if bank_len <= 0:
             raise RuntimeError("query-bank read requires a non-empty bank")
-        query_start = int(query_start)
+        if torch.is_tensor(query_start):
+            query_starts = query_start.to(device=expression.device, dtype=torch.int64)
+            if tuple(query_starts.shape) != (batch,):
+                raise ValueError("query_start tensor must have shape [B]")
+        else:
+            query_starts = torch.full(
+                (batch,), int(query_start), device=expression.device, dtype=torch.int64
+            )
+        if bank_valid_mask is None:
+            bank_valid_mask = torch.ones(
+                batch, bank_len, dtype=torch.bool, device=expression.device
+            )
+        elif bank_valid_mask.dtype != torch.bool or tuple(bank_valid_mask.shape) != (
+            batch,
+            bank_len,
+        ):
+            raise ValueError("bank_valid_mask must be bool [B,N]")
+        if bank_positions is None:
+            bank_positions = torch.arange(
+                bank_len, dtype=torch.int64, device=expression.device
+            ).unsqueeze(0).expand(batch, -1)
+        elif bank_positions.dtype != torch.int64 or tuple(bank_positions.shape) != (
+            batch,
+            bank_len,
+        ):
+            raise ValueError("bank_positions must be int64 [B,N]")
 
         query = F.normalize(expression, dim=-1)
         # Keys normalized after the gather (Phase 2c) -- see the short read: the
@@ -721,11 +810,12 @@ class DABSNRead(nn.Module):
         )
 
         window = F.softplus(self.admit_window)
-        admit_floor = torch.cummax(admission, dim=1).values - window
-        member = admission >= admit_floor
+        masked_admission = admission.masked_fill(~bank_valid_mask, -torch.inf)
+        admit_floor = torch.cummax(masked_admission, dim=1).values - window
+        member = (admission >= admit_floor) & bank_valid_mask
         counts = member.sum(dim=1)
         fake_tensor = not torch.compiler.is_compiling() and is_fake(expression)
-        n_max = bank_len if fake_tensor else max(int(counts.max().item()), 1)
+        n_max = bank_len if torch.compiler.is_compiling() or fake_tensor else max(int(counts.max().item()), 1)
         order = torch.argsort(
             member.to(query.dtype),
             dim=1,
@@ -747,6 +837,7 @@ class DABSNRead(nn.Module):
         )
         selected_bias = torch.gather(key_bias, 1, bank_idx)
         selected_admission = torch.gather(admission, 1, bank_idx)
+        selected_positions = torch.gather(bank_positions, 1, bank_idx)
         next_idx = (bank_idx + 1).clamp(max=bank_len - 1)
         next_writes = torch.gather(
             bank_write,
@@ -760,11 +851,11 @@ class DABSNRead(nn.Module):
         if compact_cuda:
             allow = induct_allow = eligible = induct_eligible = None
         else:
-            query_pos = (query_start + torch.arange(query_len, device=expression.device)).view(
-                1, query_len, 1
-            )
-            allow = (bank_idx.unsqueeze(1) <= query_pos) & bank_valid.unsqueeze(1)
-            induct_allow = (bank_idx.unsqueeze(1) < query_pos) & bank_valid.unsqueeze(1)
+            query_pos = query_starts.view(batch, 1, 1) + torch.arange(
+                query_len, device=expression.device
+            ).view(1, query_len, 1)
+            allow = (selected_positions.unsqueeze(1) <= query_pos) & bank_valid.unsqueeze(1)
+            induct_allow = (selected_positions.unsqueeze(1) < query_pos) & bank_valid.unsqueeze(1)
             eligible = allow.any(dim=-1)
             induct_eligible = induct_allow.any(dim=-1)
         retrieved = self._admitted_read(
@@ -781,7 +872,7 @@ class DABSNRead(nn.Module):
             induct_allow,
             eligible,
             induct_eligible,
-            bank_idx=bank_idx - query_start,
+            bank_idx=selected_positions - query_starts.unsqueeze(1),
             bank_valid=bank_valid,
             mode="seq",
         )
@@ -812,25 +903,199 @@ class DABSNRead(nn.Module):
                 "dense_masks_materialized": not compact_cuda,
                 "context_parallel": True,
                 "query_only": True,
-                "query_start": query_start,
+                "query_start": (
+                    int(query_starts[0].item())
+                    if bool(torch.all(query_starts == query_starts[0]).item())
+                    else tuple(int(value) for value in query_starts.tolist())
+                ),
                 "bank_entries": int(bank_len),
                 "admission_policy": "causal_write_prefix_max",
                 "kernel_backend": kernel_backend,
             }
 
         short_output = read_parameters.out(torch.cat([y, budget, retrieved], dim=-1))
-        long_result = self._long_scan_from_state(
-            write,
-            plasticity,
-            novelty,
-            initial_state=initial_long_state,
-            return_final_state=return_long_state,
-        )
-        if return_long_state:
-            long, final_long_state = long_result
+        if temporal_credit == "online":
+            if (
+                initial_long_state is None
+                or long_eligibility_state is None
+                or online_long_frame is None
+            ):
+                raise ValueError(
+                    "online query-bank read requires recurrent state, eligibility, and frame"
+                )
+            from .temporal_credit import long_read_online_autograd
+
+            long, final_long_state = long_read_online_autograd(
+                self,
+                write,
+                plasticity,
+                novelty,
+                initial_long_state,
+                long_eligibility_state,
+                online_long_frame,
+            )
+        elif temporal_credit == "bptt":
+            if long_eligibility_state is not None or online_long_frame is not None:
+                raise ValueError("BPTT query-bank read does not accept online eligibility state")
+            long_result = self._long_scan_from_state(
+                write,
+                plasticity,
+                novelty,
+                initial_state=initial_long_state,
+                return_final_state=return_long_state,
+            )
+            if return_long_state:
+                long, final_long_state = long_result
+            else:
+                long = long_result
+                final_long_state = None
         else:
-            long = long_result
-            final_long_state = None
+            raise ValueError("temporal_credit must be bptt or online")
+        self.last_long_scan_norm = float(long.detach().norm().cpu()) if trace_enabled else None
+        output = short_output + self.long_gain * long
+        if return_long_state:
+            return output, final_long_state
+        return output
+
+    def forward_query_prepared(
+        self,
+        y: Tensor,
+        budget: Tensor,
+        expression: Tensor,
+        write: Tensor,
+        novelty: Tensor,
+        plasticity: Tensor,
+        energy: Tensor,
+        saturation: Tensor,
+        *,
+        bank,
+        query_start: int | Tensor,
+        initial_long_state: tuple[Tensor, Tensor, Tensor] | None = None,
+        return_long_state: bool = False,
+        temporal_credit: str = "bptt",
+        long_eligibility_state=None,
+        online_long_frame=None,
+    ):
+        """Query an already admitted paged bank without rebuilding its metadata."""
+        if self.read_geometry != "seq":
+            raise RuntimeError("prepared query-bank read is exact only for seq geometry")
+        from .prepared_memory import prepared_three_way_read, read_parameter_identity
+
+        if bank.identity.get("read_parameters") != read_parameter_identity(self):
+            raise ValueError("prepared bank read parameters do not match the current read")
+        batch, query_len, hidden = expression.shape
+        if torch.is_tensor(query_start):
+            query_starts = query_start.to(device=expression.device, dtype=torch.int64)
+            if tuple(query_starts.shape) != (batch,):
+                raise ValueError("query_start tensor must have shape [B]")
+        else:
+            query_starts = torch.full(
+                (batch,), int(query_start), device=expression.device, dtype=torch.int64
+            )
+        if int(bank.entries.shape[0]) != batch:
+            raise ValueError("prepared bank batch does not match query batch")
+
+        query = F.normalize(expression, dim=-1)
+        query_cocktail = F.normalize(
+            torch.stack(
+                [
+                    energy.mean(dim=-1),
+                    saturation.mean(dim=-1),
+                    novelty.mean(dim=-1),
+                    plasticity.mean(dim=-1),
+                ],
+                dim=-1,
+            ),
+            dim=-1,
+        )
+        parameters = self.short_read
+        scale = (F.softplus(parameters.log_temp) + 1.0) * (hidden**0.5)
+        retrieved = prepared_three_way_read(
+            query,
+            query_cocktail,
+            bank,
+            query_starts,
+            scale=scale,
+            short_gain=self.short_gain,
+            pad_gain=self.pad_gain,
+            induct_gain=self.induct_gain,
+            cocktail_gain=self.cocktail_gain,
+        )
+
+        compiling = torch.compiler.is_compiling()
+        trace_enabled = not compiling and (self.collect_traces or not expression.is_cuda)
+        if not compiling:
+            n_max = int(bank.entries.max().item())
+            self.last_n_max = n_max
+            self.last_hybrid_gate = None
+            self.last_seq_norm = float(retrieved.detach().norm().cpu()) if trace_enabled else None
+            self.last_field_norm = None
+            self.last_field_neighbors = None
+            self.last_read_contract = {
+                "read_strategy": "prepared_paged_admitted_bank",
+                "exact": True,
+                "approximation_reason": None,
+                "bank_growth": "data_dependent_committed_events",
+                "stored_writes_preserved": True,
+                "max_admitted_bank": n_max,
+                "estimated_read_work": int(batch) * int(query_len) * n_max * 3,
+                "dense_masks_materialized": False,
+                "context_parallel": True,
+                "query_only": True,
+                "query_start": (
+                    int(query_starts[0].item())
+                    if bool(torch.all(query_starts == query_starts[0]).item())
+                    else tuple(int(value) for value in query_starts.tolist())
+                ),
+                "bank_entries": tuple(int(value) for value in bank.entries.tolist()),
+                "admission_policy": "prepared_causal_write_prefix_max",
+                "kernel_backend": (
+                    "cuda_inductor_pagewise_bmm_score_once"
+                    if expression.is_cuda
+                    else "torch_pagewise_score_once"
+                ),
+                "page_size": int(bank.page_size),
+                "page_count": len(bank.pages),
+            }
+
+        short_output = parameters.out(torch.cat([y, budget, retrieved], dim=-1))
+        if temporal_credit == "online":
+            if (
+                initial_long_state is None
+                or long_eligibility_state is None
+                or online_long_frame is None
+            ):
+                raise ValueError(
+                    "online prepared read requires recurrent state, eligibility, and frame"
+                )
+            from .temporal_credit import long_read_online_autograd
+
+            long, final_long_state = long_read_online_autograd(
+                self,
+                write,
+                plasticity,
+                novelty,
+                initial_long_state,
+                long_eligibility_state,
+                online_long_frame,
+            )
+        elif temporal_credit == "bptt":
+            if long_eligibility_state is not None or online_long_frame is not None:
+                raise ValueError("BPTT prepared read does not accept online eligibility state")
+            long_result = self._long_scan_from_state(
+                write,
+                plasticity,
+                novelty,
+                initial_state=initial_long_state,
+                return_final_state=return_long_state,
+            )
+            if return_long_state:
+                long, final_long_state = long_result
+            else:
+                long = long_result
+                final_long_state = None
+        else:
+            raise ValueError("temporal_credit must be bptt or online")
         self.last_long_scan_norm = float(long.detach().norm().cpu()) if trace_enabled else None
         output = short_output + self.long_gain * long
         if return_long_state:

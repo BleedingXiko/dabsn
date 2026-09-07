@@ -24,7 +24,9 @@ def test_import_succeeds_without_native_register_autocast():
                 "import torch; "
                 "delattr(torch.library, 'register_autocast'); "
                 "import dabsn; "
-                "print(dabsn.__version__)"
+                "assert dabsn.__version__; "
+                "assert callable(dabsn.DABSNCore); "
+                "print('DABSN import succeeded')"
             ),
         ],
         cwd=root,
@@ -34,7 +36,7 @@ def test_import_succeeds_without_native_register_autocast():
         check=False,
     )
     assert result.returncode == 0, result.stdout + result.stderr
-    assert "0.1.8" in result.stdout
+    assert "DABSN import succeeded" in result.stdout
 
 
 def test_backported_autocast_rule_casts_and_redispatches(monkeypatch):

@@ -24,6 +24,7 @@ from .components import (
 from .config import (
     DABSNConfig,
     DABSNLayerSpec,
+    TemporalCreditMode,
     coerce_layer_specs,
     resolve_dabsn_layers,
 )
@@ -371,6 +372,123 @@ class DABSNBlock(nn.Module):
         }
         return output
 
+    def forward_world_online(self, inputs: Tensor, layer_state):
+        """Run one bounded online-credit chunk from explicit layer state."""
+
+        from .temporal_credit import (
+            OnlineCoreFrame,
+            OnlineLayerState,
+            OnlineLongReadFrame,
+        )
+
+        if not isinstance(layer_state, OnlineLayerState):
+            raise TypeError("forward_world_online requires OnlineLayerState")
+        core_frame = OnlineCoreFrame(layer_state.core_eligibility)
+        result, final_core = self.core.forward_from_state(
+            inputs,
+            initial_state=layer_state.core_recurrent,
+            return_writes=True,
+            return_cocktail=True,
+            return_final_state=True,
+            temporal_credit="online",
+            eligibility_state=layer_state.core_eligibility,
+            online_frame=core_frame,
+        )
+        trajectory, novelty, plasticity, expression, write, energy, saturation = result
+        y, budget = trajectory.split(self.state_dim, dim=-1)
+        long_frame = OnlineLongReadFrame(layer_state.long_eligibility)
+        if self.read_geometry == "seq":
+            batch, chunk_steps = write.shape[:2]
+            if layer_state.read_bank:
+                old_counts = layer_state.read_bank["valid"].sum(dim=1, dtype=torch.int64)
+            else:
+                old_counts = torch.zeros(batch, dtype=torch.int64, device=write.device)
+            chunk_bank = {
+                "write": write,
+                "novelty_mean": novelty.mean(dim=-1),
+                "plasticity_mean": plasticity.mean(dim=-1),
+                "energy_mean": energy.mean(dim=-1),
+                "saturation_mean": saturation.mean(dim=-1),
+                "valid": torch.ones(
+                    batch, chunk_steps, dtype=torch.bool, device=write.device
+                ),
+                "position": old_counts.unsqueeze(1)
+                + torch.arange(chunk_steps, dtype=torch.int64, device=write.device).unsqueeze(0),
+            }
+            bank = (
+                chunk_bank
+                if not layer_state.read_bank
+                else {
+                    name: torch.cat((layer_state.read_bank[name], value), dim=1)
+                    for name, value in chunk_bank.items()
+                }
+            )
+
+            def widen(name: str) -> Tensor:
+                return bank[f"{name}_mean"].unsqueeze(-1).expand(-1, -1, self.state_dim)
+
+            read, final_long = self.read.forward_query_bank(
+                y,
+                budget,
+                expression,
+                write,
+                novelty,
+                plasticity,
+                energy,
+                saturation,
+                bank_y=None,
+                bank_b=None,
+                bank_ay=None,
+                bank_write=bank["write"],
+                bank_novelty=widen("novelty"),
+                bank_p=widen("plasticity"),
+                bank_energy=widen("energy"),
+                bank_saturation=widen("saturation"),
+                query_start=old_counts,
+                bank_valid_mask=bank["valid"],
+                bank_positions=bank["position"],
+                initial_long_state=layer_state.long_recurrent,
+                return_long_state=True,
+                temporal_credit="online",
+                long_eligibility_state=layer_state.long_eligibility,
+                online_long_frame=long_frame,
+            )
+            next_bank = {name: value.detach() for name, value in bank.items()}
+        else:
+            if layer_state.read_bank:
+                raise ValueError("only seq geometry may carry an online query bank")
+            read, final_long = self.read(
+                y,
+                budget,
+                expression,
+                write,
+                novelty,
+                plasticity,
+                energy,
+                saturation,
+                field_shape=None,
+                temporal_credit="online",
+                initial_long_state=layer_state.long_recurrent,
+                long_eligibility_state=layer_state.long_eligibility,
+                online_long_frame=long_frame,
+                return_long_state=True,
+            )
+            next_bank = {}
+        dabsn_output = self.state_to_hidden(y + self.read_gain * read)
+        output = self._finish_block(inputs, dabsn_output)
+        next_layer = OnlineLayerState(
+            core_recurrent=tuple(value.detach() for value in final_core),
+            core_eligibility=layer_state.core_eligibility,
+            long_recurrent=tuple(value.detach() for value in final_long),
+            long_eligibility=layer_state.long_eligibility,
+            read_bank=next_bank,
+        )
+        return output, next_layer, (core_frame, long_frame)
+
+    def forward_online(self, inputs: Tensor, layer_state):
+        hidden, next_layer, frames = self.forward_world_online(inputs, layer_state)
+        return self.forward_mlp(hidden), next_layer, frames
+
     def forward(self, inputs: Tensor, _dabsn_only: bool = False) -> Tensor:
         """0.1.x wrapper: DABSN world transform followed by translated MLP."""
 
@@ -535,6 +653,46 @@ class DABSNBackbone(nn.Module):
             return hidden.reshape(batch, height, width, -1)
         return hidden
 
+    def forward_online(self, inputs: Tensor, temporal_state):
+        """Run one bounded chunk with explicit per-layer online state."""
+
+        from .temporal_credit import OnlineTemporalState
+
+        if not isinstance(temporal_state, OnlineTemporalState):
+            raise TypeError("forward_online requires OnlineTemporalState")
+        if temporal_state.active_frames:
+            raise RuntimeError("previous online chunk still has pending replay")
+        if inputs.dim() != 3:
+            raise ValueError("online backbone chunks currently require [B,T,H] inputs")
+        if len(temporal_state.layers) != len(self.blocks):
+            raise ValueError("online temporal state layer count does not match backbone")
+        hidden = inputs
+        next_layers = []
+        frames = []
+        for index, (block, layer_state) in enumerate(
+            zip(cast(list[DABSNBlock], list(self.blocks)), temporal_state.layers)
+        ):
+            hidden, next_layer, layer_frames = block.forward_online(hidden, layer_state)
+            next_layers.append(next_layer)
+            frames.extend(layer_frames)
+            if index == self.mlp_depth_index:
+                for mlp in cast(list[nn.Module], list(self.middle_mlps)):
+                    hidden = mlp(hidden)
+        pending = OnlineTemporalState(
+            layers=tuple(next_layers),
+            stream_policy=temporal_state.stream_policy,
+            stream_ids=temporal_state.stream_ids,
+            pending_reset_mask=torch.zeros_like(temporal_state.pending_reset_mask),
+            chunk_position=temporal_state.chunk_position + 1,
+            accumulation_position=temporal_state.accumulation_position,
+            temporal_chunk_size=temporal_state.temporal_chunk_size,
+            eligibility_batch_mode=temporal_state.eligibility_batch_mode,
+            eligibility_lane_group_size=temporal_state.eligibility_lane_group_size,
+            active_frames=tuple(frames),
+            schema_version=temporal_state.schema_version,
+        )
+        return hidden, pending
+
     def forward_with_terms(self, inputs: Tensor) -> ComponentOutput:
         field_rank = inputs.dim() in (4, 5)
         if inputs.dim() == 5:
@@ -575,6 +733,11 @@ class DABSNModel(nn.Module):
     is_dabsn = True
     _dabsn_config: DABSNConfig
 
+    @property
+    def temporal_credit(self) -> TemporalCreditMode:
+        config = getattr(self, "_dabsn_config", None)
+        return "bptt" if config is None else config.temporal_credit
+
     def __init__(
         self,
         input_dim: int,
@@ -609,6 +772,9 @@ class DABSNModel(nn.Module):
     def forward_hidden(self, inputs: Tensor) -> Tensor:
         return self.backbone(inputs)
 
+    def forward_hidden_online(self, inputs: Tensor, temporal_state):
+        return self.backbone.forward_online(inputs, temporal_state)
+
     def project_sequence(self, hidden: Tensor) -> Tensor:
         return self.output_adapter(hidden)
 
@@ -629,6 +795,10 @@ class DABSNModel(nn.Module):
 
     def forward_sequence(self, inputs: Tensor) -> Tensor:
         return self.project_sequence(self.forward_hidden(inputs))
+
+    def forward_sequence_online(self, inputs: Tensor, temporal_state):
+        hidden, pending = self.forward_hidden_online(inputs, temporal_state)
+        return self.project_sequence(hidden), pending
 
     def forward_with_terms(self, inputs: Tensor) -> ComponentOutput:
         result = self.backbone.forward_with_terms(inputs)
@@ -669,6 +839,11 @@ class DABSNTaskModel(nn.Module):
 
     is_dabsn = True
     _dabsn_config: DABSNConfig
+
+    @property
+    def temporal_credit(self) -> TemporalCreditMode:
+        config = getattr(self, "_dabsn_config", None)
+        return "bptt" if config is None else config.temporal_credit
 
     def __init__(
         self,
@@ -714,6 +889,9 @@ class DABSNTaskModel(nn.Module):
     def forward_hidden(self, inputs: Tensor) -> Tensor:
         return self.body.forward_hidden(self.input_adapter(inputs))
 
+    def forward_hidden_online(self, inputs: Tensor, temporal_state):
+        return self.body.forward_hidden_online(self.input_adapter(inputs), temporal_state)
+
     def project_sequence(self, hidden: Tensor) -> Tensor:
         return self.body.project_sequence(hidden)
 
@@ -722,6 +900,10 @@ class DABSNTaskModel(nn.Module):
 
     def forward_sequence(self, inputs: Tensor) -> Tensor:
         return self.project_sequence(self.forward_hidden(inputs))
+
+    def forward_sequence_online(self, inputs: Tensor, temporal_state):
+        hidden, pending = self.forward_hidden_online(inputs, temporal_state)
+        return self.project_sequence(hidden), pending
 
     def forward_with_terms(self, inputs: Tensor) -> ComponentOutput:
         result = self.body.forward_with_terms(self.input_adapter(inputs))
@@ -765,6 +947,81 @@ class _GraphBackbone(nn.Module):
 
     def forward_with_terms(self, inputs: Tensor):
         return self.graph.forward_with_terms(inputs)
+
+    def forward_online(self, inputs: Tensor, temporal_state, *, with_terms: bool = False):
+        from .temporal_credit import OnlineTemporalState
+
+        if not isinstance(temporal_state, OnlineTemporalState):
+            raise TypeError("forward_online requires OnlineTemporalState")
+        if temporal_state.active_frames:
+            raise RuntimeError("previous online graph chunk still has pending replay")
+        hidden = inputs
+        next_layers = []
+        frames = []
+        losses = []
+        reports = []
+        layer_index = 0
+        for binding in self.graph.bindings:
+            policy = binding.capabilities.temporal_credit
+            if policy == "dabsn":
+                if layer_index >= len(temporal_state.layers):
+                    raise ValueError("online graph has more DABSN blocks than temporal layers")
+                method = getattr(binding.module, "forward_online", None)
+                if not callable(method):
+                    raise TypeError(
+                        f"component {binding.component_id!r} declares DABSN temporal credit "
+                        "without forward_online"
+                    )
+                hidden, next_layer, layer_frames = method(
+                    hidden, temporal_state.layers[layer_index]
+                )
+                next_layers.append(next_layer)
+                frames.extend(layer_frames)
+                layer_index += 1
+                continue
+            if policy != "stateless":
+                raise TypeError(
+                    f"component {binding.component_id!r} does not support online temporal credit"
+                )
+            state_method = getattr(type(binding.module), "forward_with_state", None)
+            if state_method is not None:
+                raise TypeError(
+                    f"stateless online component {binding.component_id!r} declares streaming state"
+                )
+            terms_method = getattr(type(binding.module), "forward_with_terms", None)
+            if terms_method is None:
+                hidden = binding.module(hidden)
+            else:
+                result = terms_method(binding.module, hidden)
+                if not isinstance(result, ComponentOutput):
+                    raise TypeError(
+                        f"component {binding.component_id!r} forward_with_terms returned "
+                        f"{type(result).__name__}"
+                    )
+                if len(result.loss_terms) != len(binding.loss_terms):
+                    raise RuntimeError(
+                        f"component {binding.component_id!r} returned the wrong loss-term count"
+                    )
+                hidden = cast(Tensor, result.value)
+                losses.extend(result.loss_terms)
+                reports.extend(result.reports)
+        if layer_index != len(temporal_state.layers):
+            raise ValueError("online graph has fewer DABSN blocks than temporal layers")
+        pending = OnlineTemporalState(
+            layers=tuple(next_layers),
+            stream_policy=temporal_state.stream_policy,
+            stream_ids=temporal_state.stream_ids,
+            pending_reset_mask=torch.zeros_like(temporal_state.pending_reset_mask),
+            chunk_position=temporal_state.chunk_position + 1,
+            accumulation_position=temporal_state.accumulation_position,
+            temporal_chunk_size=temporal_state.temporal_chunk_size,
+            eligibility_batch_mode=temporal_state.eligibility_batch_mode,
+            eligibility_lane_group_size=temporal_state.eligibility_lane_group_size,
+            active_frames=tuple(frames),
+            schema_version=temporal_state.schema_version,
+        )
+        value = ComponentOutput(hidden, tuple(losses), tuple(reports), ()) if with_terms else hidden
+        return value, pending
 
     def post_optimizer_step(self, *, step_applied: bool) -> None:
         self.graph.post_optimizer_step(step_applied=step_applied)
@@ -822,8 +1079,11 @@ class DABSNSequenceLM(nn.Module):
         mlp_ratio: float | None = None,
         mlp_middle_depth: int = 0,
         mlp_depth_index: int = 0,
+        temporal_credit: TemporalCreditMode = "bptt",
     ) -> None:
         super().__init__()
+        if temporal_credit not in {"bptt", "online"}:
+            raise ValueError("temporal_credit must be bptt or online")
         self.block_name = "dabsn"
         self.vocab = int(vocab)
         self.hidden_dim = int(hidden_dim)
@@ -833,6 +1093,7 @@ class DABSNSequenceLM(nn.Module):
         self.mlp_ratio = None if mlp_ratio is None else float(mlp_ratio)
         self.mlp_middle_depth = int(mlp_middle_depth)
         self.mlp_depth_index = int(mlp_depth_index)
+        self._temporal_credit: TemporalCreditMode = temporal_credit
         self.layers = resolve_dabsn_layers(
             layers=layers,
             hidden_dim=self.hidden_dim,
@@ -865,6 +1126,7 @@ class DABSNSequenceLM(nn.Module):
         *,
         vocab: int,
         tie_embeddings: bool = False,
+        temporal_credit: TemporalCreditMode = "bptt",
     ) -> DABSNSequenceLM:
         """Construct a language model whose only body is ``graph``.
 
@@ -873,6 +1135,8 @@ class DABSNSequenceLM(nn.Module):
         only the preceding component's world value.
         """
 
+        if temporal_credit not in {"bptt", "online"}:
+            raise ValueError("temporal_credit must be bptt or online")
         if not graph.bindings[0].capabilities.world_builder:
             raise ValueError("a language-model graph must begin with DABSN")
         input_width = _world_width(graph.input_contract)
@@ -888,6 +1152,7 @@ class DABSNSequenceLM(nn.Module):
         model.mlp_ratio = None
         model.mlp_middle_depth = 0
         model.mlp_depth_index = 0
+        model._temporal_credit = temporal_credit
         model.layers = []
         model.depth = graph.dabsn_memory_count
         model.layer_geometries = []
@@ -906,6 +1171,10 @@ class DABSNSequenceLM(nn.Module):
     def graph(self) -> DABSNGraph:
         return self.backbone.graph
 
+    @property
+    def temporal_credit(self) -> TemporalCreditMode:
+        return self._temporal_credit
+
     def forward_with_terms(self, ids: Tensor):
         result = self.backbone.forward_with_terms(self.embed(ids))
         return type(result)(
@@ -920,6 +1189,17 @@ class DABSNSequenceLM(nn.Module):
 
     def forward_hidden(self, ids: Tensor) -> Tensor:
         return self.backbone(self.embed(ids))
+
+    def forward_hidden_online(self, ids: Tensor, temporal_state, *, with_terms: bool = False):
+        forward_online = getattr(self.backbone, "forward_online", None)
+        if not callable(forward_online):
+            raise TypeError(
+                "this graph-backed language model has no declared online temporal policy"
+            )
+        if isinstance(self.backbone, _GraphBackbone):
+            return forward_online(self.embed(ids), temporal_state, with_terms=with_terms)
+        hidden, pending = forward_online(self.embed(ids), temporal_state)
+        return (ComponentOutput(hidden) if with_terms else hidden), pending
 
     def project_sequence(self, hidden: Tensor) -> Tensor:
         return self.readout(hidden)
@@ -941,6 +1221,19 @@ class DABSNSequenceLM(nn.Module):
 
     def forward_sequence(self, ids: Tensor) -> Tensor:
         return self.project_sequence(self.forward_hidden(ids))
+
+    def forward_sequence_online(self, ids: Tensor, temporal_state, *, with_terms: bool = False):
+        hidden, pending = self.forward_hidden_online(
+            ids, temporal_state, with_terms=with_terms
+        )
+        if isinstance(hidden, ComponentOutput):
+            return ComponentOutput(
+                self.project_sequence(cast(Tensor, hidden.value)),
+                hidden.loss_terms,
+                hidden.reports,
+                hidden.next_state,
+            ), pending
+        return self.project_sequence(hidden), pending
 
     def forward(self, ids: Tensor) -> Tensor:
         return self.forward_sequence(ids)[:, -1, :]
