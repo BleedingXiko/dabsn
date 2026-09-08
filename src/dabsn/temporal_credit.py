@@ -611,7 +611,9 @@ def _advance_core_eligibility(
     tape: CoreOnlineTape,
     step: int,
     eligibility: CoreEligibilityState,
-) -> CoreEligibilityState:
+    *,
+    _small_only: bool = False,
+):
     """Faithful batched port of the supplied full-hybrid eligibility update."""
 
     batch = tape.batch_size
@@ -743,6 +745,8 @@ def _advance_core_eligibility(
     next_global = next_global + global_direct
 
     jbb = next_budget.derivative[..., 0]
+    if _small_only:
+        return next_local.contiguous(), next_global.contiguous(), jbb
     dy = 1.0 - y_value.square()
     hard_gate_gradient = (
         (gate_preactivation_value > -3.0) & (gate_preactivation_value < 3.0)
@@ -1210,6 +1214,145 @@ def core_online_replay_analytic(
     )
 
 
+def _core_trace_scan_reference(core, tape, incoming, eligibility):
+    """Small three-state traces only; matrix traces are contracted separately."""
+    local = eligibility.local
+    global_ = eligibility.global_
+    local_gradient = torch.zeros_like(local[:, :, 0, :]).sum(0)
+    global_gradient = torch.zeros_like(global_[0, 0, 0])
+    transitions = []
+    for step in range(tape.steps):
+        local_gradient += torch.einsum("bso,bsop->sp", incoming[:, step], local)
+        global_gradient += torch.einsum("bso,bsop->p", incoming[:, step], global_)
+        current = CoreEligibilityState(*eligibility.tensors()[:4], local, global_)
+        local, global_, jbb = _advance_core_eligibility(
+            core, tape, step, current, _small_only=True
+        )
+        transitions.append(jbb)
+    return local, global_, local_gradient, global_gradient, torch.stack(transitions, dim=1)
+
+
+def _budget_trace_weights(jbb, incoming_budget):
+    """Division-free adjoint/product scan of E[t+1] = j[t] E[t] + d[t]."""
+    if jbb.is_cuda:
+        from .kernels.online_trace import budget_trace_weights
+        return budget_trace_weights(jbb, incoming_budget)
+    response = torch.zeros_like(jbb[:, 0])
+    multiplier = torch.ones_like(response)
+    future_response = torch.empty_like(jbb)
+    suffix = torch.empty_like(jbb)
+    for step in range(jbb.shape[1] - 1, -1, -1):
+        future_response[:, step] = response
+        suffix[:, step] = multiplier
+        response = incoming_budget[:, step] + jbb[:, step] * response
+        multiplier = jbb[:, step] * multiplier
+    return response, multiplier, future_response, suffix
+
+
+def _contract_budget_trace(initial, coefficient, inputs, weights):
+    """Touch a full matrix trace once per chunk, not once per time step.
+
+    The summed rank-one updates are BLAS matrix products. No division by a
+    transition/prefix product is used, so zero and negative transitions work.
+    """
+    boundary_response, final_multiplier, future_response, suffix = weights
+    batch, steps, state = coefficient.shape
+    # baddbmm avoids materializing a separate B*S*I sum of rank-one updates.
+    final = torch.baddbmm(
+        initial * final_multiplier.unsqueeze(-1),
+        (coefficient * suffix).transpose(1, 2),
+        inputs,
+    )
+    gradient = torch.einsum("bs,bsi->si", boundary_response, initial)
+    gradient.addmm_(
+        (coefficient * future_response).reshape(batch * steps, state).T,
+        inputs.reshape(batch * steps, inputs.shape[-1]),
+    )
+    return final.contiguous(), gradient
+
+
+@torch.no_grad()
+@torch.autocast(device_type="cpu", enabled=False)
+@torch.autocast(device_type="cuda", enabled=False)
+def core_online_replay_contracted(core, tape, signal_grads, eligibility_state):
+    """Exact hybrid credit with chunk-level GEMMs for large matrix traces.
+
+    The channelwise eligibility rule is unchanged. Only the order of sums and
+    products is reassociated; no past input gradient or full BPTT is introduced.
+    """
+    batch, steps, state = tape.batch_size, tape.steps, tape.state_dim
+    if steps < 1:
+        raise ValueError("online replay requires at least one time step")
+    if (eligibility_state.batch_size, eligibility_state.input_dim, eligibility_state.state_dim) != (
+        batch, tape.input_dim, state
+    ):
+        raise ValueError("eligibility dimensions do not match tape")
+    for name in CoreSignalGrads.__dataclass_fields__:
+        value = getattr(signal_grads, name)
+        if value is not None and tuple(value.shape) != (batch, steps, state):
+            raise ValueError(f"{name} cotangent must have shape {(batch, steps, state)}")
+
+    # All current-step VJPs are independent: flatten B*T to replace T small
+    # weight/input-gradient GEMMs with one large GEMM per matrix.
+    flat_tape = CoreOnlineTape(**{
+        name: getattr(tape, name).reshape(batch * steps, 1, -1)
+        for name in CoreOnlineTape.__dataclass_fields__
+    })
+    flat_signals = CoreSignalGrads(**{
+        name: None if getattr(signal_grads, name) is None else
+        getattr(signal_grads, name).reshape(batch * steps, 1, state)
+        for name in CoreSignalGrads.__dataclass_fields__
+    })
+    incoming, direct, input_gradient = _core_step_local_vjp_analytic(core, flat_tape, 0, flat_signals)
+    incoming = torch.stack(incoming, dim=-1).reshape(batch, steps, state, 3).to(eligibility_state.dtype)
+    if tape.inputs.is_cuda:
+        from .kernels.online_trace import core_trace_scan
+        scan = core_trace_scan
+    else:
+        scan = _core_trace_scan_reference
+    local, global_, local_gradient, global_gradient, jbb = scan(core, tape, incoming, eligibility_state)
+    weights = _budget_trace_weights(jbb, incoming[..., 0])
+    dtype = eligibility_state.dtype
+    y = tape.y.to(dtype)
+    x = tape.inputs.to(dtype)
+    expression = tape.expression.to(dtype)
+    gate = tape.gate.to(dtype)
+    gate_pre = tape.gate_preactivation.to(dtype)
+    slope = ((gate_pre > -3) & (gate_pre < 3)).to(dtype) / 6
+    common = F.softplus(core.log_lambda.detach()).to(dtype) * tape.energy.to(dtype)
+    coefficient_g = common * expression * slope
+    coefficient_a = common * gate
+    coefficient_w = common * (1 - y.square()) * (
+        expression * slope * core.Ug.weight.detach().diagonal().to(dtype)
+        + gate * core.A.weight.detach().diagonal().to(dtype)
+    )
+    gradients = {parameter: torch.zeros_like(parameter, dtype=torch.promote_types(parameter.dtype, torch.float32))
+                 for parameter in core.parameters()}
+    matrices = []
+    for parameter, initial, coefficient, inputs in (
+        (core.W.weight, eligibility_state.w_budget, coefficient_w, x),
+        (core.A.weight, eligibility_state.a_budget, coefficient_a, y),
+        (core.Wg.weight, eligibility_state.wg_budget, coefficient_g, x),
+        (core.Ug.weight, eligibility_state.ug_budget, coefficient_g, y),
+    ):
+        final, gradient = _contract_budget_trace(initial, coefficient, inputs, weights)
+        matrices.append(final)
+        gradients[parameter].add_(gradient.to(gradients[parameter].dtype))
+    for index, name in enumerate(CORE_LOCAL_PARAMETER_NAMES):
+        parameter = core.get_parameter(name)
+        gradients[parameter].add_(local_gradient[:, index].to(gradients[parameter].dtype))
+    for index, name in enumerate(CORE_GLOBAL_PARAMETER_NAMES):
+        parameter = core.get_parameter(name)
+        gradients[parameter].add_(global_gradient[index].reshape_as(parameter).to(gradients[parameter].dtype))
+    for parameter, gradient in direct.items():
+        gradients[parameter].add_(gradient.to(gradients[parameter].dtype))
+    return (
+        CoreEligibilityState(*matrices, local, global_),
+        {parameter: gradient.to(parameter.dtype) for parameter, gradient in gradients.items()},
+        input_gradient.reshape_as(tape.inputs).to(tape.inputs.dtype),
+    )
+
+
 def _core_parameter_tuple(core: DABSNCore) -> tuple[torch.nn.Parameter, ...]:
     if core.Wg.bias is None:
         raise RuntimeError("DABSNCore.Wg must retain its bias for online credit")
@@ -1501,13 +1644,23 @@ def initial_online_temporal_state(
     stream_ids: tuple[str | int, ...],
     device,
     dtype,
+    eligibility_dtype: torch.dtype | None = None,
     temporal_chunk_size: int | None = None,
     eligibility_batch_mode: str = "vectorized",
     eligibility_lane_group_size: int | None = None,
 ) -> OnlineTemporalState:
-    """Create independent recurrent and eligibility state for every DABSN block."""
+    """Create independent recurrent and eligibility state for every DABSN block.
+
+    ``dtype`` controls recurrent storage. Eligibility defaults to FP32 for
+    FP16/BF16/FP32 recurrent state and FP64 for FP64 recurrent state. An explicit
+    ``eligibility_dtype`` overrides that precision policy; backend support is
+    checked when replay executes. Resets and checkpoint restore preserve the
+    stored eligibility dtype rather than deriving it again from recurrent state.
+    """
 
     batch = int(batch_size)
+    if eligibility_dtype is None:
+        eligibility_dtype = torch.promote_types(dtype, torch.float32)
     layers: list[OnlineLayerState] = []
     for block in _online_blocks(model):
         core_recurrent = tuple(
@@ -1529,12 +1682,14 @@ def initial_online_temporal_state(
                     block.core,
                     batch,
                     device=device,
+                    dtype=eligibility_dtype,
                 ),
                 long_recurrent=long_recurrent,
                 long_eligibility=initial_long_read_eligibility(
                     block.read,
                     batch,
                     device=device,
+                    dtype=eligibility_dtype,
                 ),
             )
         )
@@ -1987,20 +2142,10 @@ def prepare_online_temporal_state(
     if len(ids) != state.batch_size:
         raise ValueError("stream_ids do not match the online batch size")
     device = state.pending_reset_mask.device
-    if state.stream_policy == "reset_each_batch":
-        reference = state.layers[0].core_recurrent[0]
-        return initial_online_temporal_state(
-            model,
-            state.batch_size,
-            stream_policy=state.stream_policy,
-            stream_ids=ids,
-            device=device,
-            dtype=reference.dtype,
-            temporal_chunk_size=state.temporal_chunk_size,
-            eligibility_batch_mode=state.eligibility_batch_mode,
-            eligibility_lane_group_size=state.eligibility_lane_group_size,
-        )
-    if stream_reset_mask is None:
+    reset_all = state.stream_policy == "reset_each_batch"
+    if reset_all:
+        mask = torch.ones(state.batch_size, dtype=torch.bool, device=device)
+    elif stream_reset_mask is None:
         mask = torch.zeros(state.batch_size, dtype=torch.bool, device=device)
     else:
         mask = stream_reset_mask.to(device=device)
@@ -2012,7 +2157,7 @@ def prepare_online_temporal_state(
         dtype=torch.bool,
         device=device,
     )
-    if bool(torch.any(changed & ~mask).item()):
+    if not reset_all and bool(torch.any(changed & ~mask).item()):
         raise ValueError("stream lane identity changed without a matching reset")
 
     blocks = _online_blocks(model)
@@ -2046,6 +2191,16 @@ def prepare_online_temporal_state(
             device=device,
             dtype=layer.long_eligibility.traces.dtype,
         )
+        if reset_all:
+            layers.append(
+                OnlineLayerState(
+                    core_recurrent=fresh_core,
+                    core_eligibility=fresh_core_eligibility,
+                    long_recurrent=fresh_long,
+                    long_eligibility=fresh_long_eligibility,
+                )
+            )
+            continue
         bank = dict(layer.read_bank)
         if bank:
             valid = bank["valid"].clone()
@@ -2085,8 +2240,8 @@ def prepare_online_temporal_state(
         stream_policy=state.stream_policy,
         stream_ids=ids,
         pending_reset_mask=torch.zeros_like(state.pending_reset_mask),
-        chunk_position=state.chunk_position,
-        accumulation_position=state.accumulation_position,
+        chunk_position=0 if reset_all else state.chunk_position,
+        accumulation_position=0 if reset_all else state.accumulation_position,
         temporal_chunk_size=state.temporal_chunk_size,
         eligibility_batch_mode=state.eligibility_batch_mode,
         eligibility_lane_group_size=state.eligibility_lane_group_size,

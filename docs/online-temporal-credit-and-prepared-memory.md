@@ -49,14 +49,22 @@ chunk settings, and accumulation position. Use `online_training_state_dict` and
 `load_online_training_state` from `dabsn.temporal_credit` when writing a custom
 trainer. Checkpointing pending replay is rejected.
 
-Native CPU core replay is C++. The CUDA core uses the existing precise Triton
-forward tape plus full-graph Inductor lowering of analytic eligibility replay.
-The CUDA long-read path also uses Inductor. These are inner implementation
-boundaries, not an added outer-model CUDA graph. Performance depends on model
+Native CPU core replay is C++ with BLAS. CUDA uses precise native forward tapes,
+direct Triton small-state scans, and chunk-level BLAS contractions for matrix
+eligibility. The CUDA long-read recurrence also uses direct Triton scans. These
+online paths do not use Dynamo/Inductor compilation. Performance depends on model
 dimensions, chunk size, precision, and hardware; no universal speedup is claimed.
-Compiled CUDA online credit requires native hardware support for its storage
+Native CUDA online credit requires native hardware support for its storage
 dtype. BF16 requires compute capability 8.0 or newer; GPUs such as T4 must use
 FP32 or FP16. BF16 emulation is not treated as a native compiled backend.
+
+`initial_online_temporal_state(dtype=...)` specifies recurrent storage precision.
+Eligibility defaults to `torch.promote_types(dtype, torch.float32)`; an independent
+`eligibility_dtype` override is available for reference execution. Native replay
+requires FP32 eligibility and rejects incompatible precision rather than silently
+narrowing it. Resets and checkpoint restore preserve each layer's eligibility
+dtype. Reassociating matrix-trace sums can change floating-point rounding, not
+the structured credit rule.
 
 ## Prepared carried-memory inference
 

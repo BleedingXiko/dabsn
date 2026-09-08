@@ -53,7 +53,9 @@ class ManualGradientAccumulator:
             gradient = parameter.grad
             if gradient is None:
                 continue
-            self.buffers[parameter].add_(gradient.detach().to(self.dtype), alpha=float(scale))
+            # TensorIterator converts the source while adding into the FP32
+            # destination. A separate .to() duplicates the entire gradient.
+            self.buffers[parameter].add_(gradient.detach(), alpha=float(scale))
             self.active.add(parameter)
             found = True
         if not found:

@@ -899,6 +899,7 @@ def native_core_online_forward(core, inputs, initial_state, eligibility_state):
     return result, tape
 
 
+@torch.autocast(device_type="cpu", enabled=False)
 def native_core_online_replay(
     core,
     tape,
@@ -920,6 +921,10 @@ def native_core_online_replay(
         raise TypeError("native online replay requires CoreEligibilityState")
     if not isinstance(signal_grads, CoreSignalGrads):
         raise TypeError("native online replay requires CoreSignalGrads")
+    if eligibility_state.device.type != "cpu" or eligibility_state.dtype != torch.float32:
+        if required:
+            raise RuntimeError("native online CPU replay requires CPU float32 eligibility tensors")
+        return core_online_replay_reference(core, tape, signal_grads, eligibility_state)
     extension = _load_ext(required=required)
     if extension is None:
         return core_online_replay_reference(core, tape, signal_grads, eligibility_state)

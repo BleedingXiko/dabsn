@@ -273,44 +273,57 @@ def cuda_core_forward(
 
 
 def cuda_core_online_forward(core, inputs, initial_state, eligibility_state):
-    """Build the online tape from the native precise Triton forward scan."""
+    """Build precise online tapes using the execution-shape backend policy."""
 
     if not inputs.is_cuda:
         raise TypeError("CUDA online core forward requires CUDA tensors")
     from dabsn.temporal_credit import CoreForwardResult, CoreOnlineTape
 
-    runtime = _runtime()
+    from .online_forward import validate_online_forward_dtypes
+
+    validate_online_forward_dtypes(core, inputs, initial_state)
     compute_dtype = torch.float32
     projected = core.W(inputs).contiguous()
     gate_projected = core.Wg(inputs).contiguous()
-    outputs = runtime.dabsn_core_scan_triton_tape(
-        projected,
-        gate_projected,
-        core.Ug.weight.contiguous(),
-        core.A.weight.contiguous(),
-        core.beta.contiguous(),
-        core.log_kappa.contiguous(),
-        core.logit_recover.contiguous(),
-        core.k_s.contiguous(),
-        core.k_y.contiguous(),
-        core.k_b.contiguous(),
-        core.k_n.contiguous(),
-        core.k_bias.contiguous(),
-        core.r_s.contiguous(),
-        core.r_y.contiguous(),
-        core.r_b.contiguous(),
-        core.r_n.contiguous(),
-        core.r_bias.contiguous(),
-        core.logit_saturation_decay.expand(core.hidden_dim).contiguous(),
-        core.k_saturation.contiguous(),
-        core.r_saturation.contiguous(),
-        logit_alpha=core.logit_alpha.reshape(()),
-        log_lambda=core.log_lambda.reshape(()),
-        logit_c_suppress=core.logit_saturation_suppress.reshape(()),
-        tape_dtype=compute_dtype,
-        initial_state=initial_state,
-        return_final_state=True,
+    selected = select_core_backend(
+        int(inputs.shape[0]),
+        int(core.hidden_dim),
+        requested=os.environ.get("DABSN_CORE_BACKEND", "auto"),
+        grad_enabled=False,
     )
+    if selected != "persistent":
+        from .online_forward import batched_online_forward_tapes
+
+        outputs = batched_online_forward_tapes(core, projected, gate_projected, initial_state)
+    else:
+        outputs = _runtime().dabsn_core_scan_triton_tape(
+            projected,
+            gate_projected,
+            core.Ug.weight.contiguous(),
+            core.A.weight.contiguous(),
+            core.beta.contiguous(),
+            core.log_kappa.contiguous(),
+            core.logit_recover.contiguous(),
+            core.k_s.contiguous(),
+            core.k_y.contiguous(),
+            core.k_b.contiguous(),
+            core.k_n.contiguous(),
+            core.k_bias.contiguous(),
+            core.r_s.contiguous(),
+            core.r_y.contiguous(),
+            core.r_b.contiguous(),
+            core.r_n.contiguous(),
+            core.r_bias.contiguous(),
+            core.logit_saturation_decay.expand(core.hidden_dim).contiguous(),
+            core.k_saturation.contiguous(),
+            core.r_saturation.contiguous(),
+            logit_alpha=core.logit_alpha.reshape(()),
+            log_lambda=core.log_lambda.reshape(()),
+            logit_c_suppress=core.logit_saturation_suppress.reshape(()),
+            tape_dtype=compute_dtype,
+            initial_state=initial_state,
+            return_final_state=True,
+        )
     trajectory, novelty, plasticity, expression, write, energy, next_saturation, gate = outputs[:8]
     final_state = tuple(outputs[8:11])
     state = int(core.hidden_dim)
@@ -376,56 +389,44 @@ def cuda_core_online_forward(core, inputs, initial_state, eligibility_state):
         saturation=next_saturation.to(inputs.dtype),
         final_state=tuple(value.to(inputs.dtype) for value in final_state),
     )
-    core._last_core_online_backend = "cuda_triton_forward"
+    core._last_core_online_backend = (
+        "cuda_triton_forward" if selected == "persistent" else "cuda_batched_fp32_forward"
+    )
     return result, tape
 
 
 def cuda_core_online_replay(core, tape, signals, eligibility_state):
-    """Run exact forward-time replay as a required full-graph CUDA compile."""
+    """Native small-state scans and chunk-contracted BLAS matrix credit."""
 
     if not tape.inputs.is_cuda:
         raise TypeError("CUDA online core replay requires CUDA tensors")
-    from dabsn.temporal_credit import core_online_replay_analytic
-
-    # The analytic path contains no autograd calls and no data-dependent host
-    # reads. Fullgraph=True makes a graph break a hard failure instead of
-    # silently returning to the per-timestep Python implementation.
-    from .online_compile import call_online_compiled
-
-    result = call_online_compiled(core_online_replay_analytic, core, tape, signals, eligibility_state)
-    core._last_core_online_backend = "cuda_triton_forward_inductor_fused_replay"
+    from dabsn.temporal_credit import core_online_replay_contracted
+    if eligibility_state.dtype != torch.float32:
+        raise TypeError("native CUDA online replay requires FP32 eligibility")
+    result = core_online_replay_contracted(core, tape, signals, eligibility_state)
+    core._last_core_online_backend = "cuda_native_forward_contracted_replay"
     return result
 
 
 def cuda_long_read_online_forward(
     read, write, plasticity, novelty, initial_state, eligibility_state
 ):
-    """Capture the channelwise long recurrence as a required static CUDA graph."""
+    """Run a direct native channelwise long recurrence."""
     if not write.is_cuda:
         raise TypeError("CUDA online long-read forward requires CUDA tensors")
-    from dabsn.temporal_credit import long_read_online_forward
-
-    from .online_compile import call_online_compiled
-
-    result = call_online_compiled(
-        long_read_online_forward, read, write, plasticity, novelty, initial_state, eligibility_state
-    )
-    read._last_long_online_backend = "cuda_inductor_fused_forward"
+    from .online_long import long_online_forward
+    result = long_online_forward(read, write, plasticity, novelty, initial_state, eligibility_state)
+    read._last_long_online_backend = "cuda_native_long_forward"
     return result
 
 
 def cuda_long_read_online_replay(read, tape, output_gradient, eligibility_state):
-    """Capture analytic eligibility and bounded input replay on CUDA."""
+    """Run direct native eligibility and bounded input replay."""
     if not tape.write.is_cuda:
         raise TypeError("CUDA online long-read replay requires CUDA tensors")
-    from dabsn.temporal_credit import long_read_online_replay_analytic
-
-    from .online_compile import call_online_compiled
-
-    result = call_online_compiled(
-        long_read_online_replay_analytic, read, tape, output_gradient, eligibility_state
-    )
-    read._last_long_online_backend = "cuda_inductor_fused_forward_replay"
+    from .online_long import long_online_replay
+    result = long_online_replay(read, tape, output_gradient, eligibility_state)
+    read._last_long_online_backend = "cuda_native_long_forward_replay"
     return result
 
 

@@ -100,7 +100,7 @@ def test_cuda_online_forward_and_replay_match_reference() -> None:
     torch.testing.assert_close(actual_input, expected_input, rtol=3e-5, atol=3e-6)
     assert (
         core._last_core_online_backend
-        == "cuda_triton_forward_inductor_fused_replay"
+        == "cuda_native_forward_contracted_replay"
     )
 
 
@@ -143,7 +143,7 @@ def test_cuda_online_long_forward_and_replay_match_reference() -> None:
         )
     for actual, expected in zip(actual_inputs, expected_inputs):
         torch.testing.assert_close(actual, expected, rtol=3e-5, atol=3e-6)
-    assert read._last_long_online_backend == "cuda_inductor_fused_forward_replay"
+    assert read._last_long_online_backend == "cuda_native_long_forward_replay"
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])

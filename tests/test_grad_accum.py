@@ -3,6 +3,33 @@ import copy
 import pytest
 import torch
 
+
+def test_low_precision_accumulation_does_not_materialize_fp32_gradient_copy():
+    from torch.utils._python_dispatch import TorchDispatchMode
+    from dabsn.runtime.grad_accum import ManualGradientAccumulator
+
+    class RecordCopies(TorchDispatchMode):
+        def __init__(self):
+            self.copies = []
+
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            if func == torch.ops.aten._to_copy.default:
+                self.copies.append(args[0].numel())
+            return func(*args, **(kwargs or {}))
+
+    model = torch.nn.Linear(17, 11, bias=False).bfloat16()
+    accumulator = ManualGradientAccumulator(model)
+    expected = torch.zeros_like(model.weight, dtype=torch.float32)
+    recorder = RecordCopies()
+    for _ in range(3):
+        gradient = torch.randn_like(model.weight)
+        expected.add_(gradient.float())
+        model.weight.grad = gradient
+        with recorder:
+            accumulator.add_microbatch()
+    torch.testing.assert_close(accumulator.buffers[model.weight], expected, rtol=0, atol=0)
+    assert model.weight.numel() not in recorder.copies
+
 from dabsn.runtime import ManualGradientAccumulator
 
 

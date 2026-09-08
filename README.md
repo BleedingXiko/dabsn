@@ -31,7 +31,7 @@ The current source adds two framework capabilities:
 - **Architecture-specific online temporal credit:** `temporal_credit="online"`
   runs the DABSN core with carried eligibility state and bounded autograd chunks.
   It includes native C++ core replay and a CUDA path using a precise Triton
-  forward tape and compiled analytic replay. The long-memory recurrence also
+  forward tape and native chunk-contracted replay. The long-memory recurrence also
   carries eligibility. MLPs, MoEs, projections and heads keep ordinary spatial
   autograd; they are not part of `DABSNCore`.
 - **Prepared dynamic inference memory:** prepare an existing memory once, then
@@ -49,6 +49,10 @@ generic exact RTRL or full-stack BPTT gradient equivalence. Eligibility storage
 is independent of elapsed context at fixed batch/parameter dimensions, but
 retained read-bank storage can still grow. Prepared carried-memory inference
 currently follows the existing sequence-geometry memory contract.
+
+Version 0.2.1 replaces unrolled online replay compilation with native scans and
+batched matrix contractions. FP16/BF16 models retain FP32 eligibility by default;
+eligibility precision is explicit and preserved across resets and checkpoints.
 
 ### What this is, and what it is not
 

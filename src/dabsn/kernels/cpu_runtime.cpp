@@ -1222,10 +1222,7 @@ std::vector<torch::Tensor> dabsn_core_online_replay_cpu(
   TORCH_CHECK(global_elig.sizes() == torch::IntArrayRef({B, H, 3, 4}), "invalid global eligibility shape");
 
   auto opts = inputs.options().dtype(torch::kFloat32);
-  torch::Tensor next_w_elig = w_elig.clone();
-  torch::Tensor next_a_elig = a_elig.clone();
-  torch::Tensor next_wg_elig = wg_elig.clone();
-  torch::Tensor next_ug_elig = ug_elig.clone();
+  torch::Tensor next_w_elig, next_a_elig, next_wg_elig, next_ug_elig;
   torch::Tensor next_local_elig = local_elig.clone();
   torch::Tensor next_global_elig = global_elig.clone();
   torch::Tensor grad_input = torch::zeros({B, T, I}, opts);
@@ -1262,13 +1259,47 @@ std::vector<torch::Tensor> dabsn_core_online_replay_cpu(
   const float alpha = sigmoidf(alpha_logit), lam = softplusf(lambda_log);
   const float decay = sigmoidf(decay_logit), suppress = sigmoidf(suppress_logit);
 
-  float* wep = next_w_elig.data_ptr<float>(); float* aep = next_a_elig.data_ptr<float>();
-  float* wgep = next_wg_elig.data_ptr<float>(); float* ugep = next_ug_elig.data_ptr<float>();
   float* lep = next_local_elig.data_ptr<float>(); float* gep = next_global_elig.data_ptr<float>();
-  float* gxp = grad_input.data_ptr<float>(); float* dWp = dW.data_ptr<float>();
-  float* dAp = dA.data_ptr<float>(); float* dWgp = dWg.data_ptr<float>();
-  float* dUgp = dUg.data_ptr<float>(); float* dWgbp = dWg_bias.data_ptr<float>();
   float* dlp = dlocal.data_ptr<float>(); float* dgp = dglobal.data_ptr<float>();
+
+  // Current-step VJPs are independent across B*T. Compute their matrix
+  // products once with BLAS, rather than reconstructing every output-row
+  // cotangent inside every input-channel iteration.
+  auto gate_tensor = torch::clamp(gate_pre_tape / 6.0 + 0.5, 0.0, 1.0);
+  auto novelty_tensor = torch::tanh(torch::abs(ay_tape - bpre));
+  auto p_tensor = gate_tensor * epre;
+  auto write_gradient = gwrite_out + gbn_out * lam;
+  auto plastic_gradient = gp_out + write_gradient * ay_tape;
+  auto novelty_gradient = gnov_out + gcpost_out * (1.0f - decay) * (1.0f - epre);
+  auto difference_gradient = novelty_gradient * (1.0f - novelty_tensor.square()) * torch::sign(ay_tape - bpre);
+  auto expression_gradient = gay_out + write_gradient * p_tensor + difference_gradient;
+  auto gate_gradient = plastic_gradient * epre *
+      ((gate_pre_tape > -3.0) & (gate_pre_tape < 3.0)).to(torch::kFloat32) * (1.0f / 6.0f);
+  auto flat_expression = expression_gradient.reshape({B * T, H});
+  auto flat_gate = gate_gradient.reshape({B * T, H});
+  auto y_gradient = gy_out + (torch::mm(flat_expression, A) + torch::mm(flat_gate, Ug)).reshape({B, T, H});
+  auto ypre_gradient = y_gradient * (1.0f - y_tape.square());
+  auto incoming_budget = (gbn_out * (1.0f - alpha) - difference_gradient + ypre_gradient).contiguous();
+  auto incoming_energy = (ge_out + plastic_gradient * gate_tensor - gcpost_out * (1.0f - decay) * novelty_tensor).contiguous();
+  auto incoming_saturation = (gcpost_out * decay).contiguous();
+  auto flat_x = inputs.reshape({B * T, I});
+  auto flat_y = y_tape.reshape({B * T, H});
+  auto flat_ypre = ypre_gradient.reshape({B * T, H});
+  dW = torch::mm(flat_ypre.t(), flat_x);
+  dA = torch::mm(flat_expression.t(), flat_y);
+  dWg = torch::mm(flat_gate.t(), flat_x);
+  dUg = torch::mm(flat_gate.t(), flat_y);
+  dWg_bias = flat_gate.sum(0);
+  grad_input = (torch::mm(flat_ypre, W) + torch::mm(flat_gate, Wg)).reshape({B, T, I});
+  dlocal[1].copy_(gbn_out.sum(torch::IntArrayRef({0, 1})));
+  dglobal[0].copy_((gbn_out * (-bpre) * alpha * (1.0f - alpha)).sum());
+  dglobal[1].copy_((gbn_out * (p_tensor * ay_tape) * sigmoidf(lambda_log)).sum());
+  dglobal[2].copy_((gcpost_out * (cpre - novelty_tensor * (1.0f - epre)) * decay * (1.0f - decay)).sum());
+  const float* ibp = incoming_budget.data_ptr<float>();
+  const float* iep = incoming_energy.data_ptr<float>();
+  const float* icp = incoming_saturation.data_ptr<float>();
+  auto transitions = torch::empty({B, T, H}, opts);
+  float* jp = transitions.data_ptr<float>();
 
   for (int64_t bi = 0; bi < B; ++bi) {
     for (int64_t ti = 0; ti < T; ++ti) {
@@ -1284,83 +1315,7 @@ std::vector<torch::Tensor> dabsn_core_online_replay_cpu(
         const float cpost = decay * c0 + (1.0f - decay) * stress;
         const float p = gate * e0;
 
-        // Exact current-step local VJP for all public DABSNCore signals.
-        const float gbn = gbnop[off];
-        float gb0 = gbn * (1.0f - alpha);
-        float ge0 = geop[off];
-        float gc0 = 0.0f;
-        float gy = gyop[off];
-        float gay = gayop[off];
-        float gnov = gnop[off];
-        float gp = gpop[off];
-        float gcpost = gcop[off];
-        dlp[1 * H + h] += gbn;
-        dgp[0] += gbn * (-b0) * alpha * (1.0f - alpha);
-        dgp[1] += gbn * (p * ay) * sigmoidf(lambda_log);
-        const float gwrite = gwop[off] + gbn * lam;
-        gp += gwrite * ay;
-        gay += gwrite * p;
-        float gs = gp * e0;
-        ge0 += gp * gate;
-        gc0 += gcpost * decay;
-        const float gstress = gcpost * (1.0f - decay);
-        dgp[2] += gcpost * (c0 - stress) * decay * (1.0f - decay);
-        gnov += gstress * (1.0f - e0);
-        ge0 -= gstress * novelty;
-        const float diff = ay - b0;
-        const float sign = diff > 0.0f ? 1.0f : (diff < 0.0f ? -1.0f : 0.0f);
-        const float gdiff = gnov * (1.0f - novelty * novelty) * sign;
-        gay += gdiff;
-        gb0 -= gdiff;
-        const float hsp = gate_pre > -3.0f && gate_pre < 3.0f ? 1.0f / 6.0f : 0.0f;
-        const float ggate = gs * hsp;
-        dWgbp[h] += ggate;
-        for (int64_t j = 0; j < H; ++j) {
-          dAp[h * H + j] += gay * y_tape.data_ptr<float>()[step_off + j];
-          dUgp[h * H + j] += ggate * y_tape.data_ptr<float>()[step_off + j];
-        }
-        // The y cotangent receives A^T@gay and Ug^T@ggate from every output row.
-        // Build those row cotangents directly so no forward matvec is replayed.
-        float recurrent_y = 0.0f;
-        for (int64_t row = 0; row < H; ++row) {
-          const int64_t row_off = step_off + row;
-          float row_gay = gayop[row_off];
-          float row_gp = gpop[row_off];
-          const float row_gate = hardsigmoidf(gateprep[row_off]);
-          const float row_p = row_gate * ep[row_off];
-          const float row_gbn = gbnop[row_off];
-          const float row_gwrite = gwop[row_off] + row_gbn * lam;
-          row_gp += row_gwrite * ayp[row_off];
-          row_gay += row_gwrite * row_p;
-          const float row_novelty = std::tanh(std::fabs(ayp[row_off] - bp[row_off]));
-          const float row_stress = row_novelty * (1.0f - ep[row_off]);
-          const float row_cpost = decay * cp[row_off] + (1.0f - decay) * row_stress;
-          (void)row_cpost;
-          float row_gnov = gnop[row_off] + gcop[row_off] * (1.0f - decay) * (1.0f - ep[row_off]);
-          const float row_diff = ayp[row_off] - bp[row_off];
-          const float row_sign = row_diff > 0.0f ? 1.0f : (row_diff < 0.0f ? -1.0f : 0.0f);
-          row_gay += row_gnov * (1.0f - row_novelty * row_novelty) * row_sign;
-          const float row_gs = row_gp * ep[row_off];
-          const float row_hsp = gateprep[row_off] > -3.0f && gateprep[row_off] < 3.0f ? 1.0f / 6.0f : 0.0f;
-          const float row_ggate = row_gs * row_hsp;
-          recurrent_y += Ap[row * H + h] * row_gay + Ugp[row * H + h] * row_ggate;
-        }
-        gy += recurrent_y;
-        const float ypre_grad = gy * (1.0f - y * y);
-        const float incoming[3] = {gb0 + ypre_grad, ge0, gc0};
-
-        // Eligibility contraction uses the state entering this step.
-        const int64_t wbase = (bi * H + h) * I;
-        const int64_t hbase = (bi * H + h) * H;
-        for (int64_t i = 0; i < I; ++i) {
-          dWp[h * I + i] += incoming[0] * wep[wbase + i] + ypre_grad * xp[x_off + i];
-          dWgp[h * I + i] += incoming[0] * wgep[wbase + i] + ggate * xp[x_off + i];
-          gxp[x_off + i] += ypre_grad * Wp[h * I + i] + ggate * Wgp[h * I + i];
-        }
-        for (int64_t j = 0; j < H; ++j) {
-          dAp[h * H + j] += incoming[0] * aep[hbase + j];
-          dUgp[h * H + j] += incoming[0] * ugep[hbase + j];
-        }
+        const float incoming[3] = {ibp[off], iep[off], icp[off]};
         const int64_t lbase = ((bi * H + h) * 3) * 16;
         const int64_t gbase = ((bi * H + h) * 3) * 4;
         for (int pindex = 0; pindex < 16; ++pindex) {
@@ -1460,21 +1415,56 @@ std::vector<torch::Tensor> dabsn_core_online_replay_cpu(
             gep[gbase + out_state * 4 + pi] = value;
           }
         }
-        const float jbb = next_budget_d.derivative[0];
-        const float dy = 1.0f - y * y;
-        const float common = lam * e0;
-        const float direct_common = ay * hsp * Ugp[h * H + h] + gate * Ap[h * H + h];
-        for (int64_t i = 0; i < I; ++i) {
-          wep[wbase + i] = jbb * wep[wbase + i] + common * dy * xp[x_off + i] * direct_common;
-          wgep[wbase + i] = jbb * wgep[wbase + i] + common * ay * hsp * xp[x_off + i];
-        }
-        for (int64_t j = 0; j < H; ++j) {
-          aep[hbase + j] = jbb * aep[hbase + j] + common * gate * yp[step_off + j];
-          ugep[hbase + j] = jbb * ugep[hbase + j] + common * ay * hsp * yp[step_off + j];
-        }
+        jp[off] = next_budget_d.derivative[0];
       }
     }
   }
+
+  // E[t+1]=j[t]*E[t]+c[t] outer x[t]. Contract the affine recurrence
+  // across the chunk using small scalar scans and BLAS. A zero j is valid:
+  // no division by a cumulative product occurs anywhere.
+  auto response = torch::empty({B, H}, opts);
+  auto multiplier = torch::empty({B, H}, opts);
+  auto future = torch::empty({B, T, H}, opts);
+  auto suffix = torch::empty({B, T, H}, opts);
+  float* responsep = response.data_ptr<float>();
+  float* multiplierp = multiplier.data_ptr<float>();
+  float* futurep = future.data_ptr<float>();
+  float* suffixp = suffix.data_ptr<float>();
+  for (int64_t bi = 0; bi < B; ++bi) {
+    for (int64_t h = 0; h < H; ++h) {
+      float carry = 0.0f, product = 1.0f;
+      for (int64_t ti = T; ti-- > 0;) {
+        const int64_t off = (bi * T + ti) * H + h;
+        futurep[off] = carry;
+        suffixp[off] = product;
+        carry = ibp[off] + jp[off] * carry;
+        product = jp[off] * product;
+      }
+      responsep[bi * H + h] = carry;
+      multiplierp[bi * H + h] = product;
+    }
+  }
+  auto slope = ((gate_pre_tape > -3.0) & (gate_pre_tape < 3.0)).to(torch::kFloat32) / 6.0;
+  auto common = lam * epre;
+  auto coefficient_g = common * ay_tape * slope;
+  auto coefficient_a = common * gate_tensor;
+  auto coefficient_w = common * (1.0f - y_tape.square()) *
+      (ay_tape * slope * Ug.diagonal() + gate_tensor * A.diagonal());
+  auto contract = [&](const torch::Tensor& initial, const torch::Tensor& coefficient,
+                      const torch::Tensor& values, torch::Tensor& gradient) {
+    auto final = torch::baddbmm(initial * multiplier.unsqueeze(-1),
+                               (coefficient * suffix).transpose(1, 2), values);
+    gradient.add_(torch::bmm(response.transpose(0, 1).unsqueeze(1),
+                            initial.transpose(0, 1)).squeeze(1));
+    gradient.addmm_((coefficient * future).reshape({B * T, H}).t(),
+                    values.reshape({B * T, values.size(2)}));
+    return final;
+  };
+  next_w_elig = contract(w_elig, coefficient_w, inputs, dW);
+  next_a_elig = contract(a_elig, coefficient_a, y_tape, dA);
+  next_wg_elig = contract(wg_elig, coefficient_g, inputs, dWg);
+  next_ug_elig = contract(ug_elig, coefficient_g, y_tape, dUg);
 
   return {
       next_w_elig, next_a_elig, next_wg_elig, next_ug_elig, next_local_elig,

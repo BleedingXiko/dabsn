@@ -275,18 +275,21 @@ class ReLU2MLPExpertGroup(nn.Module):
 
     def forward_grouped(self, inputs: Tensor, offsets: Tensor) -> Tensor:
         ends = offsets[1:].to(dtype=torch.int32)
+        # CUDA grouped GEMM requires its output to match the activation dtype
+        # on supported low-precision kernels; keep both GEMMs on that contract.
+        output_dtype = inputs.dtype if inputs.is_cuda else self.accumulation_dtype
         first = torch._grouped_mm(
             inputs,
             self.w1,
             offs=ends,
-            out_dtype=self.accumulation_dtype,
+            out_dtype=output_dtype,
         )
-        hidden = F.relu(first).square()
+        hidden = F.relu(first).square().to(output_dtype)
         output = torch._grouped_mm(
             hidden,
             self.w2,
             offs=ends,
-            out_dtype=self.accumulation_dtype,
+            out_dtype=output_dtype,
         )
         return output.to(inputs.dtype)
 
