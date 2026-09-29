@@ -662,6 +662,13 @@ def _reverse_into_grads(
     one containing step 0, whose predecessor is the scan's initial state -- runs
     uncaptured, as does everything when capture cannot help or be trusted.
     """
+    # This analytic reverse normally runs without autograd. FSDP1 parameter
+    # views can retain a flat base with a sharded .grad while its data has been
+    # all-gathered. The numerical kernel needs the values, not that incompatible
+    # autograd metadata, which Dynamo would otherwise recursively fake-convert.
+    # Preserve graph construction when explicitly computing higher derivatives.
+    if not torch.is_grad_enabled():
+        consts = tuple(value.detach() for value in consts)
     U, _e, c_tape, _s, _p, _x = reads
     initial_b, initial_c = initial
 
@@ -1186,6 +1193,13 @@ def _batched_forward_tapes(
         log_lambda,
         logit_c_suppress,
     )
+    # The custom operator/Function owns autograd and saves the original inputs.
+    # Detaching these numerical views does not copy storage or change its
+    # derivatives; it prevents the step compiler from inspecting FSDP1's flat
+    # parameter base and its still-sharded gradient. The eager differentiable
+    # reference path must retain its ordinary autograd graph.
+    if not torch.is_grad_enabled():
+        params = tuple(value.detach() for value in params)
     state = _ScanState(budget, energy, saturation)
     _scan_into_tapes(Wx, Wgx, recurrent, state, tapes, params, H)
     budget, energy, saturation = state.budget, state.energy, state.saturation

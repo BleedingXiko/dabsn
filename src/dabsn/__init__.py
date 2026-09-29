@@ -58,6 +58,9 @@ from .config import (
     DABSN_ARCH,
     DABSNConfig,
     DABSNLayerSpec,
+    CapacityConfig,
+    CapacityMode,
+    CapacityAddressMode,
     DABSNPretrainConfig,
     EligibilityBatchMode,
     TemporalCreditMode,
@@ -175,6 +178,9 @@ __all__ = [
     "DABSNBackbone",
     "DABSNBlock",
     "DABSNLayerSpec",
+    "CapacityConfig",
+    "CapacityMode",
+    "CapacityAddressMode",
     "DABSNPretrainConfig",
     "DABSNRead",
     "DABSNModel",
@@ -287,6 +293,6 @@ __all__ = [
     "verify_gradients",
 ]
 
-__version__ = "0.2.1"
+__version__ = "0.2.2"
 
 register_builtin_components()

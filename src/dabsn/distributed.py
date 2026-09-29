@@ -231,9 +231,9 @@ class DABSNSequenceModule(nn.Module):
         temporal_state=None,
     ) -> Tensor | ComponentOutput | tuple[Tensor, object]:
         if temporal_state is not None:
-            if positions is not None or with_terms:
+            if positions is not None:
                 raise ValueError(
-                    "online temporal_state is incompatible with positions or with_terms"
+                    "online temporal_state is incompatible with positions"
                 )
             forward_online = getattr(self.body, "forward_sequence_online", None)
             if not callable(forward_online):
@@ -575,6 +575,9 @@ def wrap_distributed(
         return module
     if state.kind == "ddp":
         from torch.nn.parallel import DistributedDataParallel
+        from .capacity_distributed import register_replicated_capacity
+
+        register_replicated_capacity(module, data_group)
 
         device_ids = [state.local_rank] if state.device.type == "cuda" else None
         # The canonical unified read retains parameters that are either used by
@@ -594,6 +597,20 @@ def wrap_distributed(
             device=str(state.device),
         )
         return wrapped
+    from .capacity_distributed import capacity_modules, shard_capacity_rows
+    capacity_rows = []
+    for capacity in capacity_modules(module):
+        if getattr(capacity, "_row_partition", None) is None:
+            shard_capacity_rows(capacity, data_group, axis="data")
+        elif capacity._row_partition.axis != "data":
+            capacity._capacity_replicated = True
+            capacity._capacity_replica_group = data_group
+        capacity_rows.extend(capacity.sparse_parameters())
+    for capacity in capacity_modules(module, sparse_only=False):
+        capacity._capacity_gain_replicated = True
+        capacity._capacity_gain_replica_group = data_group
+        capacity_rows.append(capacity.gain)
+        torch_dist.broadcast(capacity.gain.data, src=torch_dist.get_global_rank(data_group, 0), group=data_group)
     if state.kind == "fsdp2":
         from torch.distributed.device_mesh import DeviceMesh
         from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
@@ -617,25 +634,33 @@ def wrap_distributed(
                 mesh_dim_names=("data",),
             )
         boundaries = _component_fsdp_boundaries(module)
+        # FSDP2 versions before ignored_params still permit provider-owned
+        # parameters: keep them outside parameter discovery during wrapping.
+        from .capacity_distributed import exclude_capacity_parameters
+        exclusion = exclude_capacity_parameters(module)
+        exclusion.__enter__()
         seen: set[int] = set()
-        for boundary in boundaries:
-            if id(boundary) in seen or not any(
-                parameter.requires_grad for parameter in boundary.parameters()
-            ):
-                continue
-            seen.add(id(boundary))
+        try:
+            for boundary in boundaries:
+                if id(boundary) in seen or not any(
+                    parameter.requires_grad for parameter in boundary.parameters()
+                ):
+                    continue
+                seen.add(id(boundary))
+                fully_shard(
+                    boundary,
+                    mesh=data_mesh,
+                    mp_policy=policy,
+                    reshard_after_forward=True,
+                )
             fully_shard(
-                boundary,
+                module,
                 mesh=data_mesh,
                 mp_policy=policy,
                 reshard_after_forward=True,
             )
-        fully_shard(
-            module,
-            mesh=data_mesh,
-            mp_policy=policy,
-            reshard_after_forward=True,
-        )
+        finally:
+            exclusion.__exit__(None, None, None)
         emit_event(
             EventCode.DISTRIBUTED_PLACEMENT,
             component_id=None,
@@ -674,6 +699,7 @@ def wrap_distributed(
         # the right trade with FULL_SHARD + block-level grad checkpointing.
         backward_prefetch=BackwardPrefetch.BACKWARD_PRE,
         use_orig_params=True,
+        ignored_states=capacity_rows or None,
         sync_module_states=True,
         process_group=data_group,
     )
@@ -765,9 +791,15 @@ def full_model_state_dict(model: nn.Module, state: DistributedState) -> dict[str
                 strict=True,
             ),
         )
-        return {str(name): value for name, value in result.items() if isinstance(value, Tensor)}
+        result = {str(name): value for name, value in result.items() if isinstance(value, Tensor)}
+        from .capacity_distributed import checkpoint_capacity_state
+        checkpoint_capacity_state(model, result, full=True)
+        return result
     if state.kind != "fsdp":
-        return model.state_dict()
+        result = model.state_dict()
+        from .capacity_distributed import checkpoint_capacity_state
+        checkpoint_capacity_state(model, result, full=True)
+        return result
     if not _is_fsdp(model):
         raise TypeError("state.kind is fsdp but model is not an FSDP root")
     from torch.distributed.fsdp import (
@@ -782,7 +814,10 @@ def full_model_state_dict(model: nn.Module, state: DistributedState) -> dict[str
         StateDictType.FULL_STATE_DICT,
         config,
     ):
-        return model.state_dict()
+        result = model.state_dict()
+    from .capacity_distributed import checkpoint_capacity_state
+    checkpoint_capacity_state(model, result, full=True)
+    return result
 
 
 def full_training_state_dict(
@@ -798,10 +833,14 @@ def full_training_state_dict(
         optimizer,
         options=StateDictOptions(
             full_state_dict=True,
-            cpu_offload=True,
+            # Every owner participates in provider row-state consolidation below.
+            # Rank-zero-only full dictionaries would skip those collectives on peers.
+            cpu_offload=False,
             strict=True,
         ),
     )
+    from .capacity_distributed import checkpoint_capacity_state
+    checkpoint_capacity_state(model, model_state, optimizer_state, full=True)
     return {"model": model_state, "optimizer": optimizer_state}
 
 
@@ -1154,6 +1193,8 @@ def save_sharded_training_checkpoint(
         optimizer,
         options=options,
     )
+    from .capacity_distributed import checkpoint_capacity_state, reshardable_checkpoint_providers
+    checkpoint_capacity_state(model, model_state, optimizer_state)
     rng_state = _distributed_rng_state(state)
     checkpoint_state: dict[str, Any] = {
         "model": model_state,
@@ -1201,7 +1242,9 @@ def save_sharded_training_checkpoint(
             ),
             "extra": extra or {},
             "providers": providers,
+            "reshardable_providers": reshardable_checkpoint_providers(model),
             "optimizer": type(optimizer).__module__ + "." + type(optimizer).__qualname__,
+            "optimizer_state_names": sorted(optimizer_state.get("state", {})),
             "topology": state.report(),
             "scheduler": (extra or {}).get("scheduler"),
             "scaler": (extra or {}).get("amp_scaler"),
@@ -1325,11 +1368,18 @@ def _validate_checkpoint_topology(
             "an intentional topology-change restore cannot exactly restore per-worker random "
             "number generator state; pass restore_rng=False"
         )
+    if manifest.get("has_worker_training_state"):
+        raise ValueError(
+            "topology-change restore cannot remap exact worker training/stream state; "
+            "restore with the recorded topology or save a model/optimizer-only checkpoint"
+        )
     providers = manifest.get("providers")
-    if isinstance(providers, list) and providers:
+    supported = manifest.get("reshardable_providers", [])
+    unsupported = sorted(set(providers) - set(supported)) if isinstance(providers, list) else []
+    if unsupported:
         raise ValueError(
             "topology-change restore for provider-owned component shards is not implemented; "
-            f"checkpoint providers={providers}. Restore with the recorded topology, export "
+            f"checkpoint providers={unsupported}. Restore with the recorded topology, export "
             "portable model weights, then initialize a new optimizer under the new topology."
         )
 
@@ -1384,6 +1434,15 @@ def load_sharded_training_checkpoint(
         training_state.update(restored_training_state)
     options = StateDictOptions(full_state_dict=False, cpu_offload=True, strict=False)
     model_state, optimizer_state = get_state_dict(model, optimizer, options=options)
+    saved_optimizer_names = manifest.get("optimizer_state_names")
+    if isinstance(saved_optimizer_names, list):
+        # DCP initializes destination optimizer slots to discover their shapes.
+        # Remove slots absent at save time: retaining a synthetic step/moment
+        # would change the first update of a previously unused parameter.
+        optimizer_state["state"] = {name: value for name, value in optimizer_state.get("state", {}).items()
+                                    if name in saved_optimizer_names}
+    from .capacity_distributed import checkpoint_capacity_state
+    checkpoint_capacity_state(model, model_state, optimizer_state)
     state_dict: dict[str, Any] = {
         "model": model_state,
         "optimizer": optimizer_state,
@@ -1427,6 +1486,7 @@ def load_sharded_training_checkpoint(
         planner=dcp.DefaultLoadPlanner(allow_partial_load=True),
         no_dist=not state.enabled,
     )
+    checkpoint_capacity_state(model, state_dict["model"], state_dict["optimizer"], restore=True)
     set_state_dict(
         model,
         optimizer,
@@ -1442,9 +1502,11 @@ def load_sharded_training_checkpoint(
         scheduler.load_state_dict(state_dict["scheduler"])
     if restore_rng and has_rng:
         rng = cast(dict[str, Tensor], state_dict["rng"])
-        torch.set_rng_state(rng["cpu"][state.rank].cpu())
+        # Generator restore requires storage owned by this rank's byte vector;
+        # contiguous slices can still have a nonzero storage offset.
+        torch.set_rng_state(rng["cpu"][state.rank].cpu().clone())
         if state.device.type == "cuda" and rng["cuda"].shape[1]:
-            torch.cuda.set_rng_state(rng["cuda"][state.rank].cpu(), state.device)
+            torch.cuda.set_rng_state(rng["cuda"][state.rank].cpu().clone(), state.device)
     barrier(state)
     return manifest
 
@@ -1474,12 +1536,15 @@ def load_sharded_model_checkpoint(
     )
     options = StateDictOptions(full_state_dict=False, cpu_offload=True, strict=True)
     model_state = get_model_state_dict(model, options=options)
+    from .capacity_distributed import checkpoint_capacity_state
+    checkpoint_capacity_state(model, model_state)
     state_dict = {"model": model_state}
     dcp.load(
         state_dict,
         checkpoint_id=_committed_checkpoint_source(path),
         no_dist=not state.enabled,
     )
+    checkpoint_capacity_state(model, state_dict["model"], restore=True)
     set_model_state_dict(model, state_dict["model"], options=options)
     barrier(state)
     return manifest
@@ -1616,6 +1681,9 @@ def no_sync_context(model: nn.Module, *, synchronize: bool):
 def clip_grad_norm(model: nn.Module, max_norm: float) -> Tensor:
     """Clip global FSDP gradients correctly, or ordinary gradients otherwise."""
 
+    from .capacity_distributed import synchronize_capacity_gradients
+    synchronize_capacity_gradients(model)
+
     context = None
     current = model
     seen: set[int] = set()
@@ -1634,21 +1702,45 @@ def clip_grad_norm(model: nn.Module, max_norm: float) -> Tensor:
         graph is not None
         and any(binding.parallel_execution_receipt is not None for binding in graph.bindings)
     )
+    from .capacity_distributed import capacity_modules
+    capacity_sharded = [cap for cap in capacity_modules(model) if getattr(cap, "_row_partition", None) is not None]
+    capacity_ignored = {id(cap.gain) for cap in capacity_modules(model, sparse_only=False)
+                        if getattr(cap, "_capacity_gain_replicated", False)}
+    capacity_ignored.update(id(p) for cap in capacity_sharded for p in cap.sparse_parameters())
+    provider_sharded = provider_sharded or bool(capacity_sharded) or bool(capacity_ignored)
     if context is None or not provider_sharded or not torch_dist.is_initialized():
         if _is_fsdp(model):
             return cast(Any, model).clip_grad_norm_(float(max_norm))
+        if any(p.grad is not None and p.grad.is_sparse for p in model.parameters()):
+            values = []
+            for parameter in model.parameters():
+                gradient = parameter.grad
+                if gradient is None:
+                    continue
+                if gradient.is_sparse:
+                    parameter.grad = gradient = gradient.coalesce()
+                    gradient = gradient.values()
+                values.append(gradient)
+            norm = torch.stack([g.detach().float().norm() for g in values]).norm()
+            coefficient = (float(max_norm) / (norm + 1e-6)).clamp(max=1.)
+            for gradient in values:
+                gradient.mul_(coefficient.to(gradient))
+            return norm
         return torch.nn.utils.clip_grad_norm_(model.parameters(), float(max_norm))
 
     parameter_axes: dict[int, tuple[str, ...]] = {}
-    assert graph is not None
-    for binding in graph.bindings:
+    for binding in (() if graph is None else graph.bindings):
         receipt = binding.parallel_execution_receipt
         if receipt is None:
             continue
         for name, parameter in binding.module.named_parameters():
             parameter_axes[id(parameter)] = receipt.parameter_sharding[name]
+    for capacity in capacity_sharded:
+        for parameter in capacity.sparse_parameters():
+            parameter_axes[id(parameter)] = (capacity._row_partition.axis,)
 
-    data_is_sharded = _is_fsdp(model) or type(model).__name__ == "FSDPModule"
+    from torch.distributed.fsdp import FSDPModule
+    data_is_sharded = _is_fsdp(model) or isinstance(model, FSDPModule)
     all_axes = tuple(axis.name for axis in context.topology.axes)
     local_squared = torch.zeros((), device=cast(Any, context.device), dtype=torch.float64)
     gradients = []
@@ -1658,9 +1750,12 @@ def clip_grad_norm(model: nn.Module, max_norm: float) -> Tensor:
             continue
         to_local = getattr(gradient, "to_local", None)
         local_gradient = cast(Tensor, to_local() if callable(to_local) else gradient)
+        if local_gradient.is_sparse:
+            parameter.grad = local_gradient = local_gradient.coalesce()
+            local_gradient = local_gradient.values()
         gradients.append(local_gradient)
         sharded_axes = set(parameter_axes.get(id(parameter), ()))
-        if data_is_sharded and "data" in all_axes:
+        if data_is_sharded and "data" in all_axes and id(parameter) not in capacity_ignored:
             sharded_axes.add("data")
         replicas = 1
         for axis in context.topology.axes:

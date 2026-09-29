@@ -246,7 +246,8 @@ def test_cuda_does_not_cap_context(context):
             torch.bfloat16,
             id="bf16",
             marks=pytest.mark.skipif(
-                not torch.cuda.is_bf16_supported(), reason="BF16 tensor cores required"
+                not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 8,
+                reason="Native BF16 requires compute capability >= 8.0; emulation is insufficient"
             ),
         ),
     ],

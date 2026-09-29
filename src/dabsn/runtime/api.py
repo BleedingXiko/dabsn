@@ -32,7 +32,21 @@ def _default_loss(output: object, target: object) -> Tensor:
     return F.mse_loss(output, target)
 
 
+def _prepared_sequence_module(model: nn.Module):
+    from ..distributed import DABSNSequenceModule
+    current = model
+    seen = set()
+    while isinstance(current, nn.Module) and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, DABSNSequenceModule):
+            return current
+        current = getattr(current, "module", None)
+    return None
+
+
 def _sequence_forward(model: nn.Module, inputs: object) -> object:
+    if _prepared_sequence_module(model) is not None:
+        return model(inputs)
     forward_sequence = getattr(model, "forward_sequence", None)
     if callable(forward_sequence):
         return forward_sequence(inputs)
@@ -40,6 +54,14 @@ def _sequence_forward(model: nn.Module, inputs: object) -> object:
 
 
 def _training_forward(model: nn.Module, inputs: object) -> ComponentOutput:
+    prepared = _prepared_sequence_module(model)
+    if prepared is not None:
+        if callable(getattr(prepared.body, "forward_with_terms", None)):
+            result = model(inputs, with_terms=True)
+            if not isinstance(result, ComponentOutput):
+                raise TypeError("forward_with_terms must return ComponentOutput")
+            return result
+        return ComponentOutput(model(inputs))
     forward = getattr(model, "forward_with_terms", None)
     if callable(forward):
         result = forward(inputs)
@@ -53,6 +75,8 @@ def _post_optimizer_step(model: nn.Module, *, step_applied: bool) -> None:
     action = getattr(model, "post_optimizer_step", None)
     if callable(action):
         action(step_applied=step_applied)
+    elif isinstance(getattr(model, "module", None), nn.Module):
+        _post_optimizer_step(model.module, step_applied=step_applied)
 
 
 def _result_declarations(model: nn.Module):
@@ -158,10 +182,17 @@ def apply_optimizer_step(
     callers invoke this function only at their update boundary.
     """
 
+    prepare = getattr(optimizer, "prepare_gradients", None)
+    if callable(prepare):
+        prepare()
+    from ..capacity_distributed import synchronize_capacity_gradients
+    synchronize_capacity_gradients(model)
     if scaler is None:
         optimizer.step()
         step_applied = True
     else:
+        from ..capacity_distributed import synchronize_capacity_overflow
+        synchronize_capacity_overflow(model, optimizer, scaler)
         scale_before = float(scaler.get_scale())
         scaler.step(optimizer)
         scaler.update()
@@ -186,6 +217,7 @@ def train_step(
     stream_reset_mask: Tensor | None = None,
     eligibility_batch_mode: str = "vectorized",
     eligibility_lane_group_size: int | None = None,
+    scaler: Any | None = None,
 ):
     if temporal_state is not None:
         return _online_train_step(
@@ -203,6 +235,7 @@ def train_step(
             stream_reset_mask=stream_reset_mask,
             eligibility_batch_mode=eligibility_batch_mode,
             eligibility_lane_group_size=eligibility_lane_group_size,
+            scaler=scaler,
         )
     if (
         temporal_chunk_size is not None
@@ -220,10 +253,16 @@ def train_step(
     if result.loss_terms:
         for term in result.loss_terms:
             loss = loss + term
-    loss.backward()
+    (loss if scaler is None else scaler.scale(loss)).backward()
+    prepare = getattr(optimizer, "prepare_gradients", None)
+    if callable(prepare):
+        prepare()
+    if scaler is not None:
+        from .optimizer import unscale_training_gradients
+        unscale_training_gradients(optimizer, scaler)
     if clip_grad_norm is not None:
         distributed_clip_grad_norm(model, float(clip_grad_norm))
-    apply_optimizer_step(model, optimizer)
+    apply_optimizer_step(model, optimizer, scaler=scaler)
     reduced_loss, metrics = _reduced_step_metrics(
         model,
         primary_loss.detach(),
@@ -251,6 +290,7 @@ def _online_train_step(
     stream_reset_mask: Tensor | None,
     eligibility_batch_mode: str,
     eligibility_lane_group_size: int | None,
+    scaler: Any | None = None,
 ):
     """Execute one bounded online-credit update using the normal optimizer."""
 
@@ -271,10 +311,17 @@ def _online_train_step(
         stream_reset_mask=stream_reset_mask,
         eligibility_batch_mode=eligibility_batch_mode,
         eligibility_lane_group_size=eligibility_lane_group_size,
+        scaler=scaler,
     )
+    prepare = getattr(optimizer, "prepare_gradients", None)
+    if callable(prepare):
+        prepare()
+    if scaler is not None:
+        from .optimizer import unscale_training_gradients
+        unscale_training_gradients(optimizer, scaler)
     if clip_grad_norm is not None:
         distributed_clip_grad_norm(model, float(clip_grad_norm))
-    apply_optimizer_step(model, optimizer)
+    apply_optimizer_step(model, optimizer, scaler=scaler)
     result = output
     reduced_loss, metrics = _reduced_step_metrics(
         model,
@@ -301,6 +348,7 @@ def _online_backward_step(
     eligibility_lane_group_size: int | None = None,
     loss_scale: float = 1.0,
     accumulation_position: int | None = None,
+    scaler: Any | None = None,
 ):
     """Backpropagate one online microbatch without touching optimizer state."""
 
@@ -366,7 +414,8 @@ def _online_backward_step(
     if not torch.isfinite(torch.tensor(float(loss_scale))) or float(loss_scale) < 0:
         raise ValueError("loss_scale must be finite and non-negative")
 
-    forward_online = getattr(model, "forward_sequence_online", None)
+    forward_online = (None if _prepared_sequence_module(model) is not None
+                      else getattr(model, "forward_sequence_online", None))
     loss_declarations, _ = _result_declarations(model)
     group_states = []
     group_outputs = []
@@ -416,7 +465,8 @@ def _online_backward_step(
                 (term * weight for term in terms),
                 weighted_loss.new_zeros(()),
             )
-            ((weighted_loss + weighted_aux) * float(loss_scale)).backward()
+            backward_loss = (weighted_loss + weighted_aux) * float(loss_scale)
+            (backward_loss if scaler is None else scaler.scale(backward_loss)).backward()
             weighted_losses.append(weighted_loss.detach())
             for values, term in zip(weighted_terms, terms):
                 values.append((term * weight).detach())
@@ -587,6 +637,12 @@ def verify_gradients(
             core_norm = 0.0 if core_gradient is None else float(core_gradient.detach().norm())
             gain_norm = 0.0 if gain_gradient is None else float(gain_gradient.detach().abs().max())
             finite = bool(torch.isfinite(torch.tensor([core_norm, gain_norm])).all().item())
+            capacity = getattr(block, "capacity_module", None)
+            if capacity is not None:
+                capacity_gradients = [parameter.grad for parameter in capacity.parameters() if parameter.requires_grad]
+                finite = finite and all(gradient is not None and bool(torch.isfinite(
+                    gradient.coalesce().values() if gradient.is_sparse else gradient).all().item())
+                    for gradient in capacity_gradients)
             ok = finite and core_norm > 0.0 and gain_norm > 0.0
             rows.append(
                 {
@@ -622,7 +678,8 @@ def verify_gradients(
     component_failures: list[str] = []
     for stage_name, stage in stages:
         parameters = tuple(parameter for parameter in stage.parameters() if parameter.requires_grad)
-        gradients = tuple(parameter.grad for parameter in parameters if parameter.grad is not None)
+        gradients = tuple(parameter.grad.coalesce().values() if parameter.grad.is_sparse else parameter.grad
+                          for parameter in parameters if parameter.grad is not None)
         finite = all(bool(torch.isfinite(gradient).all().item()) for gradient in gradients)
         if gradients:
             squared_norm = sum(

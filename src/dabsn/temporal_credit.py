@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from typing import Mapping
 
 import torch
@@ -235,6 +235,9 @@ class OnlineLayerState:
     long_recurrent: tuple[Tensor, Tensor, Tensor]
     long_eligibility: LongReadEligibilityState
     read_bank: Mapping[str, Tensor] = field(default_factory=dict)
+    capacity_recurrent: Mapping[str, Tensor] = field(default_factory=dict)
+    capacity_eligibility: Mapping[str, Tensor] = field(default_factory=dict)
+    capacity_contract: Mapping[str, object] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         batch = self.core_eligibility.batch_size
@@ -279,6 +282,15 @@ class OnlineLayerState:
                 raise ValueError("online read_bank position must be int64 [B,N]")
             if any(value.grad_fn is not None for value in self.read_bank.values()):
                 raise ValueError("online read_bank values must be detached")
+        if bool(self.capacity_recurrent) != bool(self.capacity_eligibility):
+            raise ValueError("capacity recurrent and eligibility state must be present together")
+        for label, mapping in (("capacity_recurrent", self.capacity_recurrent),
+                               ("capacity_eligibility", self.capacity_eligibility)):
+            for name, value in mapping.items():
+                if not isinstance(value, Tensor) or value.dim() < 1 or int(value.shape[0]) != batch:
+                    raise ValueError(f"online {label} {name} must be a batch-leading tensor")
+                if value.grad_fn is not None:
+                    raise ValueError(f"online {label} {name} must be detached")
 
     @property
     def batch_size(self) -> int:
@@ -290,7 +302,11 @@ class OnlineLayerState:
             for value in (*self.core_recurrent, *self.long_recurrent)
         )
         bank = sum(value.numel() * value.element_size() for value in self.read_bank.values())
-        return recurrent + bank + self.core_eligibility.nbytes() + self.long_eligibility.nbytes()
+        capacity = sum(
+            value.numel() * value.element_size()
+            for value in (*self.capacity_recurrent.values(), *self.capacity_eligibility.values())
+        )
+        return recurrent + bank + capacity + self.core_eligibility.nbytes() + self.long_eligibility.nbytes()
 
 
 @dataclass(frozen=True)
@@ -1675,6 +1691,12 @@ def initial_online_temporal_state(
                 dtype=dtype,
             )
         )
+        capacity_recurrent = {}
+        capacity_eligibility = {}
+        if getattr(block, "capacity_module", None) is not None:
+            capacity_recurrent, capacity_eligibility = block.capacity_module.initial_online_state(
+                batch, device=device, recurrent_dtype=dtype, eligibility_dtype=eligibility_dtype
+            )
         layers.append(
             OnlineLayerState(
                 core_recurrent=core_recurrent,
@@ -1691,6 +1713,9 @@ def initial_online_temporal_state(
                     device=device,
                     dtype=eligibility_dtype,
                 ),
+                capacity_recurrent=capacity_recurrent,
+                capacity_eligibility=capacity_eligibility,
+                capacity_contract=asdict(block.capacity_module.config) if block.capacity_module is not None else {},
             )
         )
     return OnlineTemporalState(
@@ -1738,6 +1763,15 @@ def online_temporal_state_dict(state: OnlineTemporalState) -> dict[str, object]:
                 "read_bank": {
                     name: _checkpoint_tensor(value) for name, value in layer.read_bank.items()
                 },
+                "capacity_recurrent": {
+                    name: _checkpoint_tensor(value)
+                    for name, value in layer.capacity_recurrent.items()
+                },
+                "capacity_eligibility": {
+                    name: _checkpoint_tensor(value)
+                    for name, value in layer.capacity_eligibility.items()
+                },
+                "capacity_contract": dict(layer.capacity_contract),
             }
         )
     return {
@@ -1859,6 +1893,10 @@ def load_online_temporal_state(
     layers: list[OnlineLayerState] = []
     for index, (block, raw_layer) in enumerate(zip(blocks, raw_layers)):
         layer_data = _checkpoint_mapping(raw_layer, f"layer {index}")
+        capacity_contract = dict(_checkpoint_mapping(layer_data.get("capacity_contract", {}), "Capacity contract"))
+        expected_capacity_contract = asdict(block.capacity_module.config) if block.capacity_module is not None else {}
+        if capacity_contract != expected_capacity_contract:
+            raise ValueError(f"online Capacity contract does not match layer {index}")
         core_recurrent_raw = _checkpoint_sequence(
             layer_data.get("core_recurrent"), f"layer {index} core_recurrent", 3
         )
@@ -1872,6 +1910,12 @@ def load_online_temporal_state(
             layer_data.get("long_eligibility"), f"layer {index} long_eligibility"
         )
         bank_data = _checkpoint_mapping(layer_data.get("read_bank"), f"layer {index} read_bank")
+        capacity_recurrent_data = _checkpoint_mapping(
+            layer_data.get("capacity_recurrent", {}), f"layer {index} capacity_recurrent"
+        )
+        capacity_eligibility_data = _checkpoint_mapping(
+            layer_data.get("capacity_eligibility", {}), f"layer {index} capacity_eligibility"
+        )
         try:
             core_eligibility = CoreEligibilityState(
                 w_budget=_restore_tensor(
@@ -1901,6 +1945,7 @@ def load_online_temporal_state(
                 schema_version=int(long_data.get("schema_version", -1)),
             )
             layer = OnlineLayerState(
+                capacity_contract=capacity_contract,
                 core_recurrent=tuple(
                     _restore_tensor(value, f"layer {index} core recurrent", resolved_device)
                     for value in core_recurrent_raw
@@ -1917,6 +1962,18 @@ def load_online_temporal_state(
                     )
                     for name, value in bank_data.items()
                 },
+                capacity_recurrent={
+                    str(name): _restore_tensor(
+                        value, f"layer {index} capacity_recurrent {name}", resolved_device
+                    )
+                    for name, value in capacity_recurrent_data.items()
+                },
+                capacity_eligibility={
+                    str(name): _restore_tensor(
+                        value, f"layer {index} capacity_eligibility {name}", resolved_device
+                    )
+                    for name, value in capacity_eligibility_data.items()
+                },
             )
         except (TypeError, ValueError) as exc:
             raise ValueError(f"online temporal state model layer {index} is invalid: {exc}") from exc
@@ -1932,6 +1989,22 @@ def load_online_temporal_state(
                 f"online temporal state does not match model layer {index}: expected "
                 f"core {expected_input}->{expected_state} and read width {expected_hidden}"
             )
+        capacity_module = getattr(block, "capacity_module", None)
+        if capacity_module is None:
+            if layer.capacity_recurrent or layer.capacity_eligibility:
+                raise ValueError(f"online temporal state has Capacity data for disabled layer {index}")
+        else:
+            expected_recurrent = {"features"}
+            expected_eligibility = {"key", "bias", "retention"}
+            if set(layer.capacity_recurrent) != expected_recurrent or set(layer.capacity_eligibility) != expected_eligibility:
+                raise ValueError(f"online temporal state Capacity schema does not match layer {index}")
+            if tuple(layer.capacity_recurrent["features"].shape[1:]) != (capacity_module.size,):
+                raise ValueError(f"online Capacity recurrent size does not match layer {index}")
+            if tuple(layer.capacity_eligibility["key"].shape[1:]) != (capacity_module.size, capacity_module.input_dim):
+                raise ValueError(f"online Capacity key eligibility does not match layer {index}")
+            for name in ("bias", "retention"):
+                if tuple(layer.capacity_eligibility[name].shape[1:]) != (capacity_module.size,):
+                    raise ValueError(f"online Capacity {name} eligibility does not match layer {index}")
         layers.append(layer)
 
     pending_reset_mask = _restore_tensor(
@@ -1978,9 +2051,12 @@ def finalize_online_temporal_state(state: OnlineTemporalState) -> OnlineTemporal
             OnlineLayerState(
                 core_recurrent=layer.core_recurrent,
                 core_eligibility=core_frame.resulting_eligibility,
+                capacity_contract=layer.capacity_contract,
                 long_recurrent=layer.long_recurrent,
                 long_eligibility=long_frame.resulting_eligibility,
                 read_bank=layer.read_bank,
+                capacity_recurrent=layer.capacity_recurrent,
+                capacity_eligibility=layer.capacity_eligibility,
             )
         )
     return OnlineTemporalState(
@@ -2020,6 +2096,7 @@ def _slice_online_temporal_state(
                 core_recurrent=tuple(
                     _slice_online_tensor(value, start, stop) for value in layer.core_recurrent
                 ),
+                capacity_contract=layer.capacity_contract,
                 core_eligibility=CoreEligibilityState(
                     *(
                         _slice_online_tensor(value, start, stop)
@@ -2035,6 +2112,14 @@ def _slice_online_temporal_state(
                 read_bank={
                     name: _slice_online_tensor(value, start, stop)
                     for name, value in layer.read_bank.items()
+                },
+                capacity_recurrent={
+                    name: _slice_online_tensor(value, start, stop)
+                    for name, value in layer.capacity_recurrent.items()
+                },
+                capacity_eligibility={
+                    name: _slice_online_tensor(value, start, stop)
+                    for name, value in layer.capacity_eligibility.items()
                 },
             )
         )
@@ -2094,11 +2179,20 @@ def _merge_online_temporal_states(states: tuple[OnlineTemporalState, ...]) -> On
         bank_names = set(grouped[0].read_bank)
         if any(set(layer.read_bank) != bank_names for layer in grouped[1:]):
             raise ValueError("online lane groups have incompatible read-bank schemas")
+        capacity_recurrent_names = set(grouped[0].capacity_recurrent)
+        capacity_eligibility_names = set(grouped[0].capacity_eligibility)
+        if any(set(layer.capacity_recurrent) != capacity_recurrent_names for layer in grouped[1:]):
+            raise ValueError("online lane groups have incompatible Capacity recurrent schemas")
+        if any(set(layer.capacity_eligibility) != capacity_eligibility_names for layer in grouped[1:]):
+            raise ValueError("online lane groups have incompatible Capacity eligibility schemas")
+        if any(layer.capacity_contract != grouped[0].capacity_contract for layer in grouped[1:]):
+            raise ValueError("online lane groups have incompatible Capacity contracts")
         layers.append(
             OnlineLayerState(
                 core_recurrent=tuple(
                     cat(layer.core_recurrent[index] for layer in grouped) for index in range(3)
                 ),
+                capacity_contract=grouped[0].capacity_contract,
                 core_eligibility=CoreEligibilityState(
                     *(cat(layer.core_eligibility.tensors()[index] for layer in grouped) for index in range(6))
                 ),
@@ -2109,6 +2203,14 @@ def _merge_online_temporal_states(states: tuple[OnlineTemporalState, ...]) -> On
                     cat(layer.long_eligibility.traces for layer in grouped)
                 ),
                 read_bank={name: cat(layer.read_bank[name] for layer in grouped) for name in bank_names},
+                capacity_recurrent={
+                    name: cat(layer.capacity_recurrent[name] for layer in grouped)
+                    for name in capacity_recurrent_names
+                },
+                capacity_eligibility={
+                    name: cat(layer.capacity_eligibility[name] for layer in grouped)
+                    for name in capacity_eligibility_names
+                },
             )
         )
     return OnlineTemporalState(
@@ -2191,6 +2293,15 @@ def prepare_online_temporal_state(
             device=device,
             dtype=layer.long_eligibility.traces.dtype,
         )
+        fresh_capacity_recurrent = {}
+        fresh_capacity_eligibility = {}
+        if getattr(block, "capacity_module", None) is not None:
+            recurrent_dtype = layer.capacity_recurrent["features"].dtype
+            eligibility_dtype = layer.capacity_eligibility["key"].dtype
+            fresh_capacity_recurrent, fresh_capacity_eligibility = block.capacity_module.initial_online_state(
+                state.batch_size, device=device, recurrent_dtype=recurrent_dtype,
+                eligibility_dtype=eligibility_dtype
+            )
         if reset_all:
             layers.append(
                 OnlineLayerState(
@@ -2198,6 +2309,9 @@ def prepare_online_temporal_state(
                     core_eligibility=fresh_core_eligibility,
                     long_recurrent=fresh_long,
                     long_eligibility=fresh_long_eligibility,
+                    capacity_recurrent=fresh_capacity_recurrent,
+                    capacity_contract=layer.capacity_contract,
+                    capacity_eligibility=fresh_capacity_eligibility,
                 )
             )
             continue
@@ -2233,6 +2347,15 @@ def prepare_online_temporal_state(
                     )
                 ),
                 read_bank=bank,
+                capacity_recurrent={
+                    name: _reset_lanes(layer.capacity_recurrent[name], fresh, mask)
+                    for name, fresh in fresh_capacity_recurrent.items()
+                },
+                capacity_contract=layer.capacity_contract,
+                capacity_eligibility={
+                    name: _reset_lanes(layer.capacity_eligibility[name], fresh, mask)
+                    for name, fresh in fresh_capacity_eligibility.items()
+                },
             )
         )
     return OnlineTemporalState(

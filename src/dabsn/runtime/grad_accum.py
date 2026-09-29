@@ -28,13 +28,15 @@ class ManualGradientAccumulator:
         self.parameters = [
             parameter for parameter in module.parameters() if parameter.requires_grad
         ]
+        from .optimizer import capacity_sparse_parameters
+        self.sparse_parameters = set(capacity_sparse_parameters(module))
         self.buffers = {
             parameter: torch.zeros_like(
                 parameter,
                 dtype=dtype,
                 memory_format=torch.preserve_format,
             )
-            for parameter in self.parameters
+            for parameter in self.parameters if parameter not in self.sparse_parameters
         }
         self.active: set[nn.Parameter] = set()
         self.microbatches = 0
@@ -49,13 +51,22 @@ class ManualGradientAccumulator:
         """Add one completed backward to persistent buffers, then clear it."""
 
         found = False
+        from ..kernels.capacity import finalize_capacity_gradients
+        finalize_capacity_gradients(self.module)
         for parameter in self.parameters:
             gradient = parameter.grad
             if gradient is None:
                 continue
             # TensorIterator converts the source while adding into the FP32
             # destination. A separate .to() duplicates the entire gradient.
-            self.buffers[parameter].add_(gradient.detach(), alpha=float(scale))
+            if parameter in self.sparse_parameters or gradient.is_sparse:
+                from .optimizer import as_row_sparse
+                contribution = as_row_sparse(gradient.detach(), getattr(parameter, "_capacity_touched_rows", None)).to(self.dtype) * float(scale)
+                if parameter in self.active:
+                    contribution = self.buffers[parameter] + contribution
+                self.buffers[parameter] = contribution.coalesce()
+            else:
+                self.buffers[parameter].add_(gradient.detach(), alpha=float(scale))
             self.active.add(parameter)
             found = True
         if not found:
@@ -82,7 +93,13 @@ class ManualGradientAccumulator:
 
         self.module.zero_grad(set_to_none=True)
         for parameter in self.active:
-            self.buffers[parameter].zero_()
+            touched = getattr(parameter, "_capacity_touched_rows", None)
+            if touched is not None:
+                touched.zero_()
+            if self.buffers[parameter].is_sparse:
+                del self.buffers[parameter]
+            else:
+                self.buffers[parameter].zero_()
         self.active.clear()
         self.microbatches = 0
 

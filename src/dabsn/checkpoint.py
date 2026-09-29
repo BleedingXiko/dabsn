@@ -118,6 +118,9 @@ def dabsn_config_dict(model: Model) -> dict[str, object]:
         }
     config = getattr(model, "_dabsn_config", None) or _introspect_config(model)
     data = {name: getattr(config, name) for name in DABSNConfig.__dataclass_fields__}
+    if data.get("capacity") is not None:
+        from dataclasses import asdict
+        data["capacity"] = asdict(data["capacity"])
     data["layers"] = [
         spec.to_metadata() if isinstance(spec, DABSNLayerSpec) else dict(spec)
         for spec in config.layer_specs()
@@ -283,6 +286,7 @@ def build_dabsn_from_checkpoint_config(
             mlp_middle_depth=_int(config.get("mlp_middle_depth", 0)),
             mlp_depth_index=_int(config.get("mlp_depth_index", 0)),
             temporal_credit=cast(Any, config.get("temporal_credit", "bptt")),
+            capacity=cast(Any, config.get("capacity")),
         ),
         grad_checkpoint=bool(config.get("grad_checkpoint", False)),
     )
@@ -390,6 +394,7 @@ def _legacy_graph_components(config: Mapping[str, object]) -> list[dict[str, obj
                     "state_dim": state,
                     "read_geometry": str(layer.get("read_geometry", "field")),
                     "residual": bool(config.get("residual", False)),
+                    **({"capacity": layer["capacity"]} if layer.get("capacity") is not None else {}),
                 },
             }
         )

@@ -24,11 +24,13 @@ from .components import (
 from .config import (
     DABSNConfig,
     DABSNLayerSpec,
+    CapacityConfig,
     TemporalCreditMode,
     coerce_layer_specs,
     resolve_dabsn_layers,
 )
 from .core import DABSNCore
+from .capacity import DABSNCapacitySubsystem, capacity_config
 from .graph import DABSNGraph
 from .read import DABSNRead, _stream_is_capturing
 
@@ -81,13 +83,28 @@ def _sequence_world_contract(width: int) -> ValueContract:
     )
 
 
-class _DABSNWorldView(nn.Module):
+class _OwnedModuleView(nn.Module):
+    """Non-owning execution view that follows replacements of its owner entry."""
+
+    def __init__(self, owner: nn.ModuleList, index: int) -> None:
+        super().__init__()
+        object.__setattr__(self, "_owner", owner)
+        self._owner_index = int(index)
+
+    @property
+    def module(self) -> nn.Module:
+        return self._owner[self._owner_index]
+
+    def forward(self, inputs: Tensor) -> Tensor:
+        return self.module(inputs)
+
+
+class _DABSNWorldView(_OwnedModuleView):
     """Non-owning graph view of the DABSN computation in a legacy block."""
 
-    def __init__(self, block: DABSNBlock) -> None:
-        super().__init__()
-        self.block: DABSNBlock
-        object.__setattr__(self, "block", block)
+    @property
+    def block(self):
+        return self.module
 
     def forward(self, inputs: Tensor) -> Tensor:
         # Route through nn.Module.__call__ so user forward hooks retain their
@@ -96,16 +113,16 @@ class _DABSNWorldView(nn.Module):
         return self.block(inputs, _dabsn_only=True)
 
 
-class _InlineMLPView(nn.Module):
+class _InlineMLPView(_DABSNWorldView):
     """Non-owning explicit component view of a legacy block's MLP modules."""
 
-    def __init__(self, block: DABSNBlock) -> None:
-        super().__init__()
-        self.block: DABSNBlock
-        object.__setattr__(self, "block", block)
-
     def forward(self, inputs: Tensor) -> Tensor:
-        return self.block.forward_mlp(inputs)
+        block = self.block
+        if type(block) is DABSNBlock:
+            # Preserve ordinary legacy block hooks: the world call already
+            # invoked them. A wrapper needs its own parameter-gather boundary.
+            return block.forward_mlp(inputs)
+        return block(inputs, _mlp_only=True)
 
 
 class DABSNBlock(nn.Module):
@@ -134,6 +151,7 @@ class DABSNBlock(nn.Module):
         *,
         residual: bool = False,
         mlp_ratio: float | None = None,
+        capacity: CapacityConfig | Mapping[str, object] | None = None,
     ) -> None:
         super().__init__()
         self.input_dim = input_dim
@@ -145,6 +163,13 @@ class DABSNBlock(nn.Module):
         self.read_gain = nn.Parameter(torch.full((1,), 0.01))
         self.field_read_gain = (
             nn.Parameter(torch.full((1,), 1.0)) if read_geometry == "field" else None
+        )
+        resolved_capacity = capacity_config(capacity)
+        self.capacity_config = resolved_capacity
+        self.capacity_module = (
+            None
+            if resolved_capacity is None
+            else DABSNCapacitySubsystem(input_dim, state_dim, resolved_capacity)
         )
         self.state_to_hidden = (
             nn.Identity() if state_dim == hidden_dim else nn.Linear(state_dim, hidden_dim)
@@ -334,7 +359,10 @@ class DABSNBlock(nn.Module):
             saturation,
             field_shape=None,
         )
-        dabsn_output = self.state_to_hidden(y + self.read_gain * read)
+        fused_state = y + self.read_gain * read
+        if self.capacity_module is not None:
+            fused_state = fused_state + self.capacity_module.forward_sequence(inputs)
+        dabsn_output = self.state_to_hidden(fused_state)
         output = self._finish_block(inputs, dabsn_output)
         compiling = torch.compiler.is_compiling()
         fake_tensor = not compiling and is_fake(inputs)
@@ -369,6 +397,9 @@ class DABSNBlock(nn.Module):
             "long_scan_norm": self.read.last_long_scan_norm,
             "read_contract": self.read.last_read_contract,
             "read_gain": float(self.read_gain.detach().cpu()) if trace_enabled else None,
+            "capacity_mode": None if self.capacity_module is None else self.capacity_module.mode,
+            "capacity_size": 0 if self.capacity_module is None else self.capacity_module.size,
+            "capacity_active_units": 0 if self.capacity_module is None else self.capacity_module.active_units,
         }
         return output
 
@@ -474,24 +505,45 @@ class DABSNBlock(nn.Module):
                 return_long_state=True,
             )
             next_bank = {}
-        dabsn_output = self.state_to_hidden(y + self.read_gain * read)
+        fused_state = y + self.read_gain * read
+        capacity_recurrent = layer_state.capacity_recurrent
+        capacity_eligibility = layer_state.capacity_eligibility
+        if self.capacity_module is not None:
+            cap, capacity_recurrent, capacity_eligibility = self.capacity_module.forward_online(
+                inputs, layer_state.capacity_recurrent, layer_state.capacity_eligibility
+            )
+            fused_state = fused_state + cap
+        dabsn_output = self.state_to_hidden(fused_state)
         output = self._finish_block(inputs, dabsn_output)
         next_layer = OnlineLayerState(
+            capacity_contract=layer_state.capacity_contract,
             core_recurrent=tuple(value.detach() for value in final_core),
             core_eligibility=layer_state.core_eligibility,
             long_recurrent=tuple(value.detach() for value in final_long),
             long_eligibility=layer_state.long_eligibility,
             read_bank=next_bank,
+            capacity_recurrent=capacity_recurrent,
+            capacity_eligibility=capacity_eligibility,
         )
         return output, next_layer, (core_frame, long_frame)
+
+    def capacity_routing_health(self, inputs: Tensor) -> dict[str, object] | None:
+        if self.capacity_module is None:
+            return None
+        return self.capacity_module.routing_health(inputs)
 
     def forward_online(self, inputs: Tensor, layer_state):
         hidden, next_layer, frames = self.forward_world_online(inputs, layer_state)
         return self.forward_mlp(hidden), next_layer, frames
 
-    def forward(self, inputs: Tensor, _dabsn_only: bool = False) -> Tensor:
+    def forward(self, inputs: Tensor, _dabsn_only: bool = False,
+                _mlp_only: bool = False, _online_state=None):
         """0.1.x wrapper: DABSN world transform followed by translated MLP."""
 
+        if _online_state is not None:
+            return self.forward_online(inputs, _online_state)
+        if _mlp_only:
+            return self.forward_mlp(inputs)
         hidden = self.forward_world(inputs)
         return hidden if _dabsn_only else self.forward_mlp(hidden)
 
@@ -538,6 +590,7 @@ class DABSNBackbone(nn.Module):
                     read_geometry=spec.read_geometry,
                     residual=self.residual,
                     mlp_ratio=self.mlp_ratio,
+                    capacity=spec.capacity,
                 )
             )
             width = spec.hidden_dim
@@ -561,7 +614,7 @@ class DABSNBackbone(nn.Module):
             ordered.append(
                 bind_module(
                     f"dabsn.{index}",
-                    _DABSNWorldView(block),
+                    _DABSNWorldView(self.blocks, index),
                     ComponentContract(input_contract, output_contract),
                     capabilities=ComponentCapabilities(
                         eager=True,
@@ -579,7 +632,7 @@ class DABSNBackbone(nn.Module):
                 ordered.append(
                     bind_module(
                         f"legacy-inline-mlp.{index}",
-                        _InlineMLPView(block),
+                        _InlineMLPView(self.blocks, index),
                         ComponentContract(output_contract, output_contract),
                         capabilities=ComponentCapabilities(
                             eager=True,
@@ -600,7 +653,7 @@ class DABSNBackbone(nn.Module):
                     ordered.append(
                         bind_module(
                             f"legacy-middle-mlp.{middle_index}",
-                            mlp,
+                            _OwnedModuleView(self.middle_mlps, middle_index),
                             ComponentContract(output_contract, output_contract),
                             capabilities=ComponentCapabilities(
                                 eager=True,
@@ -672,7 +725,10 @@ class DABSNBackbone(nn.Module):
         for index, (block, layer_state) in enumerate(
             zip(cast(list[DABSNBlock], list(self.blocks)), temporal_state.layers)
         ):
-            hidden, next_layer, layer_frames = block.forward_online(hidden, layer_state)
+            if type(block) is DABSNBlock:
+                hidden, next_layer, layer_frames = block.forward_online(hidden, layer_state)
+            else:
+                hidden, next_layer, layer_frames = block(hidden, _online_state=layer_state)
             next_layers.append(next_layer)
             frames.extend(layer_frames)
             if index == self.mlp_depth_index:
@@ -1080,6 +1136,7 @@ class DABSNSequenceLM(nn.Module):
         mlp_middle_depth: int = 0,
         mlp_depth_index: int = 0,
         temporal_credit: TemporalCreditMode = "bptt",
+        capacity: CapacityConfig | Mapping[str, object] | None = None,
     ) -> None:
         super().__init__()
         if temporal_credit not in {"bptt", "online"}:
@@ -1101,6 +1158,18 @@ class DABSNSequenceLM(nn.Module):
             layer_geometries=layer_geometries,
             state_dim=self.state_dim,
         )
+        resolved_capacity = capacity_config(capacity)
+        if resolved_capacity is not None:
+            self.layers = [
+                spec if spec.capacity is not None else DABSNLayerSpec(
+                    hidden_dim=spec.hidden_dim,
+                    state_dim=spec.state_dim,
+                    read_geometry=spec.read_geometry,
+                    capacity=resolved_capacity,
+                )
+                for spec in self.layers
+            ]
+        self.capacity_config = resolved_capacity
         self.depth = len(self.layers)
         self.layer_geometries = [spec.read_geometry for spec in self.layers]
         self.embed = nn.Embedding(self.vocab, self.hidden_dim)
@@ -1264,6 +1333,7 @@ def build_dabsn(
     mlp_ratio: float | None = None,
     mlp_middle_depth: int = 0,
     mlp_depth_index: int = 0,
+    capacity: CapacityConfig | Mapping[str, object] | None = None,
 ) -> DABSNModel:
     config = DABSNConfig(
         input_dim=input_dim,
@@ -1277,6 +1347,7 @@ def build_dabsn(
         mlp_ratio=mlp_ratio,
         mlp_middle_depth=mlp_middle_depth,
         mlp_depth_index=mlp_depth_index,
+        capacity=capacity,
     )
     model = build_dabsn_from_config(config, grad_checkpoint=grad_checkpoint)
     if not isinstance(model, DABSNModel):

@@ -15,6 +15,7 @@ from typing import Protocol, runtime_checkable
 
 import torch.nn as nn
 from torch import Tensor
+from torch.utils._pytree import GetAttrKey, register_pytree_node
 
 from .events import EventCode, emit_event
 
@@ -386,6 +387,22 @@ class ComponentOutput:
     loss_terms: tuple[Tensor, ...] = ()
     reports: tuple[Tensor, ...] = ()
     next_state: tuple[Tensor, ...] = ()
+
+
+# FSDP2 discovers backward hooks through PyTree leaves (including on PyTorch
+# versions that do not traverse arbitrary dataclasses). Keep every tensor field
+# visible so a loss or recurrent state can independently trigger its all-gather.
+register_pytree_node(
+    ComponentOutput,
+    lambda output: ([output.value, output.loss_terms, output.reports, output.next_state], None),
+    lambda values, _context: ComponentOutput(*values),
+    serialized_type_name="dabsn.components.ComponentOutput",
+    flatten_with_keys_fn=lambda output: (
+        [(GetAttrKey(name), getattr(output, name))
+         for name in ("value", "loss_terms", "reports", "next_state")],
+        None,
+    ),
+)
 
 
 @dataclass(frozen=True)

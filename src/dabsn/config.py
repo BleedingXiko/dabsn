@@ -12,6 +12,90 @@ TemporalCreditMode: TypeAlias = Literal["bptt", "online"]
 TemporalStreamPolicy: TypeAlias = Literal["reset_each_batch", "carry_lanes"]
 EligibilityBatchMode: TypeAlias = Literal["vectorized", "lane_grouped"]
 
+CapacityMode: TypeAlias = Literal["dense", "sparse"]
+CapacityAddressMode: TypeAlias = Literal["auto", "flat", "product"]
+
+
+def _is_exact_power(n: int, base: int) -> bool:
+    if n < 1:
+        return False
+    while n > 1 and n % base == 0:
+        n //= base
+    return n == 1
+
+
+@dataclass(frozen=True)
+class CapacityConfig:
+    """Optional parametric Capacity attached natively to each configured DABSN block.
+
+    ``size`` controls total stored Capacity. In sparse mode ``active_units`` controls
+    exactly how many Capacity rows execute per token.
+    """
+
+    enabled: bool = True
+    mode: CapacityMode = "dense"
+    size: int = 4096
+    active_units: int = 64
+    address_mode: CapacityAddressMode = "auto"
+    address_branching: int = 4
+    address_seed: int = 0
+    injection_gain: float = 0.25
+    initial_retention: float = 0.05
+
+    @property
+    def active_fraction(self) -> float:
+        if not self.enabled:
+            return 0.0
+        return 1.0 if self.mode == "dense" else self.active_units / self.size
+
+    @property
+    def sparsity(self) -> float:
+        return 1.0 - self.active_fraction
+
+    def validate(self) -> "CapacityConfig":
+        if self.mode not in {"dense", "sparse"}:
+            raise ValueError("capacity.mode must be dense or sparse")
+        if int(self.size) <= 0:
+            raise ValueError("capacity.size must be positive")
+        if not 0.0 < float(self.initial_retention) < 1.0:
+            raise ValueError("capacity.initial_retention must be between zero and one")
+        if self.mode == "sparse" and self.enabled:
+            if not 1 <= int(self.active_units) <= int(self.size):
+                raise ValueError("capacity.active_units must be in [1, size]")
+            if int(self.size) % int(self.active_units):
+                raise ValueError("capacity.size must be divisible by capacity.active_units")
+            if self.address_mode not in {"auto", "flat", "product"}:
+                raise ValueError("capacity.address_mode must be auto, flat, or product")
+            if int(self.address_branching) < 2:
+                raise ValueError("capacity.address_branching must be >= 2")
+        return self
+
+    def resolve_product_branching(self, num_buckets: int) -> int | None:
+        self.validate()
+        if self.address_mode == "flat":
+            return None
+        if _is_exact_power(int(num_buckets), int(self.address_branching)):
+            return int(self.address_branching)
+        if self.address_mode == "product":
+            raise ValueError(
+                f"product addressing requires num_buckets={num_buckets} to be an exact "
+                f"power of address_branching={self.address_branching}"
+            )
+        for branching in (4, 2, 8, 16, 3, 5, 7):
+            if _is_exact_power(int(num_buckets), branching):
+                return branching
+        return None
+
+
+def coerce_capacity_config(
+    value: CapacityConfig | Mapping[str, object] | None,
+) -> CapacityConfig | None:
+    if value is None:
+        return None
+    cfg = value if isinstance(value, CapacityConfig) else CapacityConfig(**dict(value))
+    return cfg.validate()
+
+
 
 def _validate_temporal_credit(value: object) -> None:
     if value not in {"bptt", "online"}:
@@ -52,6 +136,7 @@ class DABSNLayerSpec:
     hidden_dim: int
     state_dim: int | None = None
     read_geometry: str = "field"
+    capacity: CapacityConfig | Mapping[str, object] | None = None
 
     def __post_init__(self) -> None:
         if self.hidden_dim <= 0:
@@ -60,17 +145,22 @@ class DABSNLayerSpec:
             raise ValueError("state_dim must be positive")
         if self.read_geometry not in {"seq", "field", "hybrid"}:
             raise ValueError("read_geometry must be seq, field, or hybrid")
+        capacity = coerce_capacity_config(self.capacity)
+        object.__setattr__(self, "capacity", capacity)
 
     @property
     def resolved_state_dim(self) -> int:
         return self.hidden_dim if self.state_dim is None else self.state_dim
 
     def to_metadata(self) -> dict[str, object]:
-        return {
+        data = {
             "hidden_dim": int(self.hidden_dim),
             "state_dim": None if self.state_dim is None else int(self.state_dim),
             "read_geometry": self.read_geometry,
         }
+        if self.capacity is not None:
+            data["capacity"] = asdict(self.capacity)
+        return data
 
 
 def parse_dabsn_layer_specs(spec: str | Sequence[object] | None) -> list[DABSNLayerSpec]:
@@ -128,6 +218,7 @@ def parse_dabsn_layer_specs(spec: str | Sequence[object] | None) -> list[DABSNLa
                 hidden_dim=int(hidden),
                 state_dim=None if state is None else int(state),
                 read_geometry=str(geometry),
+                capacity=item.get("capacity"),
             )
         )
     return layers
@@ -211,6 +302,7 @@ class DABSNConfig:
     mlp_middle_depth: int = 0
     mlp_depth_index: int = 0
     temporal_credit: TemporalCreditMode = "bptt"
+    capacity: CapacityConfig | Mapping[str, object] | None = None
 
     def __post_init__(self) -> None:
         if self.input_dim <= 0 or self.out_dim <= 0:
@@ -222,6 +314,8 @@ class DABSNConfig:
         if self.mlp_ratio is not None and float(self.mlp_ratio) <= 0:
             raise ValueError("mlp_ratio must be positive or None")
         _validate_temporal_credit(self.temporal_credit)
+        capacity = coerce_capacity_config(self.capacity)
+        object.__setattr__(self, "capacity", capacity)
         _validate_middle_mlp(
             mlp_ratio=self.mlp_ratio,
             mlp_middle_depth=self.mlp_middle_depth,
@@ -231,12 +325,24 @@ class DABSNConfig:
 
     def layer_specs(self) -> list[DABSNLayerSpec]:
         if self.layers:
-            return coerce_layer_specs(self.layers)
+            specs = coerce_layer_specs(self.layers)
+            if self.capacity is None:
+                return specs
+            return [
+                spec if spec.capacity is not None else DABSNLayerSpec(
+                    hidden_dim=spec.hidden_dim,
+                    state_dim=spec.state_dim,
+                    read_geometry=spec.read_geometry,
+                    capacity=self.capacity,
+                )
+                for spec in specs
+            ]
         return [
             DABSNLayerSpec(
                 hidden_dim=self.hidden_dim,
                 state_dim=self.state_dim,
                 read_geometry=self.geometry,
+                capacity=self.capacity,
             )
             for _ in range(self.depth)
         ]
@@ -306,8 +412,10 @@ class DABSNPretrainConfig:
     temporal_chunk_size: int = 0
     eligibility_batch_mode: EligibilityBatchMode = "vectorized"
     eligibility_lane_group_size: int | None = None
+    capacity: CapacityConfig | Mapping[str, object] | None = None
 
     def __post_init__(self) -> None:
+        object.__setattr__(self, "capacity", coerce_capacity_config(self.capacity))
         if bool(self.corpus_bin) == bool(self.corpus_text):
             raise ValueError("set exactly one of corpus_bin or corpus_text")
         if self.corpus_dtype not in {"uint8", "uint16", "uint32", "int32", "int64"}:
@@ -388,13 +496,19 @@ class DABSNPretrainConfig:
             )
 
     def layer_specs(self) -> list[DABSNLayerSpec]:
-        return resolve_dabsn_layers(
+        specs = resolve_dabsn_layers(
             layers=self.layers,
             hidden_dim=self.hidden_dim,
             depth=self.depth,
             layer_geometries=self.layer_geometries,
             state_dim=self.state_dim,
         )
+        return [
+            spec if spec.capacity is not None or self.capacity is None else DABSNLayerSpec(
+                spec.hidden_dim, spec.state_dim, spec.read_geometry, self.capacity
+            )
+            for spec in specs
+        ]
 
     def metadata(self) -> dict[str, object]:
         data = asdict(self)

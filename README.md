@@ -26,6 +26,10 @@ hidden dimension and expert parallelism over MoE experts.
 
 ## New: online temporal credit and prepared memory
 
+Optional dense and geometrically sparse Capacity is integrated beside native
+Read. See [Capacity configuration, training, and carried state](docs/capacity.md)
+and the [training example](examples/capacity_train.py).
+
 The current source adds two framework capabilities:
 
 - **Architecture-specific online temporal credit:** `temporal_credit="online"`

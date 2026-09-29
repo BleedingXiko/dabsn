@@ -392,6 +392,7 @@ def pretrain_next_token(
                 mlp_middle_depth=config.mlp_middle_depth,
                 mlp_depth_index=config.mlp_depth_index,
                 temporal_credit=config.temporal_credit,
+                capacity=config.capacity,
             ).to(state.device)
 
         global_tokens_per_step = config.batch_size * config.train_context * state.data_world_size
@@ -415,8 +416,9 @@ def pretrain_next_token(
             model.zero_grad(set_to_none=True)
 
         train_model = prepare_distributed_model(model, state, precision=precision)
-        optimizer = torch.optim.AdamW(
-            train_model.parameters(),
+        from .runtime import build_training_optimizer
+        optimizer = build_training_optimizer(
+            train_model,
             lr=config.learning_rate,
             betas=(config.beta1, config.beta2),
             eps=config.adam_eps,
@@ -672,8 +674,12 @@ def pretrain_next_token(
             if update_boundary:
                 if accumulator is not None:
                     accumulator.install()
+                prepare_gradients = getattr(optimizer, "prepare_gradients", None)
+                if callable(prepare_gradients):
+                    prepare_gradients()
                 if scaler is not None:
-                    scaler.unscale_(optimizer)
+                    from .runtime.optimizer import unscale_training_gradients
+                    unscale_training_gradients(optimizer, scaler)
                 if config.clip_grad_norm > 0:
                     clip_grad_norm(train_model, config.clip_grad_norm)
                 apply_optimizer_step(model, optimizer, scaler=scaler)

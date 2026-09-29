@@ -18,6 +18,7 @@ forward/backward directly, so DABSN's custom-autograd boundaries are preserved.
 from __future__ import annotations
 
 import os
+from contextlib import ExitStack
 from collections.abc import Callable, Sequence
 from typing import cast
 
@@ -345,6 +346,22 @@ def make_graphed_train_callable(
     module.train()
     module.zero_grad(set_to_none=True)
 
+    # Building a graph is not a stream update. Preserve caller-owned carried
+    # tensors across warmup and verification without recording resets in replay.
+    from ..capacity import DABSNCapacitySubsystem
+    carried = []
+    if any(isinstance(child, DABSNCapacitySubsystem) for child in module.modules()):
+        seen = set()
+        for tensor in (*module.buffers(), *sample_args):
+            if id(tensor) not in seen:
+                seen.add(id(tensor))
+                carried.append((tensor, tensor.detach().clone()))
+
+    def restore_carried() -> None:
+        with torch.no_grad():
+            for tensor, original in carried:
+                tensor.copy_(original)
+
     # Pin the admitted read to a fixed, sub-quadratic width for the whole build
     # (warmup + capture must agree, or the recorded graph misaligns). Restored
     # afterward so eager/non-graph steps keep their data-dependent sparse width.
@@ -354,20 +371,27 @@ def make_graphed_train_callable(
     restore_scan_graphs = _suspend_nested_scan_graphs()
     restore_recompute = None
     restore_reads = None
+    capacity_capture = ExitStack()
     try:
+        from ..kernels.capacity import capture_capacity_rows, finalize_capacity_gradients
+        capacity_capture.enter_context(capture_capacity_rows(module))
         restore_recompute = _pin_capture_safe_recompute(module)
         restore_reads = _pin_capture_safe_reads(module, sample_args)
         eager_loss = None
         eager_signature = None
         if verify:
+            restore_carried()
             eager_loss = float(reduce(module(*sample_args)).detach())
+            restore_carried()
             reduce(module(*sample_args)).backward()
+            finalize_capacity_gradients(module)
             eager_signature = _block_grad_signature(module)
             module.zero_grad(set_to_none=True)
 
         # make_graphed_callables records the eager forward/backward as CUDA work.
         # It does NOT invoke Dynamo/AOTAutograd, so DABSN custom-autograd Functions
         # are captured intact rather than traced or rewritten.
+        restore_carried()
         graphed = torch.cuda.make_graphed_callables(
             module,
             sample_args=sample_args,
@@ -378,14 +402,19 @@ def make_graphed_train_callable(
         # Flush capture's transient so the first independent single backward
         # begins from the same state as every later replay. Cross-replay
         # accumulation is intentionally delegated to ManualGradientAccumulator.
+        restore_carried()
         reduce(graphed(*sample_args)).backward()
+        finalize_capacity_gradients(module)
         torch.cuda.synchronize()
         module.zero_grad(set_to_none=True)
 
         if verify:
             assert eager_loss is not None
+            restore_carried()
             graph_loss = float(reduce(graphed(*sample_args)).detach())
+            restore_carried()
             reduce(graphed(*sample_args)).backward()
+            finalize_capacity_gradients(module)
             graph_signature = _block_grad_signature(module)
             module.zero_grad(set_to_none=True)
             _assert_close("loss", eager_loss, graph_loss, rtol=loss_rtol, atol=loss_atol)
@@ -394,6 +423,8 @@ def make_graphed_train_callable(
                     eager_signature, graph_signature, rtol=grad_rtol, atol=grad_atol
                 )
     finally:
+        restore_carried()
+        capacity_capture.close()
         if restore_reads is not None:
             restore_reads()
         if restore_recompute is not None:

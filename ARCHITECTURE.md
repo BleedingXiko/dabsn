@@ -27,7 +27,10 @@ plasticity, expression, committed write, energy, and saturation signals. The
 read combines admitted short memory, successor induction, permanent associative
 memory, predictive expectation, and recurrent long memory. A block returns:
 
-Let `d = state_to_hidden(y + read_gain * read)`. With both optional additions
+With optional Capacity, let
+`d = state_to_hidden(y + read_gain * read + capacity(input))`; the Capacity term
+is absent when disabled. See [Capacity](docs/capacity.md) for dense and sparse
+recurrence, initialization, training, and state contracts. With both optional additions
 enabled, a block returns:
 
 ```text

@@ -34,6 +34,7 @@ from .api import (
 )
 from .dispatch import log_routing_once, reset_routing_log, warn_routing_once
 from .grad_accum import ManualGradientAccumulator
+from .optimizer import build_training_optimizer
 from .graph import make_graphed_train_callable
 from .loss import (
     ChunkedLinearCrossEntropy,
@@ -63,6 +64,7 @@ __all__ = [
     "make_grad_scaler",
     "make_graphed_train_callable",
     "ManualGradientAccumulator",
+    "build_training_optimizer",
     "no_sync_context",
     "parse_parallel_topology",
     "prepare_distributed_model",

@@ -159,6 +159,7 @@ class DABSNBlockProvider:
             "read_geometry",
             "residual",
             "tensor_parallel_axis",
+            "capacity",
         }
         unknown = set(config) - allowed
         if unknown:
@@ -168,6 +169,8 @@ class DABSNBlockProvider:
                 raise ValueError(f"{name} must be positive")
         if config["read_geometry"] not in {"seq", "field", "hybrid"}:
             raise ValueError("read_geometry must be seq, field, or hybrid")
+        from .capacity import capacity_config
+        capacity_config(config.get("capacity"))
         tensor_axis = config.get("tensor_parallel_axis")
         if tensor_axis is not None and (not isinstance(tensor_axis, str) or not tensor_axis):
             raise ValueError("tensor_parallel_axis must be a non-empty axis name")
@@ -185,6 +188,7 @@ class DABSNBlockProvider:
             read_geometry=str(config["read_geometry"]),
             residual=bool(config.get("residual", False)),
             mlp_ratio=None,
+            capacity=config.get("capacity"),
         )
 
     def parallelize(
@@ -207,6 +211,7 @@ class DABSNBlockProvider:
         axis = directive.mesh_axes[0]
         workers = context.topology.axis_size(axis)
         worker = int(context.coordinate[axis])
+        original_shapes = {name: tuple(parameter.shape) for name, parameter in module.named_parameters()}
         module.core = TensorParallelDABSNCore(
             module.core,
             group=context.group(axis),
@@ -235,6 +240,15 @@ class DABSNBlockProvider:
             "core.Ug.weight",
             "core.A.weight",
         }
+        module._dabsn_checkpoint_shards = {
+            name: {"axis": axis, "group": context.group(axis), "dim": 0,
+                   "shape": original_shapes[name]}
+            for name in sharded
+        }
+        if module.capacity_module is not None and module.capacity_module.mode == "sparse":
+            from .capacity_distributed import shard_capacity_rows, ROW_NAMES
+            shard_capacity_rows(module.capacity_module, context.group(axis), axis=axis)
+            sharded.update(f"capacity_module.{name}" for name in ROW_NAMES)
         placements = {
             name: ((axis,) if name in sharded else ())
             for name, _parameter in module.named_parameters()
@@ -283,6 +297,13 @@ class DABSNBlockProvider:
         if missing:
             raise KeyError(f"DABSN tensor shard state is missing {sorted(missing)}")
         result = dict(local_state)
+        capacity = module.capacity_module
+        partition = getattr(capacity, "_row_partition", None)
+        if partition is not None:
+            from .capacity_distributed import gather_capacity_rows, ROW_NAMES
+            for row_name in ROW_NAMES:
+                name = f"capacity_module.{row_name}"
+                result[name] = gather_capacity_rows(local_state[name].to(context.device), partition).cpu()
         for name in sorted(sharded_names):
             result[name] = _gather_first_dimension(
                 local_state[name],

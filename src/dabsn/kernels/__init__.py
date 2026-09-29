@@ -37,6 +37,15 @@ class Primitive:
 
 PRIMITIVES = (
     Primitive(
+        "capacity_scan",
+        "DABSNCapacitySubsystem v4 dense / selected-row recurrence",
+        "C++ selected-row addressing, forward and replay",
+        "Triton selected-row addressing, forward and replay",
+        "C++/Triton BPTT reverse scan or forward eligibility replay; COO online rows",
+        ("seq", "field", "hybrid"),
+        "v4 zero-init learning, full-signal gradients, routing and carried-state parity",
+    ),
+    Primitive(
         "core_online_temporal_credit",
         "dabsn.temporal_credit core online oracle",
         "C++/OpenMP forward-time eligibility replay",
@@ -122,6 +131,8 @@ def enable(
             "select a different backend in a fresh process"
         )
     if normalized == "reference":
+        from .capacity import enable_capacity
+        enable_capacity("reference")
         _ACTIVE_BACKEND = normalized
         return status()
     if normalized == "cpu":
@@ -131,6 +142,8 @@ def enable(
         from .permanent import enable_native_cpu_permanent
 
         results = enable_native_cpu_kernels(required=required)
+        from .capacity import enable_capacity
+        results["capacity_scan"] = enable_capacity("cpu", required=required)
         results["permanent_delta_scan"] = enable_native_cpu_permanent(required=required)
         results["local_field_gather"] = enable_native_cpu_local_field(required=required)
         enable_fused_long_read(required_cuda=False)
@@ -141,6 +154,8 @@ def enable(
         from .triton import enable_triton_kernels
 
         results = enable_triton_kernels(required=required)
+        from .capacity import enable_capacity
+        results["capacity_scan"] = enable_capacity("cuda", required=required)
         enable_fused_long_read(required_cuda=required)
         if required and not all(results.values()):
             raise RuntimeError(f"required Triton primitives unavailable: {results}")
@@ -149,6 +164,7 @@ def enable(
 
 
 def status() -> dict[str, object]:
+    from .capacity import capacity_runtime_status
     from .long import long_runtime_status
     from .triton import triton_status
 
@@ -168,6 +184,7 @@ def status() -> dict[str, object]:
         "long_memory": long_runtime_status(),
         "permanent": permanent_runtime_status(),
         "local_field": local_field_gather_stats(),
+        "capacity": capacity_runtime_status(),
         "primitives": primitive_map(),
     }
 

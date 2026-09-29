@@ -33,9 +33,13 @@ def test_builtin_component_conformance_runs_real_local_checks():
 
 
 @pytest.mark.parametrize("read_geometry", ["seq", "field", "hybrid"])
+@pytest.mark.parametrize("capacity_mode", [None, "dense", "sparse"])
 def test_dabsn_component_conformance_includes_real_bf16_and_fake_tensor_checks(
-    read_geometry,
+    read_geometry, capacity_mode,
 ):
+    # Each provider configuration is an independent compile contract. Do not
+    # spend the preceding configurations' specialization cache budget here.
+    torch._dynamo.reset()
     report = check_component(
         "dabsn:block",
         {
@@ -44,6 +48,8 @@ def test_dabsn_component_conformance_includes_real_bf16_and_fake_tensor_checks(
             "state_dim": 7,
             "read_geometry": read_geometry,
             "residual": False,
+            **({"capacity": {"mode": capacity_mode, "size": 16, "active_units": 4}}
+               if capacity_mode else {}),
         },
     )
     assert report.passed, report.to_dict()

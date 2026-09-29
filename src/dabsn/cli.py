@@ -324,7 +324,8 @@ def _supervised_train(args, *, initial_checkpoint: str | None = None) -> int:
 
         train_model = _prepare_training_artifact(model, state, precision)
         parameter_groups = dabsn_adamw_param_groups(train_model, args.weight_decay)
-        optimizer = torch.optim.AdamW(parameter_groups, lr=args.learning_rate)
+        from .runtime import build_training_optimizer
+        optimizer = build_training_optimizer(train_model, params=parameter_groups, lr=args.learning_rate)
         scaler = make_grad_scaler(state, precision)
         args._scaler = scaler
         start_step = 0
@@ -394,8 +395,12 @@ def _supervised_train(args, *, initial_checkpoint: str | None = None) -> int:
                         scaled_loss.backward()
                     else:
                         scaler.scale(scaled_loss).backward()
+            prepare_gradients = getattr(optimizer, "prepare_gradients", None)
+            if callable(prepare_gradients):
+                prepare_gradients()
             if scaler is not None:
-                scaler.unscale_(optimizer)
+                from .runtime.optimizer import unscale_training_gradients
+                unscale_training_gradients(optimizer, scaler)
             if args.clip_grad_norm is not None:
                 clip_grad_norm(train_model, args.clip_grad_norm)
             apply_optimizer_step(

@@ -63,11 +63,17 @@ def _graph_config(path):
     )
 
 
-def test_cli_trains_and_reloads_raw_graph_from_json(tmp_path):
+@pytest.mark.parametrize("capacity_mode", [None, "dense", "sparse"])
+def test_cli_trains_and_reloads_raw_graph_from_json(tmp_path, capacity_mode):
     config = tmp_path / "graph.json"
     data = tmp_path / "graph-data.pt"
     output = tmp_path / "graph.safetensors"
     _graph_config(config)
+    if capacity_mode:
+        payload = json.loads(config.read_text())
+        payload["components"][0]["config"]["capacity"] = {
+            "mode": capacity_mode, "size": 16, "active_units": 4}
+        config.write_text(json.dumps(payload))
     torch.save(
         {
             "inputs": torch.randn(2, 5, 4),
@@ -268,7 +274,8 @@ def test_pretrain_cuda_graph_flag_falls_back_cleanly_on_cpu(tmp_path):
         torch.testing.assert_close(actual[name], expected[name], atol=0, rtol=0)
 
 
-def test_pretrain_portable_resume_matches_uninterrupted(tmp_path):
+@pytest.mark.parametrize("capacity_mode", [None, "dense", "sparse"])
+def test_pretrain_portable_resume_matches_uninterrupted(tmp_path, capacity_mode):
     corpus = tmp_path / "tokens.bin"
     np.asarray(list(range(16)) * 32, dtype=np.uint8).tofile(corpus)
     common = dict(
@@ -298,6 +305,8 @@ def test_pretrain_portable_resume_matches_uninterrupted(tmp_path):
         val_every=0,
     )
     uninterrupted = tmp_path / "uninterrupted.safetensors"
+    if capacity_mode:
+        common["capacity"] = {"mode": capacity_mode, "size": 16, "active_units": 4}
     resumed = tmp_path / "resumed.safetensors"
     pretrain_next_token(
         DABSNPretrainConfig(**common),
@@ -326,7 +335,8 @@ def test_pretrain_portable_resume_matches_uninterrupted(tmp_path):
     assert inspect_dabsn(resumed)["extra"]["step"] == 2
 
 
-def test_online_pretrain_accumulates_and_portable_resume_is_exact(tmp_path):
+@pytest.mark.parametrize("capacity_mode", [None, "dense", "sparse"])
+def test_online_pretrain_accumulates_and_portable_resume_is_exact(tmp_path, capacity_mode):
     corpus = tmp_path / "online-tokens.bin"
     np.asarray(list(range(16)) * 32, dtype=np.uint8).tofile(corpus)
     common = dict(
@@ -361,6 +371,8 @@ def test_online_pretrain_accumulates_and_portable_resume_is_exact(tmp_path):
         eligibility_lane_group_size=1,
     )
     uninterrupted = tmp_path / "online-uninterrupted.safetensors"
+    if capacity_mode:
+        common["capacity"] = {"mode": capacity_mode, "size": 16, "active_units": 4}
     resumed = tmp_path / "online-resumed.safetensors"
     report = pretrain_next_token(
         DABSNPretrainConfig(**common),
@@ -396,7 +408,8 @@ def test_online_pretrain_accumulates_and_portable_resume_is_exact(tmp_path):
     assert load_dabsn(resumed).temporal_credit == "online"
 
 
-def test_online_pretrain_sharded_resume_matches_uninterrupted(tmp_path):
+@pytest.mark.parametrize("capacity_mode", [None, "dense", "sparse"])
+def test_online_pretrain_sharded_resume_matches_uninterrupted(tmp_path, capacity_mode):
     corpus = tmp_path / "online-sharded-tokens.bin"
     np.asarray(list(range(8)) * 24, dtype=np.uint8).tofile(corpus)
     common = dict(
@@ -429,6 +442,8 @@ def test_online_pretrain_sharded_resume_matches_uninterrupted(tmp_path):
         temporal_stream_policy="reset_each_batch",
     )
     uninterrupted = tmp_path / "online-sharded-uninterrupted"
+    if capacity_mode:
+        common["capacity"] = {"mode": capacity_mode, "size": 16, "active_units": 4}
     resumed = tmp_path / "online-sharded-resumed"
     uninterrupted_export = tmp_path / "online-sharded-uninterrupted.safetensors"
     resumed_export = tmp_path / "online-sharded-resumed.safetensors"

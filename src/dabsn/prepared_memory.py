@@ -16,6 +16,7 @@ from torch import Tensor
 
 
 FORMAT = "dabsn_prepared_memory_v2"
+CAPACITY_FORMAT = "dabsn_prepared_memory_v3"
 _IDENTITIES: WeakKeyDictionary = WeakKeyDictionary()
 
 
@@ -212,6 +213,7 @@ class PreparedLayerMemory:
     bank: PreparedAdmittedBank
     core: tuple[Tensor, Tensor, Tensor]
     long: tuple[Tensor, Tensor, Tensor]
+    capacity: Tensor | None = None
 
     def to(self, *, device=None, dtype=None) -> "PreparedLayerMemory":
         def value(tensor: Tensor) -> Tensor:
@@ -221,11 +223,16 @@ class PreparedLayerMemory:
             bank=self.bank.to(device=device, dtype=dtype),
             core=tuple(value(tensor) for tensor in self.core),
             long=tuple(value(tensor) for tensor in self.long),
+            capacity=None if self.capacity is None else self.capacity.to(
+                device=device, dtype=None if dtype is None else torch.promote_types(dtype, torch.float32)
+            ),
         )
 
     def nbytes(self) -> int:
         return self.bank.nbytes() + sum(
-            tensor.numel() * tensor.element_size() for tensor in (*self.core, *self.long)
+            tensor.numel() * tensor.element_size() for tensor in (
+                *self.core, *self.long, *((self.capacity,) if self.capacity is not None else ())
+            )
         )
 
 
@@ -237,6 +244,10 @@ class PreparedDABSNMemory:
     fingerprint: Mapping[str, object] = field(default_factory=dict)
     source_format: str = "dabsn_memory_v1"
     format: str = FORMAT
+
+    def __post_init__(self) -> None:
+        if self.format == FORMAT and any(layer.capacity is not None for layer in self.layers):
+            self.format = CAPACITY_FORMAT
 
     @property
     def entries(self) -> int:
@@ -785,7 +796,7 @@ def _page_payload(page: PreparedBankPage) -> dict[str, Tensor]:
 
 def to_payload(memory: PreparedDABSNMemory) -> dict[str, object]:
     return {
-        "format": FORMAT,
+        "format": CAPACITY_FORMAT if any(layer.capacity is not None for layer in memory.layers) else FORMAT,
         "source_format": memory.source_format,
         "position": memory.position,
         "batch_size": memory.batch_size,
@@ -804,6 +815,7 @@ def to_payload(memory: PreparedDABSNMemory) -> dict[str, object]:
                 },
                 "core": [tensor.detach().cpu() for tensor in layer.core],
                 "long": [tensor.detach().cpu() for tensor in layer.long],
+                **({"capacity": layer.capacity.detach().cpu()} if layer.capacity is not None else {}),
             }
             for layer in memory.layers
         ],
@@ -811,7 +823,7 @@ def to_payload(memory: PreparedDABSNMemory) -> dict[str, object]:
 
 
 def from_payload(payload: Mapping[str, object]) -> PreparedDABSNMemory:
-    if payload.get("format") != FORMAT:
+    if payload.get("format") not in (FORMAT, CAPACITY_FORMAT):
         raise ValueError(
             f"not a prepared DABSN memory payload: format={payload.get('format')!r}, expected {FORMAT!r}"
         )
@@ -839,6 +851,7 @@ def from_payload(payload: Mapping[str, object]) -> PreparedDABSNMemory:
         )
         layers.append(
             PreparedLayerMemory(
+                capacity=cast(Tensor | None, entry.get("capacity")),
                 bank=bank,
                 core=tuple(cast(Sequence[Tensor], entry["core"])),
                 long=tuple(cast(Sequence[Tensor], entry["long"])),

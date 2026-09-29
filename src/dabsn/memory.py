@@ -10,7 +10,7 @@ which takes an externally supplied bank plus a ``query_start`` causal offset.
 Chunked ingest against a growing bank reproduces one dense pass to float32
 rounding -- see ``tests/test_memory_carry.py``.
 
-Three states carry, and all three are required for exactness:
+Three states carry, plus optional Capacity recurrent features, for exactness:
 
 ``bank``
     Per layer, the five write-tape fields the read actually scores against:
@@ -23,6 +23,9 @@ Three states carry, and all three are required for exactness:
     carried writes against a state they were never written under.
 ``long``
     The long-scan ``(long, expected, retention)`` EMA.
+``capacity``
+    When enabled, Capacity's recurrent feature tensor. This is execution state;
+    Capacity's learned parameters belong to the model checkpoint.
 
 Nothing here touches :meth:`DABSNBlock.forward`, which stays the hot path for
 ``checkpoint()``, the dispatch hooks, and CUDA-graph capture.
@@ -49,6 +52,7 @@ from torch import Tensor
 from .model import DABSNBackbone, DABSNBlock, DABSNSequenceLM
 from .prepared_memory import (
     FORMAT as PREPARED_FORMAT,
+    CAPACITY_FORMAT as PREPARED_CAPACITY_FORMAT,
     PreparedAdmittedBank,
     PreparedBankPage,
     PreparedDABSNMemory,
@@ -81,6 +85,7 @@ __all__ = [
 ]
 
 FORMAT = "dabsn_memory_v1"
+CAPACITY_FORMAT = "dabsn_memory_v2"
 
 #: What the bank actually has to hold.
 #:
@@ -114,6 +119,7 @@ class LayerMemory:
     bank: dict[str, Tensor]
     core: tuple[Tensor, Tensor, Tensor]
     long: tuple[Tensor, Tensor, Tensor]
+    capacity: Tensor | None = None
 
     @property
     def entries(self) -> int:
@@ -127,10 +133,15 @@ class LayerMemory:
             bank={k: cast(v) for k, v in self.bank.items()},
             core=(cast(self.core[0]), cast(self.core[1]), cast(self.core[2])),
             long=(cast(self.long[0]), cast(self.long[1]), cast(self.long[2])),
+            capacity=None if self.capacity is None else self.capacity.to(
+                device=device, dtype=None if dtype is None else torch.promote_types(dtype, torch.float32)
+            ),
         )
 
     def nbytes(self) -> int:
         tensors = list(self.bank.values()) + list(self.core) + list(self.long)
+        if self.capacity is not None:
+            tensors.append(self.capacity)
         return sum(t.numel() * t.element_size() for t in tensors)
 
 
@@ -184,6 +195,21 @@ def fingerprint_of(model: DABSNSequenceLM) -> dict[str, object]:
 
 def _check_fingerprint(memory: DABSNMemory, model: DABSNSequenceLM) -> None:
     expected = fingerprint_of(model)
+    blocks = list(_legacy_backbone(model).blocks)
+    if any(block.capacity_module is not None for block in blocks) or any(
+        layer.capacity is not None for layer in memory.layers
+    ):
+        if len(memory.layers) != len(blocks):
+            raise ValueError("Capacity memory layer count does not match the model")
+        for index, (layer, block) in enumerate(zip(memory.layers, blocks)):
+            capacity = block.capacity_module
+            features = layer.capacity
+            if capacity is None:
+                if features is not None:
+                    raise ValueError(f"Capacity memory exists for disabled layer {index}")
+            elif (not isinstance(features, Tensor) or not features.is_floating_point()
+                  or features.shape != (memory.batch_size, capacity.size)):
+                raise ValueError(f"Capacity memory features do not match layer {index}")
     if not memory.fingerprint:
         return
     observed = dict(memory.fingerprint)
@@ -203,7 +229,7 @@ def _check_fingerprint(memory: DABSNMemory, model: DABSNSequenceLM) -> None:
 
 
 def _check_prepared_memory(memory: PreparedDABSNMemory, model: DABSNSequenceLM) -> None:
-    if memory.format != PREPARED_FORMAT:
+    if memory.format not in (PREPARED_FORMAT, PREPARED_CAPACITY_FORMAT):
         raise ValueError(f"unsupported prepared memory format {memory.format!r}")
     _check_fingerprint(cast(DABSNMemory, memory), model)
     blocks = cast(list[DABSNBlock], list(_legacy_backbone(model).blocks))
@@ -322,10 +348,21 @@ def _ingest_block(
         initial_long_state=None if layer is None else layer.long,
         return_long_state=True,
     )
-    dabsn_output = block.state_to_hidden(y + block.read_gain * retrieved)
+    fused = y + block.read_gain * retrieved
+    capacity = None
+    if block.capacity_module is not None:
+        if layer is not None and layer.capacity is None:
+            raise ValueError("carried memory is missing Capacity features")
+        contribution, capacity = block.capacity_module.forward_sequence(
+            inputs, initial_features=None if layer is None else layer.capacity, return_state=True
+        )
+        fused = fused + contribution
+    elif layer is not None and layer.capacity is not None:
+        raise ValueError("carried memory contains Capacity features for a disabled layer")
+    dabsn_output = block.state_to_hidden(fused)
     hidden = block._finish_block(inputs, dabsn_output)
     hidden = block.forward_mlp(hidden)
-    return hidden, LayerMemory(bank=bank, core=final_core, long=final_long)
+    return hidden, LayerMemory(bank=bank, core=final_core, long=final_long, capacity=capacity)
 
 
 def _ingest_prepared_block(
@@ -367,10 +404,21 @@ def _ingest_prepared_block(
         initial_long_state=layer.long,
         return_long_state=True,
     )
-    dabsn_output = block.state_to_hidden(y + block.read_gain * retrieved)
+    fused = y + block.read_gain * retrieved
+    capacity = None
+    if block.capacity_module is not None:
+        if layer.capacity is None:
+            raise ValueError("prepared memory is missing Capacity features")
+        contribution, capacity = block.capacity_module.forward_sequence(
+            inputs, initial_features=layer.capacity, return_state=True
+        )
+        fused = fused + contribution
+    elif layer.capacity is not None:
+        raise ValueError("prepared memory contains Capacity features for a disabled layer")
+    dabsn_output = block.state_to_hidden(fused)
     hidden = block._finish_block(inputs, dabsn_output)
     hidden = block.forward_mlp(hidden)
-    return hidden, PreparedLayerMemory(bank=bank, core=final_core, long=final_long)
+    return hidden, PreparedLayerMemory(bank=bank, core=final_core, long=final_long, capacity=capacity)
 
 
 def _run_prepared(
@@ -519,7 +567,7 @@ def forward_with_memory(
 
 def _to_payload(memory: DABSNMemory) -> dict[str, object]:
     return {
-        "format": FORMAT,
+        "format": CAPACITY_FORMAT if any(layer.capacity is not None for layer in memory.layers) else FORMAT,
         "position": int(memory.position),
         "batch_size": int(memory.batch_size),
         "fingerprint": memory.fingerprint,
@@ -528,6 +576,7 @@ def _to_payload(memory: DABSNMemory) -> dict[str, object]:
                 "bank": {k: v.detach().cpu() for k, v in layer.bank.items()},
                 "core": [t.detach().cpu() for t in layer.core],
                 "long": [t.detach().cpu() for t in layer.long],
+                **({"capacity": layer.capacity.detach().cpu()} if layer.capacity is not None else {}),
             }
             for layer in memory.layers
         ],
@@ -535,7 +584,7 @@ def _to_payload(memory: DABSNMemory) -> dict[str, object]:
 
 
 def _from_payload(payload: dict[str, object]) -> DABSNMemory:
-    if payload.get("format") != FORMAT:
+    if payload.get("format") not in (FORMAT, CAPACITY_FORMAT):
         raise ValueError(
             f"not a DABSN memory payload: format={payload.get('format')!r}, expected {FORMAT!r}"
         )
@@ -561,10 +610,13 @@ def _from_payload(payload: dict[str, object]) -> DABSNMemory:
         if not isinstance(raw_long, Sequence) or len(raw_long) != 3:
             raise ValueError("memory payload long state must contain three tensors")
         tensors = [*bank.values(), *raw_core, *raw_long]
+        if entry.get("capacity") is not None:
+            tensors.append(entry["capacity"])
         if any(not isinstance(value, Tensor) for value in tensors):
             raise ValueError("memory payload state values must be tensors")
         layers.append(
             LayerMemory(
+                capacity=cast(Tensor | None, entry.get("capacity")),
                 bank={k: cast(Tensor, bank[k]) for k in BANK_FIELDS},
                 core=(
                     cast(Tensor, raw_core[0]),
@@ -609,7 +661,7 @@ def load(
     payload = torch.load(Path(path), map_location=map_location, weights_only=False)
     if isinstance(payload, dict) and "dabsn_memory" in payload:
         payload = payload["dabsn_memory"]
-    if isinstance(payload, Mapping) and payload.get("format") == PREPARED_FORMAT:
+    if isinstance(payload, Mapping) and payload.get("format") in (PREPARED_FORMAT, PREPARED_CAPACITY_FORMAT):
         raise ValueError("prepared v2 memory must be loaded with load_prepared()")
     memory = _from_payload(payload)
     if model is not None:
@@ -645,6 +697,7 @@ def prepare_for_inference(
             bank=prepare_admitted_bank(block.read, layer.bank, page_size=page_size),
             core=tuple(tensor.clone() for tensor in layer.core),
             long=tuple(tensor.clone() for tensor in layer.long),
+            capacity=None if layer.capacity is None else layer.capacity.clone(),
         )
         for block, layer in zip(blocks, memory.layers)
     )
@@ -653,7 +706,7 @@ def prepare_for_inference(
         position=memory.position,
         batch_size=memory.batch_size,
         fingerprint=dict(memory.fingerprint),
-        source_format=FORMAT,
+        source_format=CAPACITY_FORMAT if any(layer.capacity is not None for layer in memory.layers) else FORMAT,
     )
 
 

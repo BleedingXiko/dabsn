@@ -3,6 +3,7 @@ include LICENSE
 include CITATION.cff
 include release.py
 include docs/online-temporal-credit-and-prepared-memory.md
+include docs/capacity.md
 recursive-include examples *.py
 recursive-include tests *.py *.json *.toml
 recursive-include scripts *.py
