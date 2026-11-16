@@ -1,0 +1,1566 @@
+{
+ "ablation": {
+  "architecture": "block: full DABSN block (core + read), stock init, public online API",
+  "chunk": {
+   "chunks": [],
+   "declared_training_jobs": 0,
+   "input_dim": 64,
+   "methods": [],
+   "seeds": [],
+   "state_dim": 256,
+   "task": "temporal_order",
+   "removed": "Splitting full-block episodes into chunks also detaches the read bank at every boundary, so carried versus erased credit there is confounded by the read. Credit across chunk boundaries is tested without the read in the stream studies (continuous, sustained)."
+  },
+  "devices": [
+   "cpu",
+   "cuda"
+  ],
+  "no_silent_reduction": true,
+  "preflight": "each distinct task, method, shape or chunk, and train length needs a real target-device update before grid dispatch",
+  "protocol": "dabsn-online-credit-boundary-and-shape-v1",
+  "schema": 1,
+  "shape": {
+   "chunk": "episode",
+   "declared_training_jobs": 24,
+   "methods": [
+    "online",
+    "bptt"
+   ],
+   "seeds": [
+    100,
+    101,
+    102
+   ],
+   "shapes": [
+    [
+     64,
+     512
+    ],
+    [
+     128,
+     256
+    ]
+   ],
+   "tasks": [
+    "temporal_order",
+    "adding"
+   ]
+  },
+  "source_main_study": "same selected per-task learning rate, task generator, batch, optimizer, 900 updates, evaluation schedule and final held-out examples as confirmatory_protocol.json"
+ },
+ "action": {
+  "batch": 4,
+  "cadence": "four explicitly scheduled actions, not endogenous cadence",
+  "devices": [
+   "cpu",
+   "cuda"
+  ],
+  "dtype": "float64",
+  "evaluation": "actual nonlinear replay after each action; no line search or success-dependent action selection",
+  "execution": "explicit reference recurrence on the selected device; no claim of registered CUDA-kernel throughput",
+  "input_dim": 4,
+  "input_std": 0.1,
+  "length": 8,
+  "methods": [
+   "E_inverse",
+   "H_inverse",
+   "E_adjoint_matched_norm",
+   "no_action"
+  ],
+  "objective": "squared terminal three-state discrepancy to a perturbed teacher on one fixed history",
+  "operator_refresh": "rebuild the prefix and E at every action; recompute full H only for H_inverse",
+  "persistent_optimizer_moments": 0,
+  "perturbation_definition": "independent Gaussian direction normalized to the full parameter-vector L2 norm times the declared fraction",
+  "protocol": "dabsn-teacher-matching-direct-action-v1",
+  "repeated_actions": 4,
+  "schema": 1,
+  "scope": "controlled local teacher matching; broader held-out learning requires a separate study",
+  "seeds": [
+   0,
+   1,
+   2,
+   3,
+   4
+  ],
+  "state_dim": 4,
+  "svd_relative_cutoff": 0.01,
+  "teacher_relative_perturbations": [
+   0.001,
+   0.01,
+   0.05
+  ]
+ },
+ "continuation": {
+  "action": "rowwise historical W response divided by 0.05+row squared norm; global action L2 capped at 0.05",
+  "batch": 1,
+  "cadence": "one specified action per event",
+  "conditioning_input_range": [
+   0.5,
+   1.5
+  ],
+  "conditioning_steps": 128,
+  "continuation_input_range": [
+   0.25,
+   1.75
+  ],
+  "continuation_steps": 96,
+  "controls": [
+   "retained",
+   "erased",
+   "exchanged",
+   "k_y_erased"
+  ],
+  "devices": [
+   "cpu",
+   "cuda"
+  ],
+  "dtype": "float64",
+  "execution": "framework reference forward and complete native-defined E replay; no registered-kernel throughput claim",
+  "external_target_calls_during_continuation": 0,
+  "forward": {
+   "A": [
+    [
+     0.45,
+     0.15
+    ],
+    [
+     0.1,
+     0.5
+    ]
+   ],
+   "all_modulation_coefficients": 0.0,
+   "alpha": 0.5,
+   "gate": 0.5,
+   "kappa": 0.1,
+   "lambda": 1.0,
+   "recovery": 0.1,
+   "saturation_decay": 0.5
+  },
+  "handoff": "set W=0 and predictive state=(0,1,0) identically; fork E by control",
+  "input_dim": 2,
+  "objectives": [
+   -1,
+   1
+  ],
+  "optimizer_moment_buffers": 0,
+  "protocol": "dabsn-objective-conditioned-continuation-restriction-v1",
+  "reader": "orientation=-sign(sum of k_y energy traces); fixed target family 0.12*(x0+0.5*x1,0.5*x0+x1)",
+  "reader_encodes_target_family": true,
+  "schema": 1,
+  "scope": "causal objective bit after forced matching; not arbitrary objective elimination or endogenous cadence",
+  "seeds": [
+   0,
+   1,
+   2,
+   3,
+   4
+  ],
+  "state_dim": 2
+ },
+ "continuity": {
+  "a5_cohort_policy": "Separate frozen three-seed cohort; seed0 is development, not a held-out replicate. Preserve all measured outcomes. No repeat calibration in public reproduction.",
+  "a5_development_seed": 0,
+  "a5_frozen_online_lr": 0.006,
+  "a5_heldout_seeds": [
+   1,
+   2,
+   3
+  ],
+  "architecture_difference": "The historical permanent read registered two inactive scalars (long_decay and short_read.adm_train_band), omitted by the current framework. This accounts for the two-parameter difference; active architecture parity still requires numerical validation.",
+  "betas": [
+   0.9,
+   0.999
+  ],
+  "clip_norm": 1,
+  "comparison_scope": "Fresh matched online/BPTT controls in the pinned current framework, using original paper-1 task definitions and training regimes; not a bitwise replay of historical checkpoints.",
+  "control_chunk": "episode",
+  "control_methods": [
+   "frozen_core"
+  ],
+  "control_policy": "Frozen-core control on the same full model, data, rates and forward: the online computation with one chunk per episode, the core's gradients (which arrive only through E) dropped before clipping, the core verified bitwise unchanged.",
+  "devices": [
+   "cpu",
+   "cuda"
+  ],
+  "eps": 1e-08,
+  "equivalence_accuracy_margin_absolute": 0.02,
+  "equivalence_interpretation": "a paired 95 percent training-seed interval must lie entirely above -0.02 to support no loss larger than two percentage points at an evaluation length; otherwise inconclusive",
+  "evaluation_seed_namespace": "900000 plus 10000*training seed plus deterministic task/length offset",
+  "geometry": "seq",
+  "intentional_controls": [
+   "Three matched training seeds for all tasks (historical A5 used seeds 0 and 1).",
+   "Fresh fixed evaluation namespace shared by online and BPTT; historical evaluation used the post-training random stream.",
+   "Restore all original diagnostic random draws, including A5 pairwise shuffles, without running duplicate read-only model diagnostics.",
+   "Fixed current-run numerical precision and backend policy, recorded by Runtime. Original notebooks enabled cuDNN benchmarking and float32 matmul precision high; historical T4 execution had no TF32 hardware."
+  ],
+  "methods": [
+   "online",
+   "bptt"
+  ],
+  "objective": "source-faithful task loss; identical normalization for online chunks and full BPTT",
+  "online_chunk": null,
+  "optimizer": "AdamW",
+  "protocol": "dabsn-paper1-online-continuity-v4-diagnostic-rng",
+  "schema": 2,
+  "seeds": [
+   0,
+   1,
+   2
+  ],
+  "source": "Original paper-1 trainers and task generators; excerpts and source identities in continuity_regime_sources.json. The current framework model factory is shared by both methods.",
+  "suite_tasks": [
+   "copy",
+   "mqar",
+   "keyvalue"
+  ],
+  "tasks": {
+   "a5": {
+    "batch": 64,
+    "checkpoint_every": 1000,
+    "current_parameter_count": 378196,
+    "curriculum_steps": 4000,
+    "dense_targets": "running product at every position",
+    "diagnostic_every": 1000,
+    "eval_batch_by_length": {
+     "1024": 12,
+     "128": 64,
+     "16384": 4,
+     "2048": 8,
+     "256": 64,
+     "4096": 4,
+     "512": 64,
+     "8192": 4
+    },
+    "eval_lengths": [
+     128,
+     256,
+     512,
+     1024,
+     2048,
+     4096,
+     8192,
+     16384
+    ],
+    "hidden": 256,
+    "historical_parameter_count": 378198,
+    "length_selection": "ceil(frac * number_of_lengths), CPU torch.randint",
+    "lr": 0.003,
+    "lr_min_frac": 0,
+    "lr_schedule": "cosine",
+    "random_generation_device": "cpu",
+    "steps": 60000,
+    "train_len_min": 2,
+    "train_length": 256,
+    "val_batches": 3,
+    "warmup_steps": 1000
+   },
+   "copy": {
+    "batch": 48,
+    "checkpoint_every": 250,
+    "current_parameter_count": 21736,
+    "diagnostic_every": 250,
+    "eval_batch_by_length": {
+     "1024": 16,
+     "128": 48,
+     "2048": 16,
+     "256": 16,
+     "3200": 16,
+     "512": 16,
+     "64": 48
+    },
+    "eval_lengths": [
+     64,
+     128,
+     256,
+     512,
+     1024,
+     2048,
+     3200
+    ],
+    "hidden": 48,
+    "historical_parameter_count": 21738,
+    "lr": 0.01,
+    "lr_min_frac": 0,
+    "lr_schedule": "constant",
+    "random_generation_device": "execution device",
+    "steps": 1000,
+    "train_length": 64,
+    "val_batches": 5,
+    "vocab": 64,
+    "warmup_steps": 0
+   },
+   "keyvalue": {
+    "batch": 64,
+    "checkpoint_every": 500,
+    "current_parameter_count": 16504,
+    "diagnostic_every": 500,
+    "eval_batch_by_length": {
+     "1024": 64,
+     "128": 64,
+     "2000": 64,
+     "256": 64,
+     "3200": 64,
+     "512": 64,
+     "64": 64
+    },
+    "eval_lengths": [
+     64,
+     128,
+     256,
+     512,
+     1024,
+     2000,
+     3200
+    ],
+    "filler_probability": 0.25,
+    "hidden": 48,
+    "historical_parameter_count": 16506,
+    "keys": 16,
+    "lr": 0.006,
+    "lr_min_frac": 0,
+    "lr_schedule": "constant",
+    "ordered_pairs": false,
+    "pairs": 8,
+    "random_generation_device": "cpu",
+    "steps": 2000,
+    "train_length": 64,
+    "val_batches": 10,
+    "values": 16,
+    "warmup_steps": 0
+   },
+   "mqar": {
+    "batch": 64,
+    "checkpoint_every": 250,
+    "current_parameter_count": 16504,
+    "diagnostic_every": 500,
+    "eval_batch_by_length": {
+     "1024": 64,
+     "128": 64,
+     "2000": 64,
+     "256": 64,
+     "3200": 64,
+     "512": 64,
+     "64": 64
+    },
+    "eval_lengths": [
+     64,
+     128,
+     256,
+     512,
+     1024,
+     2000,
+     3200
+    ],
+    "hidden": 48,
+    "historical_parameter_count": 16506,
+    "keys": 16,
+    "lr": 0.006,
+    "lr_min_frac": 0,
+    "lr_schedule": "constant",
+    "pairs": 8,
+    "random_generation_device": "cpu",
+    "steps": 1000,
+    "train_length": 64,
+    "val_batches": 10,
+    "values": 16,
+    "warmup_steps": 0
+   }
+  },
+  "weight_decay": 0
+ },
+ "continuity_regime_sources": {
+  "coverage": [
+   "Recovered source excerpts and digests for task generation, initialization, optimizer and evaluation",
+   "Current generator/model factory source pin",
+   "Declared task budgets, dimensions, evaluation lengths, counts and batch sizes",
+   "Static parameter accounting and two historical inactive scalar declarations",
+   "Every A5 learning-rate step matched to original arithmetic",
+   "Every A5 curriculum unlock through step4001 matched to original arithmetic and CPU Torch RNG",
+   "CPU generation call sites for MQAR/key-value",
+   "Scheduled LR installed before update, declared AdamW betas/epsilon/weight decay",
+   "Original diagnostic random draws and intentional fresh evaluation controls",
+   "CPU RNG restore and optimizer restoration helper call sites"
+  ],
+  "current_generator_source_sha256": "c937b291a019b995f0827172428a11db6eba054285b6f1e5b1b1b1c74127d2fd",
+  "current_parameter_formula": "5*h*h + 2*input_dim*h + 17*h + out_dim*h + out_dim + 24",
+  "description": "Original paper-1 regime source excerpts. Historical CSV values identify budgets; original trainer code determines schedule, curriculum, generation, and evaluation. Current framework controls are fresh measurements, not a historical checkpoint replay.",
+  "expected_protocol": {
+   "architecture_difference": "The historical permanent read registered two inactive scalars (long_decay and short_read.adm_train_band), omitted by the current framework. This accounts for the two-parameter difference; active architecture parity still requires numerical validation.",
+   "betas": [
+    0.9,
+    0.999
+   ],
+   "clip_norm": 1,
+   "comparison_scope": "Fresh matched online/BPTT controls in the pinned current framework, using original paper-1 task definitions and training regimes; not a bitwise replay of historical checkpoints.",
+   "devices": [
+    "cpu",
+    "cuda"
+   ],
+   "eps": 1e-08,
+   "equivalence_accuracy_margin_absolute": 0.02,
+   "equivalence_interpretation": "a paired 95 percent training-seed interval must lie entirely above -0.02 to support no loss larger than two percentage points at an evaluation length; otherwise inconclusive",
+   "evaluation_seed_namespace": "900000 plus 10000*training seed plus deterministic task/length offset",
+   "geometry": "seq",
+   "intentional_controls": [
+    "Three matched training seeds for all tasks (historical A5 used seeds 0 and 1).",
+    "Fresh fixed evaluation namespace shared by online and BPTT; historical evaluation used the post-training random stream.",
+    "Restore all original diagnostic random draws, including A5 pairwise shuffles, without running duplicate read-only model diagnostics.",
+    "Fixed current-run numerical precision and backend policy, recorded by Runtime. Original notebooks enabled cuDNN benchmarking and float32 matmul precision high; historical T4 execution had no TF32 hardware."
+   ],
+   "methods": [
+    "online",
+    "bptt"
+   ],
+   "objective": "source-faithful task loss; identical normalization for online chunks and full BPTT",
+   "online_chunk": null,
+   "optimizer": "AdamW",
+   "protocol": "dabsn-paper1-online-continuity-v4-diagnostic-rng",
+   "schema": 2,
+   "seeds": [
+    0,
+    1,
+    2
+   ],
+   "source": "Original paper-1 trainers and task generators; excerpts and source identities in continuity_regime_sources.json. The current framework model factory is shared by both methods.",
+   "tasks": {
+    "a5": {
+     "batch": 64,
+     "checkpoint_every": 1000,
+     "current_parameter_count": 378196,
+     "curriculum_steps": 4000,
+     "dense_targets": "running product at every position",
+     "diagnostic_every": 1000,
+     "eval_batch_by_length": {
+      "1024": 12,
+      "128": 64,
+      "16384": 4,
+      "2048": 8,
+      "256": 64,
+      "4096": 4,
+      "512": 64,
+      "8192": 4
+     },
+     "eval_lengths": [
+      128,
+      256,
+      512,
+      1024,
+      2048,
+      4096,
+      8192,
+      16384
+     ],
+     "hidden": 256,
+     "historical_parameter_count": 378198,
+     "length_selection": "ceil(frac * number_of_lengths), CPU torch.randint",
+     "lr": 0.003,
+     "lr_min_frac": 0,
+     "lr_schedule": "cosine",
+     "random_generation_device": "cpu",
+     "steps": 60000,
+     "train_len_min": 2,
+     "train_length": 256,
+     "val_batches": 3,
+     "warmup_steps": 1000
+    },
+    "copy": {
+     "batch": 48,
+     "checkpoint_every": 250,
+     "current_parameter_count": 21736,
+     "diagnostic_every": 250,
+     "eval_batch_by_length": {
+      "1024": 16,
+      "128": 48,
+      "2048": 16,
+      "256": 16,
+      "3200": 16,
+      "512": 16,
+      "64": 48
+     },
+     "eval_lengths": [
+      64,
+      128,
+      256,
+      512,
+      1024,
+      2048,
+      3200
+     ],
+     "hidden": 48,
+     "historical_parameter_count": 21738,
+     "lr": 0.01,
+     "lr_min_frac": 0,
+     "lr_schedule": "constant",
+     "random_generation_device": "execution device",
+     "steps": 1000,
+     "train_length": 64,
+     "val_batches": 5,
+     "vocab": 64,
+     "warmup_steps": 0
+    },
+    "keyvalue": {
+     "batch": 64,
+     "checkpoint_every": 500,
+     "current_parameter_count": 16504,
+     "diagnostic_every": 500,
+     "eval_batch_by_length": {
+      "1024": 64,
+      "128": 64,
+      "2000": 64,
+      "256": 64,
+      "3200": 64,
+      "512": 64,
+      "64": 64
+     },
+     "eval_lengths": [
+      64,
+      128,
+      256,
+      512,
+      1024,
+      2000,
+      3200
+     ],
+     "filler_probability": 0.25,
+     "hidden": 48,
+     "historical_parameter_count": 16506,
+     "keys": 16,
+     "lr": 0.006,
+     "lr_min_frac": 0,
+     "lr_schedule": "constant",
+     "ordered_pairs": false,
+     "pairs": 8,
+     "random_generation_device": "cpu",
+     "steps": 2000,
+     "train_length": 64,
+     "val_batches": 10,
+     "values": 16,
+     "warmup_steps": 0
+    },
+    "mqar": {
+     "batch": 64,
+     "checkpoint_every": 250,
+     "current_parameter_count": 16504,
+     "diagnostic_every": 500,
+     "eval_batch_by_length": {
+      "1024": 64,
+      "128": 64,
+      "2000": 64,
+      "256": 64,
+      "3200": 64,
+      "512": 64,
+      "64": 64
+     },
+     "eval_lengths": [
+      64,
+      128,
+      256,
+      512,
+      1024,
+      2000,
+      3200
+     ],
+     "hidden": 48,
+     "historical_parameter_count": 16506,
+     "keys": 16,
+     "lr": 0.006,
+     "lr_min_frac": 0,
+     "lr_schedule": "constant",
+     "pairs": 8,
+     "random_generation_device": "cpu",
+     "steps": 1000,
+     "train_length": 64,
+     "val_batches": 10,
+     "values": 16,
+     "warmup_steps": 0
+    }
+   },
+   "weight_decay": 0
+  },
+  "historical_inactive_scalars": [
+   "read.long_decay",
+   "read.short_read.adm_train_band"
+  ],
+  "inactive_scalar_evidence": {
+   "attribute_uses_in_original_file": {
+    "adm_train_band": [
+     {
+      "context": "Store",
+      "expression": "self.adm_train_band",
+      "line": 558
+     },
+     {
+      "context": "Load",
+      "expression": "self.adm_train_band",
+      "line": 614
+     }
+    ],
+    "long_decay": [
+     {
+      "context": "Store",
+      "expression": "self.long_decay",
+      "line": 884
+     }
+    ]
+   },
+   "permanent_unified_function_sha256": "091413b891590cb0d25b57092a2467f355c17bebe2940f45b44f851c903dcdad",
+   "permanent_unified_read_attributes": [
+    "_admission",
+    "_compact_bank_idx",
+    "_compact_bank_valid",
+    "_compact_read_mode",
+    "_dropout_p",
+    "_dropout_seed",
+    "_long_scan",
+    "_three_way_read",
+    "admit_window",
+    "any",
+    "arange",
+    "argsort",
+    "as_tensor",
+    "cat",
+    "clamp",
+    "clamp_min",
+    "collect_traces",
+    "cpu",
+    "cummax",
+    "detach",
+    "device",
+    "dropout",
+    "dtype",
+    "environ",
+    "expand",
+    "float",
+    "full_like",
+    "gather",
+    "get",
+    "hybrid_gate",
+    "hybrid_gate_override",
+    "indices",
+    "inf",
+    "is_cuda",
+    "item",
+    "last_admit_gate_mean",
+    "last_field_neighbors",
+    "last_field_norm",
+    "last_hybrid_gate",
+    "last_long_scan_norm",
+    "last_n_max",
+    "last_read_contract",
+    "last_seq_norm",
+    "log1p",
+    "log_temp",
+    "long_gain",
+    "max",
+    "mean",
+    "norm",
+    "normalize",
+    "novelty_gain",
+    "null_bias",
+    "out",
+    "p_gain",
+    "randint",
+    "read_geometry",
+    "shape",
+    "short_read",
+    "sigmoid",
+    "softplus",
+    "stack",
+    "sum",
+    "to",
+    "topk",
+    "training",
+    "unsqueeze",
+    "values",
+    "view",
+    "where"
+   ]
+  },
+  "parameter_difference_evidence": "long_decay has no read site in the inspected original file. adm_train_band is read only in the separate admission _soft_forward; permanent=True dispatches directly to _unified_forward and does not call that branch. No inactive scalars are restored in the current framework.",
+  "schema": 1,
+  "sources": {
+   "a5": {
+    "file_sha256": "1db8436c0067f9f078ac39b9859c886b785f8628b3f9711680aa304e73a3ee1f",
+    "fragments": {
+     "build_group": {
+      "sha256": "09ffc024409c662665b38360dced3d23213a01c48c5495b57cb424b333f25acb",
+      "text": "def build_group(group_name: str):\n    all_elems = list(itertools.permutations(range(N)))\n    if group_name == 'A5':\n        elems = [p for p in all_elems if permutation_parity(p) == 0]\n    elif group_name == 'S5':\n        elems = all_elems\n    else:\n        raise ValueError(f'unknown group={group_name!r}; use A5 or S5')\n    index = {p: i for i, p in enumerate(elems)}\n    table = torch.empty((len(elems), len(elems)), dtype=torch.long)\n    for i, a in enumerate(elems):\n        for j, b in enumerate(elems):\n            comp = tuple(b[a[k]] for k in range(N))\n            table[i, j] = index[comp]\n    identity = index[tuple(range(N))]\n    return elems, table, identity\n"
+     },
+     "encode_batch": {
+      "sha256": "bb4d5cbf008b958d8e93249f5b87ba1aa26f1f8c626f0629f11173817f5387b9",
+      "text": "def encode_batch(sym: torch.Tensor, device: torch.device):\n    toks = ALPHABET[sym]\n    batch, seq_len = sym.shape\n    targets = torch.empty((batch, seq_len), dtype=torch.long)\n    cur = torch.full((batch,), IDENTITY_IDX, dtype=torch.long)\n    for t in range(seq_len):\n        cur = MULT_TABLE_CPU[cur, toks[:, t]]\n        targets[:, t] = cur\n    x = encode_symbols(sym, toks)\n    return x.to(device, non_blocking=True), targets.to(device, non_blocking=True)\n"
+     },
+     "eval_batch_size": {
+      "sha256": "67b4e908b2c8f9b24deb6b3d9c7f09f43ec7a0beb108c3b64bdb290480ce31eb",
+      "text": "def eval_batch_size(model_name, L):\n    base = int(CFG['batch_size'])\n    if model_name.startswith('transformer_rope') and L >= 2048:\n        return 1\n    if L >= 4096:\n        return min(base, 4)\n    if L >= 2048:\n        return min(base, 8)\n    if L >= 1024:\n        return min(base, 12)\n    return base\n"
+     },
+     "make_batch": {
+      "sha256": "24731195b0ff08872d67c2571e53ea7cc0cb7b6ef9b9e766f23488775acf1764",
+      "text": "def make_batch(batch: int, seq_len: int, device: torch.device):\n    sym = torch.randint(0, A, (batch, seq_len), device='cpu')\n    return encode_batch(sym, device)\n"
+     },
+     "make_train_batch": {
+      "sha256": "ebc4358bb8796cf65d0833a2f6b9a507467c4780126e42d74a060f98a82a747f",
+      "text": "def make_train_batch(step: int, batch: int, seq_len: int, device: torch.device):\n    # Length curriculum: early steps expose only the SHORTEST words so the model learns\n    # the group action (state o input -> state) with clean, shallow credit assignment;\n    # progressively longer words are unlocked for retention / length generalization.\n    # Training straight at long lengths never bootstraps (the earlier chance-flat bug).\n    # Sampling stays on the small cached set of shapes so kernel/cuDNN autotune is not\n    # re-triggered every step.\n    if CURRICULUM_STEPS > 0:\n        frac = min(1.0, step / CURRICULUM_STEPS)\n        n_allowed = max(1, math.ceil(frac * len(TRAIN_LENGTHS)))\n    else:\n        n_allowed = len(TRAIN_LENGTHS)\n    L = TRAIN_LENGTHS[int(torch.randint(0, n_allowed, (1,)).item())]\n    return make_batch(batch, L, device)\n"
+     },
+     "probe_acc": {
+      "sha256": "74e52ba9aeb27b15f0330e73464e9fa93aa945344415b214f27104e10e948372",
+      "text": "def probe_acc(model, model_name, L, device):\n    was_training = model.training\n    model.eval()\n    try:\n        x, y = make_batch(min(int(CFG['batch_size']), 8), int(L), device)\n        _, acc = loss_acc(model.forward_sequence(x), y)\n    finally:\n        if was_training:\n            model.train()\n    return acc\n"
+     },
+     "scheduled_lr": {
+      "sha256": "c8f58c961696f7cee5c749827c7027edcf31b73b455f6e3c0d63d32f4db11825",
+      "text": "def scheduled_lr(step: int, base_lr: float, warmup: int, total: int) -> float:\n    # Linear warmup, then (if lr_schedule=='cosine') cosine decay from base_lr down to\n    # lr_min_frac*base_lr over the nominal `total` steps. Constant after warmup otherwise.\n    if warmup > 0 and step <= warmup:\n        return base_lr * step / warmup\n    if CFG.get('lr_schedule', 'constant') != 'cosine' or total <= warmup:\n        return base_lr\n    min_frac = float(CFG.get('lr_min_frac', 0.0))\n    prog = min(1.0, max(0.0, (step - warmup) / max(1, total - warmup)))\n    return base_lr * (min_frac + (1.0 - min_frac) * 0.5 * (1.0 + math.cos(math.pi * prog)))\n"
+     },
+     "train_lengths": {
+      "sha256": "fdea01a754e923fdc2a65f5387c8700d29df34e56d8b2bc8146be946378b95b4",
+      "text": "def train_lengths(seq_len: int) -> list:\n    # Standard word-problem training mixes short and long sequences: short lengths give\n    # clean credit assignment for learning composition, long lengths teach retention.\n    # We draw from a SMALL discrete set (powers of two up to train_seq) rather than a\n    # continuous range so only a handful of distinct shapes ever occur -- continuously\n    # varying the length re-tunes the DABSN kernel / cuDNN every step and dominates\n    # wall-clock. A few cached shapes keep training fast.\n    lo = max(2, int(CFG.get('train_len_min', 2)))\n    lengths, L = [], lo\n    while L < int(seq_len):\n        lengths.append(L)\n        L *= 2\n    lengths.append(int(seq_len))\n    return lengths\n"
+     }
+    },
+    "source": "paper/DABSN_S5_HARD_COLAB.py"
+   },
+   "a5_builder": {
+    "file_sha256": "44cc7e2d8bfef6049bde885ed93e597c5b5788f7b40f9e75cdf65935325fe7a0",
+    "fragments": {
+     "diagnostic_cadence": {
+      "sha256": "7ffd06fdbcdf590ebfbf5df4717209d020c7499fe7d5bdfe42cbed2667b3a600",
+      "text": "        if step == 1 or step % log_every == 0:\n            # probe: accuracy at the full train length so the log reflects real state\n            # tracking, not whatever short length this batch happened to sample.\n            train_acc = probe_acc(model, model_name, train_seq, device)\n            pair_loss, pairwise_first_acc, pairwise_compose_acc = eval_pairwise(model, model_name, device)\n            print(\n                f'{model_name:<24} seed={seed} step={step:>6}/{steps} '\n                f'lr={cur_lr:.6g} '\n                f'loss={float(loss.detach()):.4f} acc@{train_seq}={train_acc:.4f} '\n                f'pair_first={pairwise_first_acc:.4f} pair_compose={pairwise_compose_acc:.4f} '\n                f'peakMB={cuda_peak_mb():.1f}',\n                flush=True,\n            )\n"
+     },
+     "headline_preset": {
+      "sha256": "232d2a545712b35e3ca1ac0977b08a44d35dcda4976831fd77375e07de315d2c",
+      "text": "    'paper_ready_a5_60_t4': dict(\n        seeds=[0],\n        # Standard Merrill/Petty/Sabharwal-style word-problem group: A5 has 60\n        # states/elements and is the well-known protocol target. This is the fair\n        # paper-facing comparator; S5/120 remains available below as a harder stress\n        # case that may simply need more capacity than a single T4 budget can probe.\n        group='A5',\n        alphabet_mode='full60',\n        hidden=256,\n        dabsn_layers={\n            'dabsn_seq': 'seq:256:256',\n        },\n        models=['lstm', 'dabsn_seq', 'transformer_rope_causal'],\n        train_seq=256,\n        train_len_min=2,\n        curriculum_steps=4000,\n        eval_seqs=[128, 256, 512, 1024, 2048, 4096, 8192, 16384],\n        steps=60000,\n        batch_size=64,\n        val_batches=3,\n        attention_eval_max_seq=2048,\n        input_encoding='onehot',\n        warmup_steps=1000,\n        lr_schedule='cosine',\n        lr_min_frac=0.0,\n        max_train_hours=3.0,\n        lrs={'dabsn_seq': 0.003, 'lstm': 0.003, 'transformer_rope_causal': 0.001},\n    ),\n"
+     },
+     "training_update": {
+      "sha256": "874ab3bd4aca68724f40bb1afdb19a6f90f6ce7ee03d24d9b22c515584dabe66",
+      "text": "def train_one(model_name, seed):\n    global PAIRWISE_CURSOR\n    PAIRWISE_CURSOR = 0\n    set_seed(seed)\n    device = torch.device(DEVICE)\n    model = build_model(model_name).to(device)\n    params = count_params(model)\n    lr = float(CFG['lrs'].get(model_name, 0.001))\n    opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.0)\n    steps = int(CFG['steps'])\n    batch = int(CFG['batch_size'])\n    train_seq = int(CFG['train_seq'])\n    max_hours = float(CFG.get('max_train_hours', 0.0) or 0.0)\n    warmup_steps = int(CFG.get('warmup_steps', 0))\n    log_every = max(1, min(1000, steps // 12))\n    train_acc = float('nan')\n    pairwise_first_acc = float('nan')\n    pairwise_compose_acc = float('nan')\n    steps_done = 0\n    start = time.time()\n    reset_peak()\n    model.train()\n    for step in range(1, steps + 1):\n        cur_lr = scheduled_lr(step, lr, warmup_steps, steps)\n        for g in opt.param_groups:\n            g['lr'] = cur_lr\n        x, y = make_train_batch(step, batch, train_seq, device)\n        logits = model.forward_sequence(x)\n        loss, _ = loss_acc(logits, y)\n        opt.zero_grad(set_to_none=True)\n        loss.backward()\n        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)\n        opt.step()\n        steps_done = step\n"
+     }
+    },
+    "source": "paper/build_dabsn_s5_hard_notebook.py"
+   },
+   "copy": {
+    "file_sha256": "e5bcc10747c70346d30b705f55071e257967545350ee34c88bf4160572ae85e1",
+    "fragments": {
+     "evaluation": {
+      "sha256": "69d9efbdc5c2d4cde0ed049c6e4519ef2451a0761318c903b8cf5954d873b88c",
+      "text": "    results: list[Result] = []\n    model.eval()\n    for L in eval_str_lens:\n        start_eval = time.time()\n        losses, accs = [], []\n        with torch.no_grad():\n            for _ in range(val_batches):\n                eb = min(batch_size, 16) if L >= 256 else batch_size\n                x, targets = make_copy_batch(eb, L, vocab, device)\n                loss, acc = loss_acc(model.forward_sequence(x), targets)\n                losses.append(float(loss)); accs.append(acc)\n        _nmax = getattr(getattr(model, \"attn\", None), \"last_n_max\", None)\n        if _nmax is not None:\n            print(f\"  [n_max] eval_str_len={L:<5} n_max={_nmax} (read width; ~T=dense, <<T=cheap)\", flush=True)\n        results.append(Result(\n            model=model_name, seed=seed, hidden=hidden, vocab=vocab,\n            train_str_len=train_str_len, eval_str_len=L, steps=steps,\n            batch_size=batch_size, lr=lr, params=params, train_acc_last=train_acc_last,\n            eval_loss=float(np.mean(losses)), eval_acc=float(np.mean(accs)),\n            seconds_train=seconds_train, seconds_eval=time.time() - start_eval, run=run,\n        ))\n    return results\n"
+     },
+     "make_copy_batch": {
+      "sha256": "0ce67e618bff2dbf9f8ddb92baf16c0783fd7f855cc4fe9b98bd8f9e68601110",
+      "text": "def make_copy_batch(batch: int, str_len: int, vocab: int,\n                    device: torch.device) -> tuple[Tensor, Tensor]:\n    \"\"\"One autoregressive copy batch. Content tokens are ids 0..vocab-1; GO=vocab.\n\n    Layout (length 2L): input  = [ x_0..x_{L-1} , GO , x_0..x_{L-2} ]\n                        target = [ IGNORE * L   , x_0 , x_1..x_{L-1} ]\n    During the output phase the model is fed the PREVIOUS correct token (teacher\n    forcing) and must predict the next one. Content is random, so x_j carries no\n    information about x_{j+1} except via the stored string \u2014 the model has to\n    locate x_j in the input and read the token after it (induction). Input\n    one-hot dim = vocab + 1; loss/acc are measured only on the L output positions.\n    \"\"\"\n    L = str_len\n    GO = vocab\n    content = torch.randint(0, vocab, (batch, L), device=device)\n    total = 2 * L\n    sym = torch.empty((batch, total), dtype=torch.long, device=device)\n    sym[:, :L] = content                        # input phase: the string\n    sym[:, L] = GO                              # delimiter -> predict x_0\n    sym[:, L + 1:] = content[:, :L - 1]         # fed previous correct token\n    targets = torch.full((batch, total), IGNORE, dtype=torch.long, device=device)\n    targets[:, L:] = content                    # positions L..2L-1 predict x_0..x_{L-1}\n    x = F.one_hot(sym, vocab + 1).to(torch.float32)\n    return x, targets\n"
+     },
+     "update_and_diagnostic": {
+      "sha256": "7cd0d382bbf402d213427673c780b1b344d7c0fd912796c72f0a7182a6217a7d",
+      "text": "        model.train()\n        for step in range(1, steps + 1):\n            x, targets = make_copy_batch(batch_size, train_str_len, vocab, device)\n            loss, train_acc_last = loss_acc(model.forward_sequence(x), targets)\n            optimizer.zero_grad(set_to_none=True)\n            loss.backward()\n            if clip > 0:\n                torch.nn.utils.clip_grad_norm_(model.parameters(), clip)\n            optimizer.step()\n            if log_every and (step == 1 or step % log_every == 0):\n                print(f\"seed={seed} model={model_name:<32} L={train_str_len} \"\n                      f\"step={step:>5}/{steps} loss={loss.item():.4f} train_acc={train_acc_last:.4f} \"\n                      f\"long{max(eval_str_lens)}={_long_acc():.4f}\", flush=True)\n"
+     }
+    },
+    "source": "benchmarks/COPY_LENGTH_BENCH.py"
+   },
+   "keyvalue": {
+    "file_sha256": "5d72e642eb5db5b2eb9175be9adaa97b66ebae01f2f543c9aa604b370f07c080",
+    "fragments": {
+     "make_keyvalue_batch": {
+      "sha256": "56d4789ea5319c1e8212098ebd38fadf06937098af18414560f4d4e2b5fdfd68",
+      "text": "def make_keyvalue_batch(\n    batch_size: int,\n    seq_len: int,\n    device: torch.device,\n    n_keys: int,\n    n_values: int,\n    n_pairs: int,\n    filler_prob: float,\n    ordered_pairs: bool,\n) -> tuple[Tensor, Tensor]:\n    \"\"\"\n    Input channels:\n      role:  pair/query/filler\n      key:   one-hot key id\n      value: one-hot value id, zeroed for query/filler\n\n    Sequence contains n_pairs bindings and one final query. In ordered mode,\n    slots 0..n_pairs-1 are written in fixed order at the start of the sequence;\n    this is the clean readout-context test. In random mode, bindings appear in\n    random slots with random keys, which is much harder.\n    \"\"\"\n    if n_pairs > n_keys:\n        raise ValueError(\"n_pairs must be <= n_keys\")\n    if seq_len < n_pairs + 1:\n        raise ValueError(\"seq_len must be at least n_pairs + 1\")\n\n    role_dim = 3\n    input_dim = role_dim + n_keys + n_values\n    build_device = torch.device(\"cpu\") if device.type == \"cuda\" else device\n    x = torch.zeros(batch_size, seq_len, input_dim, device=build_device)\n    y = torch.zeros(batch_size, dtype=torch.long, device=build_device)\n\n    role_offset = 0\n    key_offset = role_dim\n    value_offset = role_dim + n_keys\n\n    for b in range(batch_size):\n        if ordered_pairs:\n            keys = torch.arange(n_pairs, device=build_device)\n        else:\n            keys = torch.randperm(n_keys, device=build_device)[:n_pairs]\n        values = torch.randint(0, n_values, (n_pairs,), device=build_device)\n        query_idx = int(torch.randint(0, n_pairs, (1,), device=build_device))\n        query_key = int(keys[query_idx])\n        target_value = int(values[query_idx])\n        y[b] = target_value\n\n        if ordered_pairs:\n            pair_slots = list(range(n_pairs))\n        else:\n            pair_slots = sorted(random.sample(range(seq_len - 1), n_pairs))\n        pairs_by_slot = dict(zip(pair_slots, range(n_pairs)))\n\n        for t in range(seq_len - 1):\n            if t in pairs_by_slot:\n                i = pairs_by_slot[t]\n                key = int(keys[i])\n                value = int(values[i])\n                x[b, t, role_offset + 0] = 1.0\n                x[b, t, key_offset + key] = 1.0\n                x[b, t, value_offset + value] = 1.0\n            elif random.random() < filler_prob:\n                x[b, t, role_offset + 2] = 1.0\n\n        x[b, -1, role_offset + 1] = 1.0\n        x[b, -1, key_offset + query_key] = 1.0\n\n    if build_device != device:\n        return x.to(device, non_blocking=True), y.to(device, non_blocking=True)\n    return x, y\n"
+     }
+    },
+    "source": "benchmarks/READOUT_CONTEXT_BENCH.py"
+   },
+   "keyvalue_trainer": {
+    "file_sha256": "2d00e3888a70a1cf8e1e7c0d75f5e03812bc2ca9f4cb49de2ba03fa13a5af6b9",
+    "fragments": {
+     "evaluation": {
+      "sha256": "d49a6ef81eb8f3ea023dca47cbd385ccb3a8d7059187567841aa42a610e0c09d",
+      "text": "    model.eval()\n    for eval_seq_len in eval_seq_lens:\n        start_eval = time.time()\n        losses: list[Tensor] = []\n        correct = 0\n        total = 0\n        with torch.no_grad():\n            for _ in range(val_batches):\n                x, y = make_keyvalue_batch(\n                    batch_size=batch_size,\n                    seq_len=eval_seq_len,\n                    device=device,\n                    n_keys=n_keys,\n                    n_values=n_values,\n                    n_pairs=n_pairs,\n                    filler_prob=filler_prob,\n                    ordered_pairs=ordered_pairs,\n                )\n                pred = _query_pred(model, x)\n                losses.append(F.cross_entropy(pred, y).detach())\n                correct += int((pred.argmax(dim=-1) == y).sum().detach().cpu())\n                total += int(y.shape[0])\n\n        eval_loss = float(torch.stack(losses).mean().detach().cpu()) if losses else math.nan\n        eval_acc = correct / total if total else math.nan\n"
+     },
+     "optimizer": {
+      "sha256": "aa2846b86f4e0236f9be78fce91c38d78edcc2afbe14742a15115491ad3db65b",
+      "text": "    set_seed(seed)\n    pcfg = pcfg or {}\n    input_dim = 3 + n_keys + n_values\n    if pulse:\n        # TLA-DABSN trained with NO backprop by the subset/accumulating pulse. The query\n        # sits at the LAST position (x[:, -1]); the readout is supervised there only, so\n        # the pulse gets the recall task's per-value error with no gradient through time.\n        from tla.dabsn import TLASubstrateConfig, build_tla_dabsn\n        from tla.kernels import enable_tla_fused_linear\n        from kernels.dopacort_kernel_patch import enable_fused_dopacort\n        enable_tla_fused_linear(); enable_fused_dopacort()\n        model = build_tla_dabsn(input_dim=input_dim, out_dim=n_values, hidden_dim=hidden_dim,\n                                read_geometry=\"seq\", depth=1, output_adapter=\"token\",\n                                substrate_cfg=TLASubstrateConfig(value_scale=pcfg.get(\"value_scale\", 1.0))).to(device)\n    else:\n        model = build_model(model_name, input_dim=input_dim, hidden_dim=hidden_dim, out_dim=n_values).to(device)\n        optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.0)\n    params = count_params(model)\n"
+     },
+     "update": {
+      "sha256": "a8848e4271bba2716096c6016337cdbb3bdb8f0e3327f29613b4904c5b8f09d7",
+      "text": "        model.train()\n        for step in range(1, steps + 1):\n            x, y = _kv_batch(train_seq_len)\n            pred = model(x)\n            loss = F.cross_entropy(pred, y)\n\n            optimizer.zero_grad(set_to_none=True)\n            loss.backward()\n            if clip > 0:\n                torch.nn.utils.clip_grad_norm_(model.parameters(), clip)\n            optimizer.step()\n"
+     }
+    },
+    "source": "benchmarks/KEYVALUE_LENGTH_GENERALIZATION_BENCH.py"
+   },
+   "mqar": {
+    "file_sha256": "ebe092a16c97e877e31ce5eb8e60501e0e047909f5bae9be8e057aa03008fc7b",
+    "fragments": {
+     "evaluation": {
+      "sha256": "d3b605186be85adbf7a0fbf0a3ba0a18c506a9c03f71282e208c5a2204d0a21f",
+      "text": "    results: list[Result] = []\n    model.eval()\n    for eval_seq_len in eval_seq_lens:\n        start_eval = time.time()\n        loss_sum = 0.0\n        correct = 0\n        total = 0\n        with torch.no_grad():\n            for _ in range(val_batches):\n                x, targets, mask = make_mqar_batch(\n                    batch_size=batch_size, seq_len=eval_seq_len, device=device,\n                    n_keys=n_keys, n_values=n_values, n_pairs=n_pairs,\n                )\n                logits = model.forward_sequence(x)\n                loss, c, t = masked_loss_acc(logits, targets, mask)\n                loss_sum += float(loss.detach().cpu())\n                correct += c\n                total += t\n        eval_loss = loss_sum / val_batches if val_batches else math.nan\n        eval_acc = correct / total if total else math.nan\n"
+     },
+     "make_mqar_batch": {
+      "sha256": "97ad32cd71244009b0ad18772cf7c0cc03edeb9f608cfae9edfae7d48a73eb3d",
+      "text": "def make_mqar_batch(\n    batch_size: int,\n    seq_len: int,\n    device: torch.device,\n    n_keys: int,\n    n_values: int,\n    n_pairs: int,\n) -> tuple[Tensor, Tensor, Tensor]:\n    \"\"\"Build one MQAR batch.\n\n    Input channels (one-hot blocks):\n      role:  [is_pair, is_query, is_filler]   (3)\n      key:   one-hot key id                    (n_keys)\n      value: one-hot value id (pairs only)     (n_values)\n\n    Each sequence: n_pairs distinct key->value bindings are placed first (random\n    keys/values), then the SAME n_pairs keys are re-issued as queries in a random\n    order. Remaining slots (between/around) are filler. Targets are defined only\n    at query positions; a mask marks them so loss/acc ignore non-query steps.\n\n    Returns (x, targets, query_mask):\n      x:           (B, T, 3 + n_keys + n_values)\n      targets:     (B, T)   long, value id at query steps (0 elsewhere, masked)\n      query_mask:  (B, T)   bool, True at query steps\n    \"\"\"\n    if n_pairs > n_keys:\n        raise ValueError(\"n_pairs must be <= n_keys\")\n    # need room for n_pairs bindings + n_pairs queries\n    if seq_len < 2 * n_pairs:\n        raise ValueError(\"seq_len must be at least 2 * n_pairs\")\n\n    role_dim = 3\n    input_dim = role_dim + n_keys + n_values\n    build_device = torch.device(\"cpu\") if device.type == \"cuda\" else device\n    x = torch.zeros(batch_size, seq_len, input_dim, device=build_device)\n    targets = torch.zeros(batch_size, seq_len, dtype=torch.long, device=build_device)\n    query_mask = torch.zeros(batch_size, seq_len, dtype=torch.bool, device=build_device)\n\n    key_offset = role_dim\n    value_offset = role_dim + n_keys\n\n    for b in range(batch_size):\n        keys = torch.randperm(n_keys, device=build_device)[:n_pairs]\n        values = torch.randint(0, n_values, (n_pairs,), device=build_device)\n\n        # bindings go in the first half of the available positions, queries in a\n        # random order somewhere after their binding; filler fills the gaps.\n        # Simple, length-robust placement: bindings in the first n_pairs ordered\n        # slots of a random subset, queries in random later slots.\n        all_slots = list(range(seq_len))\n        binding_slots = sorted(random.sample(all_slots[: seq_len // 2], n_pairs))\n        remaining = [s for s in all_slots if s > binding_slots[-1]]\n        query_slots = sorted(random.sample(remaining, n_pairs))\n        query_order = torch.randperm(n_pairs, device=build_device)\n\n        for i, slot in enumerate(binding_slots):\n            k = int(keys[i]); v = int(values[i])\n            x[b, slot, 0] = 1.0                 # role: pair\n            x[b, slot, key_offset + k] = 1.0\n            x[b, slot, value_offset + v] = 1.0\n\n        for qi, slot in enumerate(query_slots):\n            i = int(query_order[qi])\n            k = int(keys[i]); v = int(values[i])\n            x[b, slot, 1] = 1.0                 # role: query\n            x[b, slot, key_offset + k] = 1.0\n            targets[b, slot] = v\n            query_mask[b, slot] = True\n\n        # filler on untouched slots\n        used = set(binding_slots) | set(query_slots)\n        for t in range(seq_len):\n            if t not in used:\n                x[b, t, 2] = 1.0                # role: filler\n\n    if build_device != device:\n        return (\n            x.to(device, non_blocking=True),\n            targets.to(device, non_blocking=True),\n            query_mask.to(device, non_blocking=True),\n        )\n    return x, targets, query_mask\n"
+     },
+     "optimizer_update": {
+      "sha256": "03d38e9183cd3ab0abb8d77386ee4864712d4b03505be48421684e3430093a2e",
+      "text": "    set_seed(seed)\n    input_dim = 3 + n_keys + n_values\n    model = build_model(model_name, input_dim=input_dim, hidden_dim=hidden_dim, out_dim=n_values).to(device)\n    if not hasattr(model, \"forward_sequence\"):\n        raise ValueError(\n            f\"model '{model_name}' has no forward_sequence; MQAR needs per-position \"\n            f\"outputs. Eligible: gru, lstm, and ABSN write-read variants.\"\n        )\n    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.0)\n    params = count_params(model)\n\n    start_train = time.time()\n    train_loss_last = math.nan\n    model.train()\n    for step in range(1, steps + 1):\n        x, targets, mask = make_mqar_batch(\n            batch_size=batch_size, seq_len=train_seq_len, device=device,\n            n_keys=n_keys, n_values=n_values, n_pairs=n_pairs,\n        )\n        logits = model.forward_sequence(x)\n        loss, _, _ = masked_loss_acc(logits, targets, mask)\n\n        optimizer.zero_grad(set_to_none=True)\n        loss.backward()\n        if clip > 0:\n            torch.nn.utils.clip_grad_norm_(model.parameters(), clip)\n        optimizer.step()\n"
+     }
+    },
+    "source": "benchmarks/MQAR_LENGTH_BENCH.py"
+   },
+   "original_model": {
+    "file_sha256": "891026509d73e18c2eb97ac30b9ee487ad7f9c934ccb3d4b213df7324245b03e",
+    "fragments": {
+     "block_factory": {
+      "sha256": "71ec55dfc1b1d413c78e27eb60947b4b3364cce553e37eb18922523805c7f883",
+      "text": "        self.core = PSWABSEnergyDopamineSequence(\n            input_dim=input_dim,\n            hidden_dim=state_dim,\n            dopamine=True,\n            cortisol=True,\n            substrate=self.sub,\n        )\n        self.read = ABSNDualMemoryRead(\n            hidden_dim=state_dim,\n            dropout=dropout,\n            predictive=True,\n            anxiety=True,\n            admission=True,\n            permanent=True,\n            read_geometry=read_geometry,\n            substrate=self.sub,\n        )\n        self.read_gain = self.sub.scalar((1,), 0.01)\n        self.field_read_gain = (\n            self.sub.scalar((1,), 1.0) if read_geometry == \"field\" else None\n        )\n        # The ONLY plumbing: a width projection when the read-state width differs from this\n        # block's hidden width (the DABSN rule -- needed for stacking layers of different\n        # widths). NO LayerNorm, NO residual shell -- those are transformer constructs and\n        # do not belong in ABSN; they also REGRESSED causal length-gen (normalizing away the\n        # read magnitude the proven length extrapolation depends on -- dabsn_seq collapsed on\n        # MQAR while admit_perm held flat). A single DABSN layer is now param-for-param the\n        # proven ABSN cell: out = proj(y + read_gain * read).\n        self.state_to_hidden = nn.Identity() if state_dim == hidden_dim else self.sub.linear(state_dim, hidden_dim)\n"
+     },
+     "linear_heads": {
+      "sha256": "f393453aa9778ea1502608e411481649f4efabc02bc391b15c48c6cf149ccde3",
+      "text": "class TokenOutputAdapter(nn.Module):\n    \"\"\"Hidden per position -> vocabulary scores per position.\"\"\"\n\n    def __init__(self, input_dim: int, vocab_size: int, substrate: \"Substrate | None\" = None):\n        super().__init__()\n        self.proj = default_substrate(substrate).linear(input_dim, vocab_size)\n\n    def forward(self, h: Tensor) -> Tensor:\n        return self.proj(h)\n\n\nclass FieldOutputAdapter(nn.Module):\n    \"\"\"Hidden per position -> target field value per position.\"\"\"\n\n    def __init__(self, input_dim: int, out_dim: int, substrate: \"Substrate | None\" = None):\n        super().__init__()\n        self.proj = default_substrate(substrate).linear(input_dim, out_dim)\n\n    def forward(self, h: Tensor) -> Tensor:\n        return self.proj(h)\n"
+     }
+    },
+    "source": "models/dabsn.py"
+   },
+   "original_read": {
+    "file_sha256": "34c41cdbf0e8fe4bca9c9b416c8c784375e399af9b293741ec6f7ba07ea453af",
+    "fragments": {
+     "inactive_admission_parameter": {
+      "sha256": "b7204d2f25cd55a2a3ae9011604c3f462fd053664128cc592dc717bf89d59313",
+      "text": "    def __init__(self, hidden_dim: int, dropout: float, substrate: \"Substrate | None\" = None):\n        super().__init__(hidden_dim=hidden_dim, dropout=dropout, substrate=substrate)\n        self.adm_p_gain = self.sub.scalar((1,), 1.0)\n        self.adm_novelty_gain = self.sub.scalar((1,), 0.5)\n        self.adm_cortisol_gain = self.sub.scalar((1,), 0.5)\n        self.adm_energy_gain = self.sub.scalar((1,), 0.25)\n        self.adm_bias = self.sub.scalar((1,), -2.0)\n        # width of the near-threshold band kept in the trained set (see _soft_forward)\n        self.adm_train_band = self.sub.scalar((1,), 0.0)\n"
+     },
+     "inactive_long_parameter": {
+      "sha256": "b2bd5ef7410f4a1435d0a5f44888df7c4e704c681e7998533d4bc9984c0a993b",
+      "text": "            self.pad_gain = self.sub.scalar((1,), 1.0)    # PERM (position) read weight: ON by default\n            self.short_gain = self.sub.scalar((1,), 1.0)  # SHORT (position-free) read weight\n            #   SYMMETRIC routing: both reads are gated so the model can suppress EITHER pathway.\n            #   copy -> short_gain DOWN / pad_gain UP (sharp position); S5 -> short_gain UP / pad_gain DOWN.\n            # INDUCTION / CONTINUATION read: same content match (q.k), but returns a\n            # continuation value instead of the matched write. Seq uses strict successor\n            # (idx+1); field builds that continuation by associative self-read over the\n            # admitted object. Starts ~off (0.1) so S5/other tasks are unchanged; copy\n            # or field propagation can dial it in. +1 param.\n            self.induct_gain = self.sub.scalar((1,), 0.1)\n            self.long_decay = self.sub.scalar((1,), 0.0)  # LONG recency-decay (softplus)\n            # POSITION-FROM-ASSOCIATION: the shared score also matches on the cocktail\n            # (energy/cortisol/novelty/p) at write-time. A write made at sequence position\n            # i carries a recurrence-state signature; the query re-derives its position by\n            # associating its own cocktail with each write's -- NOT a positional encoding,\n            # the recurrence IS the position. One extra term in the same read block.\n            self.cocktail_gain = self.sub.scalar((1,), 1.0)\n            if read_geometry == \"hybrid\":\n                self.hybrid_gate = self.sub.scalar((1,), 0.0)\n            # RELATIVE admission window (softplus): admit writes within this margin of the\n            # best admission score. This is the existing n_max admission machinery.\n            self.admit_window = self.sub.scalar((1,), 4.0)\n"
+     },
+     "initialization": {
+      "sha256": "a7375e08202d710f7f7163c0f8ea04502ddf7acef200103b7d1c5be17d73ab5d",
+      "text": "        self.W = self.sub.linear(input_dim, hidden_dim, bias=False)\n        self.A = self.sub.linear(hidden_dim, hidden_dim, bias=False)\n        self.Wg = self.sub.linear(input_dim, hidden_dim, bias=True)\n        self.Ug = self.sub.linear(hidden_dim, hidden_dim, bias=False)\n        self.beta = self.sub.scalar((hidden_dim,), 0.0, span=1.0)\n\n        self.logit_alpha = self.sub.scalar((1,), -2.0)    # scalar gate\n        self.log_lambda = self.sub.scalar((1,), -1.0)\n        self.log_kappa = self.sub.scalar((hidden_dim,), float(kappa_init), span=8.0)\n        self.logit_recover = self.sub.scalar((hidden_dim,), float(recover_init), span=8.0)\n\n        for nm in (\"k_s\", \"k_y\", \"k_b\", \"k_n\", \"k_bias\", \"r_s\", \"r_y\", \"r_b\", \"r_n\", \"r_bias\"):\n            setattr(self, nm, self.sub.scalar((hidden_dim,), 0.0, span=4.0))\n\n        if cortisol:\n            # decay \u2248 0.9: cortisol accumulates slowly and lingers\n            self.logit_cortisol_decay = self.sub.scalar((1,), 2.2)\n            self.k_c = self.sub.scalar((hidden_dim,), 0.0, span=4.0)\n            self.r_c = self.sub.scalar((hidden_dim,), 0.0, span=4.0)\n            # suppress novelty perception under stress (cortisol downregulates dopamine).\n            # init \u22480 effect: sigmoid(-6)\u22480.0025, so at init dopacort == dopamine and\n            # training dials cortisol IN only if it helps (vs. starting handicapped).\n            self.logit_cortisol_suppress = self.sub.scalar((1,), -6.0)\n\n        self.reset_parameters()\n\n    def reset_parameters(self) -> None:\n        # Torch-substrate init only. Substrate variables (e.g. TLA) self-initialize\n        # in their own constructors; they expose `.weight` as a computed view (no\n        # settable tensor), so detect them by `effective_weight` and skip.\n        if hasattr(self.W, \"effective_weight\"):\n            return\n        for m in (self.W, self.A, self.Wg, self.Ug):\n            nn.init.xavier_uniform_(m.weight)\n            if getattr(m, \"bias\", None) is not None:\n                nn.init.zeros_(m.bias)\n        nn.init.orthogonal_(self.A.weight, gain=self.a_gain)\n        nn.init.zeros_(self.beta)\n        nn.init.constant_(self.Wg.bias, -2.0)\n"
+     },
+     "permanent_dispatch": {
+      "sha256": "e6d4ada784386e6ee5eece626911885322e0538afa44cbb36adb975c9e5249e3",
+      "text": "        if self.permanent:\n            if energy is None or cortisol is None:\n                raise ValueError(\"permanent unified read requires energy and cortisol traces\")\n            return self._unified_forward(y, b, ay, write, novelty, p, energy, cortisol, field_shape)\n        if self.admission:\n            if energy is None or cortisol is None:\n                raise ValueError(\"admission read requires energy and cortisol traces\")\n            short = self.short_read(y, b, ay, write, novelty, p, energy, cortisol)\n        else:\n            short = self.short_read(y, b, ay, write, novelty, p)\n"
+     }
+    },
+    "source": "models/pswabs_retrieval.py"
+   },
+   "substrate": {
+    "file_sha256": "8d2b3098f19604734be406414f14f19775820072be5c7401ddc870dea37fbc0a",
+    "fragments": {
+     "linear_and_scalar": {
+      "sha256": "dc2ce2454934d2f06fc2ec01b52efbad7272b4e8e95bc0dad4808fbdb36f459d",
+      "text": "    def linear(self, in_features: int, out_features: int, bias: bool = True) -> nn.Module:\n        return nn.Linear(in_features, out_features, bias=bias)\n\n    def embedding(self, num_embeddings: int, embedding_dim: int) -> nn.Module:\n        return nn.Embedding(num_embeddings, embedding_dim)\n\n    def scalar(self, shape: \"int | Sequence[int]\", init: float = 0.0, span: \"float | None\" = None) -> nn.Parameter:\n        if isinstance(shape, int):\n            shape = (shape,)\n        return nn.Parameter(torch.full(tuple(int(s) for s in shape), float(init)))\n"
+     }
+    },
+    "source": "models/substrate.py"
+   }
+  },
+  "unverified": [
+   "Numerical initialization/active forward parity to the historical runtime",
+   "A real target-GPU optimizer update and full-budget task learning",
+   "Historical run source snapshot not stored in these output-free notebook exports"
+  ]
+ },
+ "continuous": {
+  "model": "stock DABSNCore at its default initialization with an FP32 linear readout at every step; no read",
+  "why_no_read": "the stream studies test the core's online credit; a read would carry the past through a separate memory and confound it",
+  "input_dim": 1,
+  "state_dim": 256,
+  "batch": 8,
+  "chunk": 8,
+  "warmup_chunks": 8,
+  "updates": 16384,
+  "learning_rate": 0.003,
+  "optimizer": "Adam",
+  "betas": [
+   0.9,
+   0.999
+  ],
+  "weight_decay": 0.0,
+  "clip_norm": 1.0,
+  "methods": [
+   "carry",
+   "reset",
+   "permute",
+   "frozen_core",
+   "tbptt",
+   "carry_normalized"
+  ],
+  "tbptt_window_chunks": 8,
+  "exchange_lane_permutation": [
+   2,
+   0,
+   1,
+   7,
+   3,
+   4,
+   5,
+   6
+  ],
+  "seeds": [
+   100,
+   101,
+   102,
+   103,
+   104
+  ],
+  "report_every": 1024,
+  "checkpoint_every": 2048,
+  "score_window_updates": 512,
+  "devices": [
+   "cpu",
+   "cuda"
+  ],
+  "dtype": "float32",
+  "rate_policy": "one declared rate shared by every arm (measured to learn on both benchmarks); every comparison is paired by seed",
+  "prequential": "every scored prediction is made before the update that uses its target",
+  "protocol": "dabsn-stream-memory-capacity-v1",
+  "schema": 2,
+  "benchmark": "memory_capacity",
+  "source": "Jaeger (2001), short-term memory capacity of recurrent networks",
+  "delays": [
+   1,
+   4,
+   8,
+   16,
+   24,
+   32,
+   40,
+   48,
+   64,
+   96,
+   128
+  ],
+  "metric": "memory capacity MC_k (squared correlation of output and u(t-k)) per delay and its sum, over the last score window",
+  "normalized_learning_rate": 1.0,
+  "normalized_rate_candidates": [
+   0.1,
+   1.0
+  ],
+  "normalized_action": {
+   "scale": "L2 norm of the parameter coordinate's embedded column of E divided by sqrt(3*B*S)",
+   "global_scale": "mean over all core parameter coordinates including zero columns",
+   "floor": 1e-08,
+   "untraced_readout": "gradient multiplied by the global scale",
+   "gradient_policy": "scale the credit, then framework-native global clipping, then plain SGD",
+   "persistent_optimizer_moments": 0
+  },
+  "normalized_rate_selection": {
+   "rule": "the candidate with the better final score on development seed 10 (not a main seed), full 16384-update run",
+   "development_seed": 10,
+   "metric": "memory capacity total, higher is better",
+   "final_scores": {
+    "0.1": 0.3091,
+    "1.0": 0.929
+   },
+   "selected": 1.0
+  },
+  "eligibility_unit_ceiling": 10000.0,
+  "eligibility_bound_policy": "Carried E is bounded per unit at 1e4 (healthy units measure order 10, so the bound is about three orders of headroom and is never reached by a run whose units contract). E carries no cross-unit coupling by construction, so a unit whose own transport expands grows its trace without bound on a stream that never resets, even where the full dynamics contract; the bound rescales that unit's traces to the ceiling, preserving direction within the unit and leaving every other unit untouched, exactly as the declared global clipping bounds the action in every arm. Rescaling events, the units involved and the peak per-unit trace norm are recorded with every run.",
+  "transport_diagnostic_chunks": 64,
+  "transport_diagnostic_iterations": 12,
+  "transport_diagnostic": "At the final weights of every carried-E run: per-unit trace growth from a fresh E over the run's own next inputs, against the top singular value of the exact state Jacobian over the same window. Positive per-unit growth with a contracting Jacobian is the omitted cross-unit transport term of the residual identity, measured directly."
+ },
+ "credit": "B-channel online credit: CoreEligibilityState (budget-only matrix traces; three-state local and shared control traces)",
+ "delayed": {
+  "architecture": "block: full DABSN block (core + read), stock init, public online API",
+  "development": {
+   "checkpoint_steps": [
+    750,
+    1500
+   ],
+   "evaluation_examples_per_horizon": 1024,
+   "evaluation_steps": [
+    0,
+    750,
+    1500
+   ],
+   "learning_rates": [
+    0.001,
+    0.003
+   ],
+   "methods": [
+    "online",
+    "bptt"
+   ],
+   "seeds": [
+    10,
+    11
+   ],
+   "selection": "per-task common rate; mean online and BPTT validation loss across horizons and both development seeds; lower is better; ties choose lower rate",
+   "updates": 1500
+  },
+  "execution": {
+   "budget_source": "measured target-GPU preflight; no unmeasured runtime promise",
+   "cpu_threads": 1,
+   "devices": [
+    "cpu",
+    "cuda"
+   ],
+   "dtype": "float32",
+   "evaluation_batch": 64,
+   "evaluation_batch_equivalence_scaled_tolerance": 2e-05,
+   "minimum_free_gpu_memory_fraction": 0.1,
+   "target_gpu_preflight_required_before_paid_matrix": true,
+   "tf32": false
+  },
+  "main": {
+   "batch": 32,
+   "betas": [
+    0.9,
+    0.999
+   ],
+   "checkpoint_steps": [
+    1500,
+    3000,
+    4500
+   ],
+   "chunk": 32,
+   "clip_norm": 1.0,
+   "data_seed_namespace": "paper2-standard-tasks-v2; training=17003+seed, development evaluation=730021, final evaluation=930021",
+   "development_evaluation_examples_per_horizon": 1024,
+   "evaluation_steps": [
+    0,
+    750,
+    1500,
+    2250,
+    3000,
+    3750,
+    4500
+   ],
+   "final_evaluation_examples_per_horizon": 4096,
+   "final_evaluation_lengths": [
+    128,
+    512,
+    2048,
+    4096
+   ],
+   "final_input_diagnostic": "same held-out episodes and trained model; zero every input except the final processing chunk; no retraining or checkpoint selection",
+   "input_dim": 64,
+   "methods": [
+    "online",
+    "frozen_core",
+    "bptt"
+   ],
+   "optimizer": "Adam",
+   "parameter_policy": "fixed during every episode; recurrent and eligibility state reset between episodes",
+   "seeds": [
+    100,
+    101,
+    102,
+    103,
+    104
+   ],
+   "state_dim": 256,
+   "train_lengths_round_robin": [
+    128,
+    512,
+    2048
+   ],
+   "updates": 4500,
+   "weight_decay": 0.0,
+   "online_chunk": "episode"
+  },
+  "protocol": "dabsn-delayed-credit-standard-tasks-v2",
+  "schema": 2,
+  "tasks": [
+   "temporal_order",
+   "adding"
+  ],
+  "task_definitions": {
+   "source": "studies/delayed_tasks.py",
+   "temporal_order": "Hochreiter and Schmidhuber (1997), Experiment 6a: noise symbols a-d, B first, E last, X or Y at one uniform position in [0.1T, 0.2T] and one in [0.5T, 0.6T]; class is the ordered pair; one-hot over 8 symbols; chance 1/4; reported as accuracy",
+   "adding": "Hochreiter and Schmidhuber (1997), Experiment 4, in the form of Arjovsky, Shah and Bengio (2016): channel 0 a value from U[0,1], channel 1 a marker; one marker uniform in each half; target the sum of the two marked values; reported as MSE over 1/6 (the constant-1 predictor), so 1 is no learning",
+   "embedding": "task channels occupy the first input coordinates; the remaining coordinates of the 64-dimensional model input are zero",
+   "episodes": "each episode is a pure function of (task, seed, index, length) through its own SHA-256-seeded generator"
+  }
+ },
+ "directions": {
+  "action_timing": "one declared action per event; no claim of internally generated discrete update times",
+  "adaptive_amplitude": "multiply the declared direct action by mean full K column RMS / its handoff value, clipped to [0.1,10], then apply the common 0.05 action-norm cap",
+  "calibration_angles_pi": [
+   0,
+   0.25,
+   0.5,
+   0.75,
+   1,
+   1.25,
+   1.5,
+   1.75
+  ],
+  "calibration_seeds": [
+   20,
+   21,
+   22,
+   23,
+   24
+  ],
+  "conditioning_steps": 128,
+  "continuation_steps": 96,
+  "controls": [
+   "retained",
+   "erased",
+   "exchanged",
+   "k_y_erased",
+   "frozen_reader",
+   "adaptive_amplitude"
+  ],
+  "decoder_features": "two k_y energy coordinates and intercept; fit once on calibration histories",
+  "decoder_projection": "unit direction; values with norm below 1e-12 decode as zero",
+  "decoder_ridge": 1e-06,
+  "devices": [
+   "cpu",
+   "cuda"
+  ],
+  "exchanged": "opposite objective direction, same conditioning input seed",
+  "execution": "complete framework FP64 reference E; same legal two-channel forward restriction as conditioned_continuation_protocol.json",
+  "external_target_calls_during_continuation": 0,
+  "handoff": "all arms match W=0 and predictive state=(0,1,0); other parameters fixed identically",
+  "objective_family": "q0*0.12*(x0+0.5*x1), q1*0.12*(0.5*x0+x1); q on unit circle",
+  "optimizer_moment_buffers": 0,
+  "protocol": "dabsn-held-objective-direction-v1",
+  "schema": 1,
+  "scope": "held-out direction transfer through a fixed family-encoding reader; no claim that arbitrary objectives or readers disappear",
+  "test_angles_pi": [
+   0.125,
+   0.375,
+   0.625,
+   0.875,
+   1.125,
+   1.375,
+   1.625,
+   1.875
+  ],
+  "test_seeds": [
+   100,
+   101,
+   102,
+   103,
+   104
+  ]
+ },
+ "execution": {
+  "cpu_threads": 1,
+  "devices": [
+   "cpu",
+   "cuda"
+  ],
+  "dtype": "float32",
+  "maximum_job_seconds": 3600,
+  "maximum_suite_seconds": 28800,
+  "outer_compile": false,
+  "tf32": false
+ },
+ "framework": "current DABSN 1.0 working tree, locked by file hash in paper2/framework.lock.json",
+ "interventions": {
+  "architecture": "block: full DABSN block (core + read), stock init, public online API",
+  "batch": 8,
+  "boundary_suffixes": [1, 32],
+  "credit_effect": "core credit of each branch against the carried branch: cosine and norm ratio, in total and by parameter family",
+  "isolated_w_pathway": "1-step boundary only: final input zeroed so W credit is purely historical; carried, W-trace-negated and erased E share one forward",
+  "checkpoint_steps": [
+   0,
+   1500,
+   4500
+  ],
+  "conditions": [
+   "carry",
+   "zero",
+   "permute_lanes",
+   "negate_w",
+   "erase_local"
+  ],
+  "credit_diagnostic": "immediate-only/TBPTT-1 measured separately at matched weights",
+  "devices": [
+   "cpu",
+   "cuda"
+  ],
+  "dtype": "float32",
+  "equal_norm_diagnostic": "single SGD step at selected task rate after rescaling total preclip gradient to the carry norm; undefined when gradient norm is zero",
+  "intervention_data_seed_namespace": "830021 plus training seed",
+  "lengths": [
+   128,
+   512,
+   2048
+  ],
+  "paired_episodes_per_condition": 256,
+  "post_update_evaluation_seed_namespace": "850021 plus training seed",
+  "protocol": "dabsn-frozen-eligibility-intervention-v2",
+  "schema": 1,
+  "source": "selected-rate main-study online checkpoints only",
+  "tasks": [
+   "temporal_order",
+   "adding"
+  ],
+  "training_seeds": [
+   100,
+   101,
+   102,
+   103,
+   104
+  ],
+  "true_update": "clone source Adam optimizer and apply framework-native clipping at 1.0"
+ },
+ "ontology": {
+  "arithmetic": {
+   "amplitudes": [
+    0.5,
+    1.0
+   ],
+   "lengths": [
+    32,
+    64,
+    128
+   ],
+   "noise_std": 0.1,
+   "seeds": [
+    0,
+    1,
+    2,
+    3,
+    4
+   ],
+   "step_norm": 0.001
+  },
+  "decode": {
+   "examples_per_core_and_length": 24,
+   "feature_budgets": [
+    9,
+    48
+   ],
+   "noise_std": 0.1,
+   "ridge": 0.01,
+   "test_cores": [
+    3,
+    4
+   ],
+   "test_lengths": [
+    32,
+    64,
+    128
+   ],
+   "train_cores": [
+    0,
+    1,
+    2
+   ],
+   "train_lengths": [
+    32,
+    64
+   ]
+  },
+  "device": "cpu",
+  "dtype": "float64",
+  "inverse": {
+   "lengths": [
+    8,
+    32,
+    64
+   ],
+   "parameter_step_norm": 0.001,
+   "ridge_fraction": 0.01,
+   "seeds": [
+    0,
+    1,
+    2,
+    3,
+    4
+   ]
+  },
+  "protocol": "dabsn-e-ontology-probes-v1"
+ },
+ "oracles": {
+  "experiments": [
+   "storage",
+   "single_step",
+   "partition",
+   "counterexample",
+   "residual",
+   "transport",
+   "learning",
+   "jacobian_separation",
+   "operator"
+  ]
+ },
+ "resource": {
+  "batch": 8,
+  "betas": [
+   0.9,
+   0.999
+  ],
+  "chunk": 32,
+  "claim_scope": "implementation measurement for core, readout, optimizer and declared input policy; eligibility bytes distinguish analytical allocation from total allocator peak",
+  "clip_norm": 1.0,
+  "devices": [
+   "cpu",
+   "cuda"
+  ],
+  "dtype": "float32",
+  "input_policies": [
+   "streamed",
+   "resident"
+  ],
+  "lengths": [
+   512,
+   2048,
+   8192
+  ],
+  "lr": 0.0003,
+  "measurements": 5,
+  "methods": [
+   "online",
+   "tbptt",
+   "bptt"
+  ],
+  "optimizer": "Adam",
+  "protocol": "dabsn-online-credit-streamed-resource-v1",
+  "schema": 1,
+  "seed": 0,
+  "shapes": [
+   [
+    64,
+    256
+   ],
+   [
+    64,
+    512
+   ],
+   [
+    128,
+    256
+   ]
+  ],
+  "warmup": 2,
+  "weight_decay": 0.0
+ },
+ "scaling": {
+  "batch": 4,
+  "chunk": 16,
+  "lengths": [
+   64,
+   256,
+   1024
+  ],
+  "lr": 0.0001,
+  "methods": [
+   "online",
+   "tbptt",
+   "bptt"
+  ],
+  "repetitions": 7,
+  "seeds": [
+   0,
+   1,
+   2
+  ],
+  "warmup": 3,
+  "widths": [
+   32,
+   64,
+   128,
+   256
+  ]
+ },
+ "schema": 1,
+ "sustained": {
+  "model": "stock DABSNCore at its default initialization with an FP32 linear readout at every step; no read",
+  "why_no_read": "the stream studies test the core's online credit; a read would carry the past through a separate memory and confound it",
+  "input_dim": 1,
+  "state_dim": 256,
+  "batch": 8,
+  "chunk": 8,
+  "warmup_chunks": 8,
+  "updates": 16384,
+  "learning_rate": 0.003,
+  "optimizer": "Adam",
+  "betas": [
+   0.9,
+   0.999
+  ],
+  "weight_decay": 0.0,
+  "clip_norm": 1.0,
+  "methods": [
+   "carry",
+   "reset",
+   "permute",
+   "frozen_core",
+   "tbptt",
+   "carry_normalized"
+  ],
+  "tbptt_window_chunks": 8,
+  "exchange_lane_permutation": [
+   2,
+   0,
+   1,
+   7,
+   3,
+   4,
+   5,
+   6
+  ],
+  "seeds": [
+   100,
+   101,
+   102,
+   103,
+   104
+  ],
+  "report_every": 1024,
+  "checkpoint_every": 2048,
+  "score_window_updates": 512,
+  "devices": [
+   "cpu",
+   "cuda"
+  ],
+  "dtype": "float32",
+  "rate_policy": "one declared rate shared by every arm (measured to learn on both benchmarks); every comparison is paired by seed",
+  "prequential": "every scored prediction is made before the update that uses its target",
+  "protocol": "dabsn-stream-narma10-v1",
+  "schema": 2,
+  "benchmark": "narma10",
+  "source": "Atiya and Parlos (2000), tenth-order NARMA system",
+  "series_rule": "a lane takes the first keyed attempt whose series stays within |y| <= 1 for the whole stream (standard regeneration of divergent NARMA series; fixed in advance, model-independent)",
+  "metric": "normalized MSE (MSE over target variance) over the last score window",
+  "normalized_learning_rate": 0.1,
+  "normalized_rate_candidates": [
+   0.1,
+   1.0
+  ],
+  "normalized_action": {
+   "scale": "L2 norm of the parameter coordinate's embedded column of E divided by sqrt(3*B*S)",
+   "global_scale": "mean over all core parameter coordinates including zero columns",
+   "floor": 1e-08,
+   "untraced_readout": "gradient multiplied by the global scale",
+   "gradient_policy": "scale the credit, then framework-native global clipping, then plain SGD",
+   "persistent_optimizer_moments": 0
+  },
+  "normalized_rate_selection": {
+   "rule": "the candidate with the better final score on development seed 10 (not a main seed), full 16384-update run",
+   "development_seed": 10,
+   "metric": "normalized MSE, lower is better",
+   "final_scores": {
+    "0.1": 0.5336,
+    "1.0": 0.6104
+   },
+   "selected": 0.1
+  },
+  "eligibility_unit_ceiling": 10000.0,
+  "eligibility_bound_policy": "Carried E is bounded per unit at 1e4 (healthy units measure order 10, so the bound is about three orders of headroom and is never reached by a run whose units contract). E carries no cross-unit coupling by construction, so a unit whose own transport expands grows its trace without bound on a stream that never resets, even where the full dynamics contract; the bound rescales that unit's traces to the ceiling, preserving direction within the unit and leaving every other unit untouched, exactly as the declared global clipping bounds the action in every arm. Rescaling events, the units involved and the peak per-unit trace norm are recorded with every run.",
+  "transport_diagnostic_chunks": 64,
+  "transport_diagnostic_iterations": 12,
+  "transport_diagnostic": "At the final weights of every carried-E run: per-unit trace growth from a fresh E over the run's own next inputs, against the top singular value of the exact state Jacobian over the same window. Positive per-unit growth with a contracting Jacobian is the omitted cross-unit transport term of the residual identity, measured directly."
+ },
+ "alignment": {
+  "protocol": "dabsn-stream-credit-alignment-v1",
+  "schema": 1,
+  "studies": [
+   "continuous",
+   "sustained"
+  ],
+  "seeds": [
+   100,
+   101,
+   102,
+   103,
+   104
+  ],
+  "source": "final checkpoint of each carried-E stream run",
+  "window_chunks": 8,
+  "windows": 8,
+  "devices": [
+   "cuda"
+  ],
+  "dtype": "float32",
+  "comparison": "Over consecutive windows of the run's own continuing stream, from the same entering state, the gradient of the window's last-chunk loss by BPTT through the window and by the online computation with E started fresh at the window; per parameter family, cosine and norm ratio. The readout must agree exactly."
+ },
+ "stream_window": {
+  "protocol": "dabsn-stream-horizon-matched-tbptt-v1",
+  "schema": 1,
+  "studies": [
+   "continuous",
+   "sustained"
+  ],
+  "seeds": [
+   100,
+   101,
+   102,
+   103,
+   104
+  ],
+  "window_chunks": 1,
+  "devices": [
+   "cpu",
+   "cuda"
+  ],
+  "design": "Truncated BPTT whose window is one chunk, the reach of E erased after every update, with every other setting taken unchanged from the stream study it belongs to. Matched pairs: one chunk, exact BPTT versus erased E; long reach, the declared window versus carried E."
+ },
+ "stream_normalized": {
+  "protocol": "dabsn-stream-native-action-v5",
+  "schema": 1,
+  "studies": [
+   "continuous",
+   "sustained"
+  ],
+  "seeds": [
+   100,
+   101,
+   102,
+   103,
+   104
+  ],
+  "devices": [
+   "cpu",
+   "cuda"
+  ],
+  "rule": "core: studies/native_action.py (direction: credit times eta_t/max(s_theta, floor*eta_t) with s_theta the column RMS of the core's E and eta_t its mean; pace: the direction rescaled to coordinate RMS eta_t); plain SGD at the core's nominal rate; no momentum, moments, clipping or optimizer state. readout: its own credit under the stream arms' regime (Adam at the declared rate and betas, clipping at the declared norm over its own gradient), so the arm differs from carry only in the core's action.",
+  "inherited_variant": "The continuous and sustained carry_normalized arm is the inherited trace_rms variant: readout scaled by the global scale, global clipping, development-selected rate. The native action itself is this stage.",
+  "development": {
+   "seed": 10,
+   "updates": 16384,
+   "rate_grid": [
+    0.3,
+    1.0,
+    3.0,
+    10.0,
+    30.0
+   ],
+   "relative_floor_grid": [
+    0.1,
+    1.0
+   ],
+   "selection": "per benchmark: highest total memory capacity or lowest NARMA-10 NMSE over the last score window of the development run; a diverged run is worst; ties choose the smaller rate, then the larger floor",
+   "divergence": "a non-finite loss or credit ends the run and is recorded as diverged, a measured outcome of that setting",
+   "budget": "the full declared stream budget: a shorter development run cannot see late-training instability of a fixed-rate core action"
+  }
+ },
+ "conjunction": {
+  "protocol": "dabsn-conjunction-v4",
+  "schema": 1,
+  "tasks": [
+   "copy",
+   "mqar",
+   "keyvalue"
+  ],
+  "seeds": [
+   0,
+   1,
+   2
+  ],
+  "arms": [
+   "native",
+   "adamw_online",
+   "adamw_bptt"
+  ],
+  "evaluate_every": 100,
+  "evaluation_batches": 5,
+  "devices": [
+   "cuda"
+  ],
+  "native": "online credit, one chunk per episode. The core: direction from its credit normalized by its own E (s_theta column RMS of E, eta_t its mean; core credit times eta_t/max(s_theta, floor*eta_t)), pace from E (the direction rescaled to coordinate RMS eta_t), plain SGD at one nominal rate, so the per-coordinate step has RMS rate*eta_t; no optimizer state, no schedule, no clipping. The read and the readout are not the core's responsibility: they keep their own online credit under exactly the AdamW arms' regime (paper-1 rate and schedule, clipping at the declared norm over their own gradients), so native and adamw_online differ only in the core's action",
+  "baselines": "the continuity regime unchanged: paper-1 AdamW rate, warmup and schedule, declared clipping",
+  "data_efficiency": "first scheduled update at which held-out accuracy at the training length reaches 0.99",
+  "development_seed": 10,
+  "rate_grid": [
+   0.3,
+   1.0,
+   3.0,
+   10.0
+  ],
+  "relative_floor_grid": [
+   0.1,
+   1.0
+  ],
+  "selection": "per task, as the AdamW arms have per-task paper-1 rates: the core's nominal rate and relative floor with the highest mean final held-out accuracy over the paper-1 evaluation lengths (the evaluation the main study reports) on development seed 10 (never a main seed); ties choose the smaller rate, then the larger floor"
+ }
+}

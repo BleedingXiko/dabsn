@@ -1,0 +1,21 @@
+\begin{table}\centering\small
+\setlength{\tabcolsep}{4pt}
+\begin{adjustbox}{max width=\linewidth}
+\begin{tabular}{lrrrrrrr}
+\toprule
+ & \multicolumn{1}{c}{train} & \multicolumn{4}{c}{distance} & \multicolumn{2}{c}{load} \\
+Model & val & 1$\times$ & 4$\times$ & 16$\times$ & 64$\times$ & 2$\times$ & 8$\times$ \\
+\midrule
+NoPE + matched MLP (front)$^\dagger$ & 60.7{\scriptsize$\pm$6.4} & 50.6{\scriptsize$\pm$8.7} & 48.6{\scriptsize$\pm$8.6} & 48.9{\scriptsize$\pm$8.3} & 47.8{\scriptsize$\pm$8.2} & 32.5{\scriptsize$\pm$8.5} & 9.3{\scriptsize$\pm$3.4} \\
+\textbf{NoPE + memory (front)} & 100.0{\scriptsize$\pm$0.0} & \textbf{100.0}{\scriptsize$\pm$0.0} & \textbf{100.0}{\scriptsize$\pm$0.0} & \textbf{99.9}{\scriptsize$\pm$0.2} & \textbf{96.9}{\scriptsize$\pm$2.8} & \textbf{100.0}{\scriptsize$\pm$0.0} & \textbf{100.0}{\scriptsize$\pm$0.0} \\
+\textbf{Sliding window + memory (front)} & 100.0{\scriptsize$\pm$0.0} & \textbf{100.0}{\scriptsize$\pm$0.0} & \textbf{100.0}{\scriptsize$\pm$0.0} & \textbf{99.9}{\scriptsize$\pm$0.1} & \textbf{96.9}{\scriptsize$\pm$2.4} & \textbf{100.0}{\scriptsize$\pm$0.0} & \textbf{100.0}{\scriptsize$\pm$0.0} \\
+NoPE + matched MLP (middle) & 92.0{\scriptsize$\pm$13.3} & 89.5{\scriptsize$\pm$17.8} & 65.0{\scriptsize$\pm$12.8} & 31.6{\scriptsize$\pm$28.1} & 22.1{\scriptsize$\pm$23.8} & 73.5{\scriptsize$\pm$22.1} & 12.7{\scriptsize$\pm$4.6} \\
+\textbf{NoPE + memory (middle)} & 99.6{\scriptsize$\pm$0.2} & 99.5{\scriptsize$\pm$0.2} & 96.5{\scriptsize$\pm$0.9} & 90.7{\scriptsize$\pm$5.7} & 75.0{\scriptsize$\pm$18.8} & 88.6{\scriptsize$\pm$2.8} & 23.2{\scriptsize$\pm$2.8} \\
+\textbf{Sliding window + memory (middle)} & 99.9{\scriptsize$\pm$0.1} & \textbf{100.0}{\scriptsize$\pm$0.0} & 99.9{\scriptsize$\pm$0.1} & 95.6{\scriptsize$\pm$4.8} & 71.7{\scriptsize$\pm$26.6} & \textbf{100.0}{\scriptsize$\pm$0.0} & 99.8{\scriptsize$\pm$0.3} \\
+\textbf{NoPE + memory (back)} & 99.8{\scriptsize$\pm$0.2} & 99.8{\scriptsize$\pm$0.2} & 52.9{\scriptsize$\pm$30.4} & 8.1{\scriptsize$\pm$8.2} & 2.2{\scriptsize$\pm$3.1} & 76.5{\scriptsize$\pm$2.0} & 6.6{\scriptsize$\pm$4.8} \\
+\bottomrule
+\end{tabular}
+\end{adjustbox}
+\caption{Placement of the single memory on MQAR, with the parameter-matched control at the same place. Accuracy (\%), mean $\pm$ standard deviation over three seeds. Distance: filler between the facts and their use at $k\times$ the training length; load: $k\times$ the largest training load with the filler at its training size. The best model that learned the task is in bold; $^\dagger$ marks models below 90\% at the training length, which are not compared beyond it.}
+\label{tab:placement}
+\end{table}

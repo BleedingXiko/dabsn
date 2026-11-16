@@ -2143,6 +2143,10 @@ def _merge_online_temporal_states(states: tuple[OnlineTemporalState, ...]) -> On
     first = states[0]
     if any(state.active_frames for state in states):
         raise RuntimeError("cannot merge online state with pending replay")
+    # A complete single group already owns the final contiguous state.
+    # Concatenating it would duplicate the entire carried learning state.
+    if len(states) == 1:
+        return first
     identity = (
         first.stream_policy,
         first.chunk_position,

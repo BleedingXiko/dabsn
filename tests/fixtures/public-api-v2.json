@@ -24,6 +24,7 @@
   "DABSNConfig",
   "DABSNCore",
   "DABSNGraph",
+  "DABSNHostMemory",
   "DABSNLayerSpec",
   "DABSNModel",
   "DABSNPretrainConfig",

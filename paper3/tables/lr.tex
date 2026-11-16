@@ -1,0 +1,24 @@
+\begin{table}\centering\small
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{lrrrrrr}
+\toprule
+Model & Params & MQAR & Passkey & Copying & Sel.\ copying & enwik8 \\
+\midrule
+NoPE & 2.89M & 0.003 & 0.001 & 0.001 & 0.001 & 0.002 \\
+RoPE & 2.89M & 0.001 & 0.001 & 0.0003 & 0.001 & 0.004 \\
+ALiBi & 2.89M & 0.003 & 0.0003 & 0.001 & 0.003 & 0.004 \\
+Sliding window & 2.89M & 0.001 & 0.003 & 0.003 & 0.0003 & 0.004 \\
+Infini-attention & 2.89M & 0.003 & 0.001 & 0.003 & 0.003 & 0.004 \\
+NoPE + matched MLP (front) & 2.97M & 0.003 & 0.0003 & 0.0003 & 0.001 & 0.001 \\
+NoPE + memory (front) & 2.97M & 0.003 & 0.003 & 0.003 & 0.001 & 0.004 \\
+Sliding window + memory (front) & 2.97M & 0.003 & 0.001 & 0.001 & 0.0003 & 0.004 \\
+NoPE + matched MLP (middle) & 2.97M & 0.003 & -- & -- & -- & -- \\
+NoPE + memory (middle) & 2.97M & 0.003 & -- & -- & -- & -- \\
+Sliding window + memory (middle) & 2.97M & 0.001 & -- & -- & -- & -- \\
+NoPE + memory (back) & 2.97M & 0.0003 & -- & -- & -- & -- \\
+RoPE + YaRN (fine-tuned) & 2.89M & 0.001 & 0.001 & 0.0003 & 0.001 & -- \\
+\bottomrule
+\end{tabular}
+\caption{Parameter counts (MQAR vocabulary) and the learning rate selected for each task by in-distribution validation. The fine-tuned YaRN model uses the rate selected for its RoPE source.}
+\label{tab:lr}
+\end{table}

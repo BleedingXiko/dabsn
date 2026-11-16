@@ -1,0 +1,20 @@
+\begin{table}\centering\small
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{llrrrrrrr}
+\toprule
+Model & Seed & 16K & 32K & 64K & 128K & 256K & 512K & 1M \\
+\midrule
+\textbf{NoPE + memory (front)} & 0 & 100 & 100 & 100 & 100 & 100 & 100 & 100 \\
+\textbf{NoPE + memory (front)} & 1 & 100 & 100 & 100 & 100 & 98 & 98 & 96 \\
+\textbf{NoPE + memory (front)} & 2 & 100 & 100 & 100 & 100 & 100 & 98 & 100 \\
+\textbf{Sliding window + memory (front)} & 0 & 86 & 88 & 74 & 76 & 78 & 74 & --\rlap{$^\ast$} \\
+\textbf{Sliding window + memory (front)} & 1 & 74 & 68 & 58 & 58 & 40 & 42 & --\rlap{$^\ast$} \\
+\textbf{Sliding window + memory (front)} & 2 & 78 & 74 & 72 & 57 & 60 & 50 & --\rlap{$^\ast$} \\
+NoPE & 0 & 32 & 20 & 14 & 2 & 14 & 16 & 10 \\
+Sliding window & 0 & 20 & 8 & 24 & 17 & 18 & 10 & --\rlap{$^\ast$} \\
+Infini-attention & 0 & 22 & 6 & 7 & 4 & 8 & 2 & --\rlap{$^\ast$} \\
+\bottomrule
+\end{tabular}
+\caption{Passkey retrieval far beyond the 256-token training length: digit accuracy (\%) over 10 prompts per length (chance 10\%), on the passkey checkpoints of the main phase (every seed for the memory models, seed 0 for the baselines). $^\ast$The reference sliding-window and segment attention kernels used here exceed a CUDA launch limit at $2^{20}$ tokens (one call with $2^{16}$ attention blocks); no result exists for those models at that length.}
+\label{tab:extreme}
+\end{table}

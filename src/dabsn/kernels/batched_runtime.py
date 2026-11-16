@@ -1391,19 +1391,25 @@ class DABSNCoreScanBatched(torch.autograd.Function):
                 return torch.zeros_like(value, dtype=torch.float32)
             return grad_outputs[index].float()
 
-        gU = public_grad(0, U)
-        gnov = public_grad(1, plasticity)
-        gp_out = public_grad(2, plasticity)
-        gay_out = public_grad(3, expression)
-        gwrite = public_grad(4, plasticity)
-        if ctx.return_tape:
-            ge_out = public_grad(5, e_tape)
-            gc_out = public_grad(6, c_tape)
-            final_offset = 7
-        else:
-            ge_out = torch.zeros_like(e_tape, dtype=torch.float32)
-            gc_out = torch.zeros_like(c_tape, dtype=torch.float32)
-            final_offset = 5
+        from .core_persistent import persistent_backward, persistent_core_supported
+
+        # The persistent reverse reads incoming gradients in their own dtype and
+        # skips absent ones, so the FP32 [B,T,H] copies are built only for the
+        # stepwise reverse below.
+        use_persistent = persistent_core_supported(Wx) and not torch.is_grad_enabled()
+        final_offset = 7 if ctx.return_tape else 5
+        if not use_persistent:
+            gU = public_grad(0, U)
+            gnov = public_grad(1, plasticity)
+            gp_out = public_grad(2, plasticity)
+            gay_out = public_grad(3, expression)
+            gwrite = public_grad(4, plasticity)
+            if ctx.return_tape:
+                ge_out = public_grad(5, e_tape)
+                gc_out = public_grad(6, c_tape)
+            else:
+                ge_out = torch.zeros_like(e_tape, dtype=torch.float32)
+                gc_out = torch.zeros_like(c_tape, dtype=torch.float32)
         if ctx.return_final_state:
             gbn = public_grad(final_offset, final_b)
             gen = public_grad(final_offset + 1, final_e)
@@ -1442,6 +1448,37 @@ class DABSNCoreScanBatched(torch.autograd.Function):
                 f"dtype (got Wx={Wx.dtype}, Wgx={Wgx.dtype}); the batched core "
                 "always projects both inputs in the block activation dtype."
             )
+        if use_persistent:
+            # One-launch reverse scan (see core_persistent). Absent output
+            # gradients are skipped in-kernel rather than read as zeros.
+            def raw(index: int):
+                if index >= len(grad_outputs) or grad_outputs[index] is None:
+                    return None
+                return grad_outputs[index]
+
+            tape_grads = (raw(5), raw(6)) if ctx.return_tape else (None, None)
+            gWx, gWgx, day_tape, pacc, sacc, gbn, gen, gcn = persistent_backward(
+                reads=(U, e_tape, c_tape, s_tape, plasticity, expression),
+                grads=(raw(0), raw(1), raw(2), raw(3), raw(4), *tape_grads),
+                initial=(initial_b, initial_c),
+                final_grads=(gbn, gen, gcn),
+                recurrent=recurrent_backward,
+                params=(
+                    beta, log_kappa, logit_recover, k_s, k_y, k_b, k_n, k_bias,
+                    r_s, r_y, r_b, r_n, r_bias, logit_c_decay, k_c, r_c,
+                    logit_alpha, log_lambda, logit_c_suppress,
+                ),
+                out_dtype=Wx.dtype,
+            )
+            param_acc = list(pacc.unbind(0))
+            scalar_acc = list(sacc.unbind(0))
+            return DABSNCoreScanBatched._finish_backward(
+                Wx, Wgx, Ug, A, U, gWx, gWgx, day_tape, param_acc, scalar_acc,
+                gbn, gen, gcn, beta, log_kappa, logit_recover, k_s, r_s,
+                logit_c_decay, k_c, r_c, logit_alpha, log_lambda, logit_c_suppress,
+                initial_b, initial_e, initial_c,
+            )
+
         gWx = torch.empty((B, T, H), device=Wx.device, dtype=Wx.dtype)
         gWgx = torch.empty_like(gWx)
         day_tape = torch.empty_like(gWx)
@@ -1485,7 +1522,22 @@ class DABSNCoreScanBatched(torch.autograd.Function):
         )
         gbn, gen, gcn = carry.gb, carry.ge, carry.gc
         param_acc, scalar_acc = carry.param_acc, carry.scalar_acc
+        return DABSNCoreScanBatched._finish_backward(
+            Wx, Wgx, Ug, A, U, gWx, gWgx, day_tape, param_acc, scalar_acc,
+            gbn, gen, gcn, beta, log_kappa, logit_recover, k_s, r_s,
+            logit_c_decay, k_c, r_c, logit_alpha, log_lambda, logit_c_suppress,
+            initial_b, initial_e, initial_c,
+        )
 
+    @staticmethod
+    def _finish_backward(
+        Wx, Wgx, Ug, A, U, gWx, gWgx, day_tape, param_acc, scalar_acc,
+        gbn, gen, gcn, beta, log_kappa, logit_recover, k_s, r_s,
+        logit_c_decay, k_c, r_c, logit_alpha, log_lambda, logit_c_suppress,
+        initial_b, initial_e, initial_c,
+    ):
+        """Shared tail of both reverse scans: recurrent-matrix GEMM and packing."""
+        B, T, H = gWx.shape
         y_flat = U[:, :, :H].reshape(B * T, H).to(Wx.dtype)
         # gWgx holds the gate-pre grad (dpre, the Ug half); day_tape holds the
         # expression grad (d_ay, the A half). Both are already Wx.dtype, so the
@@ -1546,8 +1598,23 @@ def _core_scan_batched_op(
     initial_b: Tensor,
     initial_e: Tensor,
     initial_c: Tensor,
-) -> CoreScanOutputs:
-    """Fixed-output operator form of the canonical batched core scan."""
+) -> tuple[
+    Tensor,
+    Tensor,
+    Tensor,
+    Tensor,
+    Tensor,
+    Tensor,
+    Tensor,
+    Tensor,
+    Tensor,
+    Tensor,
+    Tensor,
+]:
+    """Fixed-output operator form of the canonical batched core scan.
+
+    The return type is spelled out rather than ``CoreScanOutputs``: torch 2.6
+    evaluates custom-op annotations without this module's globals."""
 
     return _batched_forward_tapes(
         Wx,

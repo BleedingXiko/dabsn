@@ -1,0 +1,607 @@
+\documentclass[11pt]{article}
+\usepackage[margin=0.9in]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern,microtype}
+\usepackage{amsmath,amssymb,amsthm,mathtools}
+\usepackage{booktabs,tabularx,array}
+\usepackage{xcolor,graphicx,adjustbox,float}
+\usepackage[numbers,sort&compress]{natbib}
+\usepackage[colorlinks=true,linkcolor=blue!45!black,citecolor=blue!45!black,urlcolor=blue!45!black]{hyperref}
+\usepackage{enumitem}
+\setlist{nosep}
+\newtheorem{proposition}{Proposition}
+\newcommand{\R}{\mathbb R}
+\newcommand{\sg}{\operatorname{sigmoid}}
+\newcommand{\spplus}{\operatorname{softplus}}
+\input{tables/numbers}
+
+\title{Attention is My Memory:\\Positional Encoding-free Length Invariance in Transformers}
+\author{Nicholas Rosdahl\\Independent Researcher}
+\date{2026\\[0.5em]\small\href{https://doi.org/10.5281/zenodo.24268811}{doi:10.5281/zenodo.24268811}}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Every transformer inherits two limits from the way it represents order: a
+\emph{context cap}, a maximum length fixed by its positional scheme and training
+length, and a failure of \emph{length generalization}, the collapse of learned
+behaviour on sequences longer than those seen in training. We remove positional
+encoding entirely and insert a single memory, the admitted read of
+DABSN~\citep{rosdahl2026dabsn}, once into the transformer. The memory is a thin
+interface of four scalar tags and two projections feeding the original read
+unchanged. Nothing in the resulting model is indexed by position, so it has no
+architectural limit on sequence length. Trained on 256-token sequences, it keeps
+\memMqarDistSixtyFour\% accuracy on multi-query associative recall at $64\times$
+the training length and \memMqarLoadEight\% at $8\times$ the number of stored pairs,
+where the strongest positional baseline, rotary embeddings fine-tuned with YaRN,
+reaches \YarnFtMqarDistSixtyFour\% and \YarnFtMqarLoadEight\%. It retrieves a passkey
+at $2^{20}$ tokens, $4096\times$ its training length, with
+\extMemOneMMin--\extMemOneMMax\% digit accuracy across seeds, where the same
+transformer without the memory scores \extNopeOneM\%. The result holds at a larger
+width and depth. On character-level language modelling, the memory model without
+any positional encoding matches positional transformers at the training length
+(\lmMemBpc{} bits per character against \lmRopeBpc{} for rotary and \lmAlibiBpc{} for
+ALiBi). All results come from one declared protocol of \runsTotal{} runs with
+per-model learning-rate sweeps, three seeds, and the published task generators.
+\end{abstract}
+
+\section{Introduction}
+\label{sec:intro}
+
+Self-attention is permutation-equivariant: without additional machinery, it cannot
+tell one ordering of its inputs from another~\citep{vaswani2017attention}. The
+standard remedy is to inject position. Absolute embeddings attach a learned or
+fixed vector to each index, rotary embeddings rotate queries and keys by an angle
+proportional to position~\citep{su2021roformer}, and linear biases penalize
+attention by distance~\citep{press2022train}. Each choice works within the lengths
+it was trained on. Each also ties the model to those lengths.
+
+The tie produces two distinct limits. The first is a \emph{context cap}: a learned
+absolute table has no entry beyond its last index, and a rotary model meets
+rotation angles it has never seen. The second is a failure of \emph{length
+generalization}: even where a longer input is admissible, behaviour learned on
+short sequences degrades on long ones~\citep{press2022train,kazemnejad2023impact}.
+A large body of work extends context windows after training by interpolating or
+rescaling positions~\citep{chen2023extending,peng2024yarn}. These methods move the
+cap; they do not remove it, and the strongest of them require further training at
+the new length.
+
+Removing position altogether is not by itself a solution. Causal transformers with
+no positional encoding (NoPE) still learn positional information
+implicitly~\citep{haviv2022transformer} and can generalize better than positional
+schemes on some tasks~\citep{kazemnejad2023impact}. But softmax attention over an
+ever-growing sequence spreads its mass across more and more tokens, and retrieval
+that was sharp at the training length is diluted beyond it. In our experiments a
+NoPE transformer that learns associative recall at 256 tokens (\nopeScaleVal\%)
+keeps \nopeScaleDistSixtyFour\% of it at $64\times$ that length.
+
+We take a different route. DABSN~\citep{rosdahl2026dabsn} introduced an
+\emph{admitted read}: a memory whose writes are admitted by content, addressed by
+content, and retrieved by three primitives (content, permanent, and induction),
+with no positional table of any kind. In a recurrent block, this read generalized
+copying to $50\times$ the training length, a flatness that work attributes to
+addressing that depends on no position~\citep{rosdahl2026dabsn}. This
+paper asks whether the same read, used as the memory of a transformer that has no
+positional encoding, removes the transformer's limits.
+
+It removes the cap, and on retrieval it removes the length cliff. Our contributions are:
+\begin{itemize}
+\item \textbf{One memory, one interface.} We expose the admitted read through a
+thin host interface: four scalar tags and two projections computed from the
+transformer's hidden state (Section~\ref{sec:method}). The read itself is used
+unchanged. It adds \memParams{} parameters (\memParamFrac\% of the base model), and a
+single instance suffices.
+\item \textbf{No context cap.} The model contains no position index, so no input
+length is out of range (Proposition~\ref{prop:free}). Trained on 256 tokens, it
+retrieves a passkey at $2^{20}$ tokens with \extMemOneMSeeds\% digit accuracy across
+three seeds (Section~\ref{sec:extreme}).
+\item \textbf{Length generalization of recall.} On multi-query associative recall and
+passkey retrieval, accuracy holds as both the distance to the stored facts and the
+number of facts grow. The strongest positional scheme, YaRN with fine-tuning at
+$4\times$ the length, comes close on distance (\YarnFtMqarDistSixtyFour\% against
+\memMqarDistSixtyFour\% at $64\times$) but holds \YarnFtMqarLoadEight\% of the facts at
+$8\times$ the load, against \memMqarLoadEight\% (Section~\ref{sec:distance}). The result
+holds at a larger width and depth (Section~\ref{sec:scale}).
+\item \textbf{Placement.} With the memory at the front of the stack, the model solves
+associative recall in \frontSolveSteps{} steps on every seed, against
+\middleSolveSteps{} with the memory in the middle, and extrapolates further
+(Section~\ref{sec:placement}).
+\item \textbf{A complete protocol.} \runsTotal{} runs: every model is tuned on every
+task, compared only where it learns the task, trained with three seeds, and
+evaluated on byte-identical sequences generated by the published task code
+(Section~\ref{sec:setup}).
+\end{itemize}
+
+\section{Background}
+\label{sec:background}
+
+\paragraph{Positional schemes and extrapolation.}
+Rotary embeddings~\citep{su2021roformer} encode relative position through
+rotations of query and key pairs. Beyond the training length, the model meets
+rotation angles outside its training distribution. Attention with linear biases
+(ALiBi)~\citep{press2022train} subtracts a head-specific penalty proportional to
+distance, which keeps perplexity stable at longer lengths but suppresses access to
+distant tokens by construction. Position interpolation~\citep{chen2023extending}
+and YaRN~\citep{peng2024yarn} rescale rotary frequencies so that longer contexts
+map into the trained range, usually followed by fine-tuning at the target length.
+All of these keep position as the basis of addressing.
+
+\paragraph{Transformers without positional encoding.}
+A causal mask alone breaks permutation symmetry, and NoPE transformers recover
+positional information from it~\citep{haviv2022transformer}. NoPE can
+length-generalize better than explicit schemes on algorithmic
+tasks~\citep{kazemnejad2023impact}, but its attention still spreads across all
+preceding tokens. Sliding-window attention~\citep{beltagy2020longformer} bounds
+each token's attention span and removes any limit on sequence length, at the price
+of losing all access beyond the window.
+
+\paragraph{Memory-augmented transformers.}
+Memorizing Transformers~\citep{wu2022memorizing} retrieve past keys and values
+with $k$-nearest-neighbour search. The Recurrent Memory
+Transformer~\citep{bulatov2022recurrent} passes memory tokens between segments.
+Landmark attention~\citep{mohtashami2023landmark} inserts block-summary tokens
+that gate retrieval of whole blocks. Infini-attention~\citep{munkhdalai2024leave}
+adds a compressive linear-attention memory to each attention layer. Each of these
+retains positional machinery in the host, and each stores history by
+\emph{arrival}: whatever passes through is kept, compressed, or summarized. The
+memory studied here differs on both counts. The host carries no positional
+encoding at all, and writes enter memory only if they are \emph{admitted by
+content}.
+
+\paragraph{Recall and induction.}
+Multi-query associative recall (MQAR) measures a model's ability to retrieve the
+value bound to a key presented earlier, and separates architectures that store
+history exactly from those that compress it~\citep{arora2024zoology}. Induction
+heads, the attention circuit that finds a previous occurrence of the current token
+and copies its successor~\citep{olsson2022context}, are a central mechanism of
+in-context learning. The admitted read implements induction directly as one of its
+three primitives~\citep{rosdahl2026dabsn}.
+
+\section{Method}
+\label{sec:method}
+
+\subsection{The admitted read}
+
+We use the admitted read of DABSN exactly as defined in~\citep{rosdahl2026dabsn}
+and summarize it here. The read consumes, at each position $t$, a query expression
+$q_t\in\R^H$, a write $m_t\in\R^H$, and four scalar tags: novelty $\bar n_t$,
+plasticity $\bar p_t$, energy $\bar e_t$, and saturation $\bar c_t$. Each write
+receives an admission score
+\begin{equation}
+\mathrm{adm}_t = \gamma_p\log(1+H\bar p_t) + \gamma_n\bar n_t + \gamma_c\bar c_t
+ + \gamma_e\bar e_t + \gamma_0,
+\end{equation}
+and is admitted when it lies within a learned window of the best score seen so far:
+\begin{equation}
+\mathrm{member}_t = \Big[\,\mathrm{adm}_t \ge \max_{k\le t}\mathrm{adm}_k
+ - \spplus(w)\,\Big].
+\label{eq:admission}
+\end{equation}
+The window is relative, so the admitted set adapts to the task and never collapses
+to a single write. Over the admitted set, one score between the normalized query
+and write,
+$\mathrm{scale}\cdot(\hat q_i\cdot\hat m_j)+\mathrm{keybias}_j+\mathrm{adm}_j$,
+is shared by three causal softmax reads: the \emph{content} and \emph{permanent}
+reads gather the matched write itself, the latter adding a similarity between tag
+signatures; the \emph{induction} read, over strictly earlier entries, gathers the
+matched write's successor $m_{j+1}$, which is the copy primitive. The three are
+combined with learned gains. A slow prediction-error trace accumulates writes whose
+content departs from their recent expectation and is added to the read output with
+a learned gain. None of these quantities contains a position index. Order enters
+only through causality: the causal masks and the left-to-right trace.
+
+\subsection{A host interface}
+
+A transformer supplies none of these quantities natively. We derive them from the
+host's hidden state $h_t\in\R^H$ at the insertion point with three feed-forward
+maps:
+\begin{align}
+(\bar n_t,\bar p_t,\bar e_t,\bar c_t) &= \sg(W_\tau h_t+b_\tau),\\
+q_t &= W_q h_t, \qquad m_t = \bar p_t\, W_m h_t.
+\end{align}
+The write follows DABSN's own contract, in which plasticity scales what is
+written. $W_q$ and $W_m$ are initialized to the identity, so at initialization
+the memory reads and writes the host's own representation. The tags are scalars:
+the read consumes them only through their mean over hidden units, so no
+$H$-wide tag vectors are stored. The read's recurrent-state inputs are set to zero,
+so the memory branch carries retrieved content only and never re-emits the host
+state. The only change to the read is the initial value of its admission window
+(Eq.~\ref{eq:admission}), $\spplus(w)=1.5$, calibrated to the score scale of
+host-derived tags. The window remains a learned parameter.
+
+\subsection{Placement}
+
+The memory enters the host as a single residual branch,
+$h \leftarrow h + \mathrm{Mem}(\mathrm{LN}(h))$. We place exactly one memory per model
+(two only in one ablation) and study three positions: at the \emph{front}, before the first block, where the
+memory reads the token embeddings; in the \emph{middle}, before block $L/2$; and at
+the \emph{back}, after the last block. The attention layers carry no positional
+encoding. They are either full causal attention (NoPE + memory) or causal
+sliding-window attention (sliding window + memory).
+
+\subsection{Why there is no context cap}
+
+\begin{proposition}[Position-free computation]
+\label{prop:free}
+Let the host transformer use no positional encoding. Then every quantity the
+model computes at position $t$ is a function of the token contents at positions
+$\le t$ and of the attention mask (causal, or causal and windowed), and of no
+position index.
+\end{proposition}
+
+It follows that no parameter of the model is indexed by, or calibrated to, a
+sequence length, and no input length is out of range. What can still change with
+length is the \emph{distribution} of the quantities the model computes. That is an
+empirical question, and the rest of the paper answers it.
+
+\section{Experimental setup}
+\label{sec:setup}
+
+\paragraph{Tasks.} Every task uses its published generator; only the sequence length
+is set by our protocol, with training at 256 tokens. \emph{MQAR} follows \texttt{multiquery\_ar} of~\citet{arora2024zoology}:
+vocabulary 8192, keys from the lower half and values from the upper half, the
+key--value block first, then the keys queried at power-law gaps with uniform random
+tokens elsewhere; training mixes Zoology's three 256-token configurations (16, 32
+and 64 pairs). \emph{Copying}~\citep{arjovsky2016unitary} and \emph{selective
+copying}~\citep{gu2023mamba} use \texttt{torch\_copying\_data} from the S4
+repository~\citep{gu2022efficiently}: 10 tokens over 8 symbols for copying, and
+for selective copying the setting of~\citet{gu2023mamba}, 16 tokens at random
+positions in a 16-token vocabulary, at our training length of 256 rather than their
+4096. \emph{Passkey retrieval} uses the prompt
+of~\citet{mohtashami2023landmark}, tokenized by word, with a uniform key in
+$[1,50000]$ at a uniform depth; its digits are predicted.
+
+\paragraph{Test axes.} \emph{Distance} holds the content at the largest training load
+and inserts each task's own filler between the facts and their use, at $1\times$ to
+$64\times$ the training length: uniform random tokens for MQAR
+(excluding the sequence's keys, so every query keeps one answer), the noise token for
+copying, the garbage text for passkey. \emph{Load} raises the number of items with
+the filler at its training size; for MQAR this reproduces Zoology's test
+configurations (512 tokens with 128 pairs, 1024 with 256) and extends them to 2048
+with 512. Every model sees byte-identical evaluation sequences, derived from a fixed
+seed, the axis, its value and the sample index: 256 validation sequences drawn like
+the training data, and 128 test sequences per point.
+
+\paragraph{Models.} All synthetic models are pre-LayerNorm decoder-only transformers
+with width 128, 4 layers, 4 heads and an MLP ratio of 4. Baselines: NoPE; RoPE,
+evaluated as trained and with position interpolation and YaRN applied at test time;
+RoPE fine-tuned with YaRN, the standard recipe of~\citet{peng2024yarn}, in which each
+converged RoPE model is trained for 2000 further steps at $4\times$ the length with
+YaRN scaling and its selected learning rate; ALiBi; sliding-window NoPE (window 64);
+Infini-attention~\citep{munkhdalai2024leave} in every layer (segment 64, rotary positions
+within each segment, delta-rule memory; our implementation, as no official code exists); and a parameter-matched
+control, a two-layer MLP with the memory's parameter count (\ctrlParams{} against
+\memParams) in the memory's place. The memory models are NoPE + memory and sliding
+window + memory. A larger tier repeats MQAR at width 256 with 8 layers and 8 heads.
+
+\paragraph{Training.} AdamW~\citep{loshchilov2019decoupled} with
+$\beta=(0.9,0.95)$, weight decay 0.1 on attention, MLP and output matrices only (the
+memory and the matched control alike are not decayed), gradient clipping at 1.0,
+bf16 autocast, batch 64. The rate is constant after a 200-step warmup, and training
+stops once held-out validation accuracy reaches 99\% at two consecutive checks (one
+check every 1000 steps), or at 30{,}000 steps. Every check is logged.
+
+\paragraph{Selection.} Every model is trained on every task at rates
+$\{3\times10^{-4},10^{-3},3\times10^{-3}\}$ with seed 0. If the best rate lies at an
+edge of the grid without solving the task, one further rate past that edge
+($10^{-4}$ or $10^{-2}$, Zoology's sweep range) is trained and joins the selection.
+The rate with the best in-distribution validation accuracy is used for seeds 1 and 2;
+test axes are never used for selection. A model is compared beyond the training
+length only if it learns the task, i.e.\ reaches 90\% validation accuracy.
+Table~\ref{tab:lr} lists the selected rates.
+
+\paragraph{Language model.} Character-level enwik8~\citep{mahoney2011large} with the
+standard 90M/5M/5M split; width 256, 6 layers, 8 heads, window 128; trained at 512
+characters, batch 32, 20{,}000 steps with a cosine schedule; rates swept over 4000
+steps at $\{3\times10^{-4},10^{-3},2\times10^{-3}\}$ with the same edge rule
+($10^{-4}$ or $4\times10^{-3}$) and selected by validation loss; three seeds.
+
+\section{Results}
+\label{sec:results}
+
+\subsection{Distance and load}
+\label{sec:distance}
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\linewidth]{figs/distance.pdf}
+\caption{Accuracy against evaluation length for the models that learn each task
+(means over three seeds). RoPE + YaRN is applied at test time; the fine-tuned YaRN
+model is trained at $4\times$ the length.}
+\label{fig:distance}
+\end{figure}
+
+Tables~\ref{tab:mqar} and~\ref{tab:passkey} and Figure~\ref{fig:distance} show the
+two retrieval tasks. On MQAR, both memory models hold \memMqarDistSixtyFour\% at
+$64\times$ the training length and \memMqarLoadEight\% with $8\times$ the pairs. Every
+positional scheme falls short along at least one axis. RoPE collapses beyond its training
+length (\RopeMqarDistSixtyFour\% at $64\times$); YaRN at test time recovers part of
+the distance axis (\RopeYarnMqarDistSixtyFour\%); ALiBi learns the task and then
+suppresses distant facts by construction (\AlibiMqarDistSixtyFour\%). The strongest
+baseline, RoPE fine-tuned with YaRN at $4\times$ the length, reaches
+\YarnFtMqarDistSixtyFour\% on distance but \YarnFtMqarLoadEight\% on load: training at a
+longer length extends the reach of its positions, not the number of facts it can
+hold. The memory model, trained only at 256 tokens, does both. NoPE without the
+memory does not reliably learn MQAR, and neither does the parameter-matched control
+in the memory's place, so the memory's contribution is not one of parameter count.
+Sliding-window attention and Infini-attention do not learn the task at all.
+
+On passkey retrieval, NoPE + memory is at \memPasskeyDistSixtyFour\% at every
+distance through $64\times$, where NoPE alone falls to \NopePasskeyDistSixtyFour\%, RoPE
+with YaRN at test time to \RopeYarnPasskeyDistSixtyFour\%, ALiBi to
+\AlibiPasskeyDistSixtyFour\%, and fine-tuned YaRN to \YarnFtPasskeyDistSixtyFour\%.
+
+\input{tables/mqar}
+\input{tables/passkey}
+
+\subsection{Extreme length}
+\label{sec:extreme}
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=0.72\linewidth]{figs/extreme.pdf}
+\caption{Passkey retrieval from $16$K to $2^{20}$ tokens, trained at 256 (means over
+the seeds in Table~\ref{tab:extreme}).}
+\label{fig:extreme}
+\end{figure}
+
+The passkey checkpoints were evaluated at $2^{14}$ to $2^{20}$ tokens
+(Table~\ref{tab:extreme}, Figure~\ref{fig:extreme}). NoPE + memory retrieves the
+passkey at one million tokens with \extMemOneMSeeds\% digit accuracy on its three
+seeds, $4096\times$ the length it was trained on. The same transformer without the
+memory scores \extNopeOneM\% at that length, and no baseline exceeds
+\extBaselineMax\% at any length from $16$K tokens on. Sliding window + memory, whose
+attention sees only 64 tokens, still retrieves the key at $2^{19}$ tokens
+(\extSwaMemHalfM\% on its three seeds). One forward pass of NoPE + memory over
+$2^{20}$ tokens took about \extMemOneMSec~s on a single NVIDIA L4, with exact full
+attention and an exact read.
+
+\input{tables/extreme}
+
+\subsection{Scale}
+\label{sec:scale}
+
+At width 256 with 8 layers, with its own sweep and seeds (Table~\ref{tab:scale}), the
+picture is unchanged: NoPE + memory holds \memScaleDistSixtyFour\% at $64\times$ and
+\memScaleLoadEight\% at $8\times$ load (sliding window + memory
+\swaMemScaleDistSixtyFour\% at $64\times$), against at most
+\bestBaseScaleDistSixtyFour\% and \bestBaseScaleLoadEight\% for any positional
+baseline. At this size NoPE learns the task in distribution, and its accuracy still
+falls with distance and load; the memory is what holds it.
+
+\input{tables/scale}
+
+\subsection{Placement}
+\label{sec:placement}
+
+Table~\ref{tab:placement} places the single memory at the front, middle and back of
+the stack on MQAR, with the matched control at the same place. The front is best on
+every measure. It learns fastest, solving the task in \frontSolveSteps{} steps on
+every seed against \middleSolveSteps{} in the middle, and it extrapolates furthest:
+\memMqarDistSixtyFour\% at $64\times$ against \placeMiddleDistSixtyFour\% in the middle
+and \placeBackDistSixtyFour\% at the back, and \memMqarLoadEight\% at $8\times$ load
+against \placeMiddleLoadEight\% and \placeBackLoadEight\%. In the middle, the
+sliding-window host still holds load (\placeSwaMiddleLoadEight\%). Every placement
+learns the task at the training length; only the front and middle placements carry
+it far beyond. A second memory at the back, added to the front one, reaches
+\xTwoDistSixtyFour\% at $64\times$, against \memMqarDistSixtyFour\% for the front memory
+alone: one memory suffices.
+
+\input{tables/placement}
+
+\subsection{Copying and selective copying}
+\label{sec:copy}
+
+Except for the two sliding-window models, every model trained at 256 tokens learns
+copying there (Table~\ref{tab:copy}). Beyond it, NoPE + memory keeps \memCopyDistTwo\%
+at $2\times$, above NoPE, every RoPE variant and the matched control, while
+Infini-attention (\infiniCopyDistTwo\%) and ALiBi (\alibiCopyDistTwo\%) extrapolate
+further. Sliding window + memory does not learn copying at the training length
+(\swaMemCopyVal\%). Selective copying is learned at 256 tokens by every model trained there
+except plain sliding-window attention, and extrapolated by none: the best model at
+$2\times$ reaches \bestSelDistTwo\% (Table~\ref{tab:selcopy}).
+Section~\ref{sec:discussion} returns to these two tasks.
+
+\subsection{Language modelling}
+\label{sec:lm}
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=0.72\linewidth]{figs/lm_position.pdf}
+\caption{enwik8 test loss by position over sequences of $32\times$ the training length
+(means over three seeds; running mean over 32 positions). The dotted line marks the
+training length.}
+\label{fig:lm}
+\end{figure}
+
+On enwik8 (Table~\ref{tab:lm}, Figure~\ref{fig:lm}), NoPE + memory reaches
+\lmMemBpc{} bits per character at the training length, level with the positional
+models (RoPE \lmRopeBpc, ALiBi \lmAlibiBpc) and with sliding window + memory
+(\lmSwaMemBpc), without any positional encoding. NoPE alone (\lmNopeBpc) and NoPE with
+the matched MLP in the memory's place (\lmCtrlBpc) are far behind, so the memory is
+what makes a position-free language model competitive. On the exact passkey prompt
+of~\citet{mohtashami2023landmark} at the training length, NoPE + memory and ALiBi
+lead at \lmMemPkOne\%.
+
+Beyond the training length, the test loss of NoPE + memory rises from \lmMemFirst{} to
+\lmMemLast{} bits per character at $16$--$32\times$. That is well below its matched
+control (\lmCtrlFirst{} to \lmCtrlLast) and RoPE as trained (\lmRopeLast), but above
+RoPE with YaRN at test time (\lmRopeYarnLast) and the models whose attention is
+restricted to recent context: ALiBi stays flat (\lmAlibiFirst{} to \lmAlibiLast), and
+sliding window + memory rises only to \lmSwaMemLast. On natural text at this
+scale, the memory gives a position-free model language-modelling quality equal to
+positional ones within the training length; holding that quality at many times the
+training length is the open part of the language-modelling result.
+
+\input{tables/lm}
+
+\section{Admission and cost}
+\label{sec:cost}
+
+The read's work is proportional to the sequence length times the size of the
+admitted bank. Table~\ref{tab:bank} reports the bank as a fraction of the length,
+measured one sequence at a time. With full attention in the host, the memory admits
+almost every write on MQAR and copying, so its cost grows with the square of the
+length, as attention's does; on passkey it admits \bankPasskeyMem{} of the length.
+With a sliding-window host, admission is selective on passkey (\bankPasskeySwaMem{} at
+$64\times$), copying and selective copying, and the fraction is set by the task, not
+by the length: it is nearly the same at $1\times$ and $64\times$.
+
+In memory, a sliding window + memory model holds the attention keys and values of
+its last 64 tokens per layer plus the admitted writes, at most two $H$-wide vectors
+per admitted entry (the write and its successor, for the induction read). A
+full-attention transformer holds $2LH$ values per token across $L$ layers. At long
+lengths the sliding window + memory model therefore needs at most $1/L$ of the state
+of a full key--value cache, a quarter with $L=4$, and less where admission is
+selective; its per-token state does not depend on the number of layers. NoPE +
+memory keeps a full cache in addition to its bank. We report costs in these hardware-independent units; the reference implementation used
+here processes $2^{20}$ tokens in about \extMemOneMSec~s on one L4
+(Section~\ref{sec:extreme}).
+
+\input{tables/bank}
+
+\section{Discussion}
+\label{sec:discussion}
+
+Positional encodings were introduced to give attention a sense of order. They also
+gave it a ruler, and every ruler has an end. The memory studied here supplies order
+differently. Within a context, causal attention and the causal mask provide local
+structure. Across a context of any length, retrieval is by content. The resulting
+model has no index to run out of, and on the retrieval tasks it does not need one:
+it holds what it learned at 256 tokens at a million.
+
+\paragraph{Placement is a choice of address.} At the front, the memory reads token
+embeddings, so each write is addressed by the identity of a single token. That is
+exactly the address MQAR and passkey need, and it is where the memory learned
+fastest and generalized furthest. Copying and language modelling ask for a different
+address. In copying, every marker token is identical, so at the front each marker
+presents the same query to the memory, and order must come from the attention above
+it. In character-level text, a single character is a weak address. In the middle of
+the stack, attention has already placed each token in its context, so the write and
+the query carry that context. The language model and the copying tasks were run with
+the memory at the front only; whether a middle placement extends the
+language-modelling and copying results the way the front placement extends recall is
+the direct next experiment, and nothing in the interface prevents it.
+
+\paragraph{Limitations.} The models are small: width 128 with 4 layers, a tier at
+width 256 with 8 layers, and a 6-layer character-level language model. The language
+model matches positional models within its training length but its loss rises beyond
+it, unlike models with a recency bias. On copying, two baselines extrapolate further,
+and no model extrapolates selective copying. With a full-attention host the memory
+admits nearly every write, so it does not reduce the asymptotic cost of attention.
+Infini-attention is our implementation. At $2^{20}$ tokens the reference
+sliding-window and segment kernels exceeded a CUDA launch limit, so those models have
+no result at that length, and the extreme-length baselines were run with one seed.
+
+\paragraph{Reproducibility.} The protocol (\texttt{paper3/reproduce/matrix\_protocol.json})
+declares every run; \texttt{run.py} executes and resumes it; and
+\texttt{generate\_results.py} builds every table, figure and number in this paper from
+the collected run records, which are released with it. The DABSN framework,
+paper source, run records and reproduction code are available at
+\url{https://github.com/BleedingXiko/dabsn}.
+
+\clearpage
+\appendix
+\section{Additional tables}
+\floatplacement{table}{H}
+
+\input{tables/copy}
+\input{tables/selcopy}
+\input{tables/lr}
+\clearpage
+
+\begin{thebibliography}{99}
+
+\bibitem[Arjovsky et~al.(2016)]{arjovsky2016unitary}
+Martin Arjovsky, Amar Shah, and Yoshua Bengio. Unitary evolution recurrent neural
+networks. In \emph{ICML}, 2016.
+
+\bibitem[Arora et~al.(2024)]{arora2024zoology}
+Simran Arora, Sabri Eyuboglu, Aman Timalsina, Isys Johnson, Michael Poli, James
+Zou, Atri Rudra, and Christopher R\'e. Zoology: Measuring and improving recall in
+efficient language models. In \emph{ICLR}, 2024.
+
+\bibitem[Beltagy et~al.(2020)]{beltagy2020longformer}
+Iz Beltagy, Matthew~E. Peters, and Arman Cohan. Longformer: The long-document
+transformer. arXiv:2004.05150, 2020.
+
+\bibitem[Bulatov et~al.(2022)]{bulatov2022recurrent}
+Aydar Bulatov, Yuri Kuratov, and Mikhail~S. Burtsev. Recurrent memory transformer.
+In \emph{NeurIPS}, 2022.
+
+\bibitem[Chen et~al.(2023)]{chen2023extending}
+Shouyuan Chen, Sherman Wong, Liangjian Chen, and Yuandong Tian. Extending context
+window of large language models via positional interpolation. arXiv:2306.15595,
+2023.
+
+\bibitem[Gu and Dao(2023)]{gu2023mamba}
+Albert Gu and Tri Dao. Mamba: Linear-time sequence modeling with selective state
+spaces. arXiv:2312.00752, 2023.
+
+\bibitem[Gu et~al.(2022)]{gu2022efficiently}
+Albert Gu, Karan Goel, and Christopher R\'e. Efficiently modeling long sequences with
+structured state spaces. In \emph{ICLR}, 2022.
+
+\bibitem[Haviv et~al.(2022)]{haviv2022transformer}
+Adi Haviv, Ori Ram, Ofir Press, Peter Izsak, and Omer Levy. Transformer language
+models without positional encodings still learn positional information. In
+\emph{Findings of EMNLP}, 2022.
+
+\bibitem[Kazemnejad et~al.(2023)]{kazemnejad2023impact}
+Amirhossein Kazemnejad, Inkit Padhi, Karthikeyan Natesan~Ramamurthy, Payel Das,
+and Siva Reddy. The impact of positional encoding on length generalization in
+transformers. In \emph{NeurIPS}, 2023.
+
+\bibitem[Loshchilov and Hutter(2019)]{loshchilov2019decoupled}
+Ilya Loshchilov and Frank Hutter. Decoupled weight decay regularization. In
+\emph{ICLR}, 2019.
+
+\bibitem[Mahoney(2011)]{mahoney2011large}
+Matt Mahoney. Large text compression benchmark.
+\url{http://mattmahoney.net/dc/text.html}, 2011.
+
+\bibitem[Mohtashami and Jaggi(2023)]{mohtashami2023landmark}
+Amirkeivan Mohtashami and Martin Jaggi. Landmark attention: Random-access infinite
+context length for transformers. In \emph{NeurIPS}, 2023.
+
+\bibitem[Munkhdalai et~al.(2024)]{munkhdalai2024leave}
+Tsendsuren Munkhdalai, Manaal Faruqui, and Siddharth Gopal. Leave no context
+behind: Efficient infinite context transformers with infini-attention.
+arXiv:2404.07143, 2024.
+
+\bibitem[Olsson et~al.(2022)]{olsson2022context}
+Catherine Olsson, Nelson Elhage, Neel Nanda, et~al. In-context learning and
+induction heads. \emph{Transformer Circuits Thread}, 2022.
+
+\bibitem[Peng et~al.(2024)]{peng2024yarn}
+Bowen Peng, Jeffrey Quesnelle, Honglu Fan, and Enrico Shippole. YaRN: Efficient
+context window extension of large language models. In \emph{ICLR}, 2024.
+
+\bibitem[Press et~al.(2022)]{press2022train}
+Ofir Press, Noah~A. Smith, and Mike Lewis. Train short, test long: Attention with
+linear biases enables input length extrapolation. In \emph{ICLR}, 2022.
+
+\bibitem[Rosdahl(2026)]{rosdahl2026dabsn}
+Nicholas Rosdahl. One layer, both gaps: A persistent-modulation recurrence that
+generalizes copy and tracks non-solvable group state. 2026.
+Paper and reproduction source:
+\url{https://github.com/BleedingXiko/dabsn/tree/main/paper1}.
+Archived at \href{https://doi.org/10.5281/zenodo.21391204}{doi:10.5281/zenodo.21391204}.
+
+\bibitem[Su et~al.(2024)]{su2021roformer}
+Jianlin Su, Yu~Lu, Shengfeng Pan, Ahmed Murtadha, Bo~Wen, and Yunfeng Liu.
+RoFormer: Enhanced transformer with rotary position embedding.
+\emph{Neurocomputing}, 568:127063, 2024. arXiv:2104.09864.
+
+\bibitem[Vaswani et~al.(2017)]{vaswani2017attention}
+Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob Uszkoreit, Llion Jones, Aidan~N.
+Gomez, {\L}ukasz Kaiser, and Illia Polosukhin. Attention is all you need. In
+\emph{NeurIPS}, 2017.
+
+\bibitem[Wu et~al.(2022)]{wu2022memorizing}
+Yuhuai Wu, Markus~N. Rabe, DeLesley Hutchins, and Christian Szegedy. Memorizing
+transformers. In \emph{ICLR}, 2022.
+
+\end{thebibliography}
+\end{document}

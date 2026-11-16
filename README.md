@@ -1,989 +1,414 @@
 # DABSN
 
-**A recurrent modeling framework for persistent state and admitted memory.**
+**Persistent state, admitted memory, parametric Capacity, and online learning.**
 
-DABSN is a PyTorch architecture for causal sequences, whole fields, and
-structured data that mixes both. Its core maintains a nonlinear recurrent
-state while its read system combines admitted short memory, successor
-induction, permanent associative memory, and a recurrent long-memory channel.
-The same block design is used across all three geometries.
+DABSN is a PyTorch framework built around a nonlinear recurrent core and
+content-addressed memory. A block learns persistent state and selectively admits
+writes to memory. Native **Capacity** adds dense or geometrically sparse
+recurrent features inside that block, with separate controls for total stored
+rows and rows active per input. Online temporal credit carries learning state
+beyond the retained computation graph.
 
-The library includes native C++/OpenMP CPU kernels and Triton/CUDA kernels for
-forward and backward execution, task-owned input and output adapters, structured
-checkpoints, distributed execution, inference and gradient-verification
-utilities, and the complete source and result tables for the accompanying paper.
+Use a DABSN block directly, compose it with other processing, or use
+`DABSNHostMemory` to bring the admitted read into an existing architecture.
 
-DABSN is also a **composition framework**. A model is an ordered graph of
-components with declared contracts, and DABSN is one component in it — so a
-sparse mixture of experts, attention, a transformer, a CNN, or an architecture
-nobody has written yet composes with DABSN through a registered provider,
-without a core edit or a special loader, and saves and reloads through the
-ordinary checkpoint path. See [Composing architectures](#composing-architectures).
+A transformer with one DABSN memory branch and no positional encoding has no
+architectural context cap. Trained at 256 tokens, the paper-3 models retain
+**96.9% MQAR accuracy at 64× the training length**, **100% at 8× the stored
+pairs**, and **96–100% passkey digit accuracy at 1,048,576 tokens (4096×)**
+across three seeds. [Results and limits](#papers).
 
-Multi-GPU execution offers DDP and block-wrapped FSDP with full parameter,
-gradient, and optimizer sharding, plus tensor parallelism over the recurrent
-hidden dimension and expert parallelism over MoE experts.
+The framework includes native CPU and CUDA forward/backward kernels, component
+contracts, task adapters, SafeTensors checkpoints, and distributed execution.
+Models are ordinary `torch.nn.Module` objects; applications own their training
+loops, data, optimizers, and schedules.
 
-## New: online temporal credit and prepared memory
+## Install
 
-Optional dense and geometrically sparse Capacity is integrated beside native
-Read. See [Capacity configuration, training, and carried state](docs/capacity.md)
-and the [training example](examples/capacity_train.py).
-
-The current source adds two framework capabilities:
-
-- **Architecture-specific online temporal credit:** `temporal_credit="online"`
-  runs the DABSN core with carried eligibility state and bounded autograd chunks.
-  It includes native C++ core replay and a CUDA path using a precise Triton
-  forward tape and native chunk-contracted replay. The long-memory recurrence also
-  carries eligibility. MLPs, MoEs, projections and heads keep ordinary spatial
-  autograd; they are not part of `DABSNCore`.
-- **Prepared dynamic inference memory:** prepare an existing memory once, then
-  query or extend admitted-event pages without rebuilding historical admission.
-  Each page computes its query/content score once for all three reads, preserving
-  the existing admission and chronological-successor semantics. No fixed top-k,
-  eviction, ANN or lossy compression is introduced. Existing training reads and
-  the default BPTT path remain unchanged.
-
-See the [API examples and contracts](docs/online-temporal-credit-and-prepared-memory.md)
-for state handling, native backends, checkpoint resume, and prepared `.dmem` files.
-
-The online core uses DABSN's structured eligibility rule; it is not a claim of
-generic exact RTRL or full-stack BPTT gradient equivalence. Eligibility storage
-is independent of elapsed context at fixed batch/parameter dimensions, but
-retained read-bank storage can still grow. Prepared carried-memory inference
-currently follows the existing sequence-geometry memory contract.
-
-Version 0.2.1 replaces unrolled online replay compilation with native scans and
-batched matrix contractions. FP16/BF16 models retain FP32 eligibility by default;
-eligibility precision is explicit and preserved across resets and checkpoints.
-
-### What this is, and what it is not
-
-DABSN is a **model and runtime library, not a training framework.** Every model
-is an ordinary `torch.nn.Module`: put it in your own loop, or in torchtitan,
-Lightning, or whatever you already use. The library owns the architecture, the
-kernels, the component ABI, checkpoints, and distributed execution — the parts
-that are specific to DABSN and that you cannot reasonably write yourself.
-
-It deliberately does not own your training loop. Data format, schedule,
-optimizer choice, logging cadence, and checkpoint policy are yours. The `train`,
-`pretrain`, and `finetune` entry points below are **convenience examples for the
-plain dense path**, kept because they are useful and tested — not a supported
-training product, and not the way to train a composed architecture. Reach past
-them the moment your run needs something they do not do.
-
-## Paper
-
-### One Layer, Both Gaps
-
-**A Persistent-Modulation Recurrence that Generalizes Copy and Tracks
-Non-Solvable Group State**
-
-The paper tests one architecture, trained separately per task, against two
-regimes commonly treated as opposing requirements:
-
-| Task | Train length | Evaluation length | DABSN result |
-| --- | ---: | ---: | ---: |
-| Copy, vocabulary 64 | 64 | 3,200 (50x) | 0.961 +/- 0.035, three seeds |
-| A5/60 word problem | 256 | 16,384 (64x) | 1.000, two seeds |
-
-These are separately trained models, not one checkpoint reused across tasks.
-The paper includes causal ablations of the nonlinear state and read pathways;
-the machine-readable tables used for every reported result are included with
-the source.
-
-- [Read the paper](https://github.com/BleedingXiko/dabsn/blob/main/paper1/main.pdf)
-- [Inspect the paper source and result tables](https://github.com/BleedingXiko/dabsn/tree/main/paper1)
-- [Read the architecture contract](https://github.com/BleedingXiko/dabsn/blob/main/ARCHITECTURE.md)
-
-## Installation
-
-Install DABSN into an environment containing the PyTorch build appropriate for
-your machine:
+Requires Python 3.10+ and PyTorch 2.6+. Install the PyTorch build appropriate for
+your machine, then:
 
 ```bash
 pip install dabsn
 ```
 
-Turing GPUs such as the GTX 1660 Ti use the final compatible Torch/Triton
-combination:
+For Turing GPUs such as T4 and GTX 1660 Ti:
 
 ```bash
 pip install 'dabsn[cuda-turing]'
 ```
 
-Python 3.10 or newer and PyTorch 2.6 or newer are required. Linux CUDA builds
-of PyTorch provide the matching Triton runtime. Native backend
-selection is explicit: `required=True` raises instead of silently switching to
-another runtime family.
+This pins PyTorch 2.6.0 and Triton 3.2.0 on Linux. Use FP16 on Turing; the
+persistent core is disabled on this pair and the batched core runs instead.
+The exact software pins and sm_75 kernel compilation were tested; physical T4
+execution was not.
 
-## Quick start
+## Quick start: one block with sparse Capacity
 
 ```python
 import torch
-
-from dabsn import DABSNLayerSpec, DABSNModel, dabsn_adamw_param_groups
-from dabsn.kernels import enable, status
-from dabsn.runtime import train_step
+from dabsn import CapacityConfig, build_dabsn
+from dabsn.kernels import enable
+from dabsn.runtime import build_training_optimizer
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 enable(device.type, required=True)
 
-model = DABSNModel(
-    input_dim=24,
-    out_dim=10,
-    layers=[
-        DABSNLayerSpec(128, 96, "seq"),
-        DABSNLayerSpec(192, 128, "seq"),
-    ],
+model = build_dabsn(
+    input_dim=8,
+    out_dim=3,
+    hidden_dim=32,
+    state_dim=24,
+    depth=1,
+    read_geometry="seq",
     output_adapter="token",
-    residual=True,
-    mlp_ratio=4.0,
+    capacity=CapacityConfig(mode="sparse", size=256, active_units=16),
 ).to(device)
 
-inputs = torch.randn(8, 256, 24, device=device)
-targets = torch.randint(0, 10, (8, 256), device=device)
-optimizer = torch.optim.AdamW(
-    dabsn_adamw_param_groups(model, weight_decay=0.1),
-    lr=1e-3,
-)
+inputs = torch.randn(2, 16, 8, device=device)
+targets = torch.randint(0, 3, (2, 16), device=device)
+optimizer = build_training_optimizer(model, lr=1e-3, weight_decay=0.0)
 
-loss = train_step(
-    model,
-    inputs,
-    targets,
-    optimizer,
-    clip_grad_norm=1.0,
-)
-
-print({"loss": loss, "backend": status()["active_backend"]})
+optimizer.zero_grad(set_to_none=True)
+logits = model.forward_sequence(inputs)
+loss = torch.nn.functional.cross_entropy(logits.flatten(0, 1), targets.flatten())
+loss.backward()
+optimizer.step()
 ```
 
-Every model is a normal `torch.nn.Module`. Use the supplied runtime helpers or
-an ordinary PyTorch training loop:
-[`examples/minimal_train.py`](https://github.com/BleedingXiko/dabsn/blob/main/examples/minimal_train.py)
-is the same step written with no DABSN helpers and no native backend.
+This constructs one DABSN block with 256 Capacity rows, 16 active per input.
+The combined optimizer prepares sparse row gradients during `step()`.
+The dimensions and optimizer settings illustrate the API. See
+[Capacity training](examples/capacity_train.py) and
+[minimal training without Capacity](examples/minimal_train.py).
 
-`residual=True` makes each block return `skip(x) + dabsn(x)`, using a learned
-bias-free projection only when the block changes width. `mlp_ratio=4.0` adds the
-fixed post-DABSN update `h + mlp(mlp_rmsnorm(h))`. The normalization exists only
-inside that MLP branch and never touches DABSN or the residual trunk. Set
-`mlp_ratio=None` (the default) for pure DABSN with no MLP parameters; both new
-settings default off so existing checkpoints retain their original architecture.
+## Inside a DABSN block
 
-For a DABSN front/rear pair with ordinary nonlinear processing in between, set
-`mlp_middle_depth` to the number of standalone residual MLP blocks and
-`mlp_depth_index` to the zero-based DABSN block after which they run. The middle
-blocks use the same `mlp_ratio`, RMSNorm, ReLU-squared, bias-free projections,
-and zero-initialized output projection as the post-DABSN branch:
+A block has distinct input, output, and recurrent-state widths. The core
+maintains baseline, energy, and saturation state. Read combines admitted content
+memory, successor induction, permanent associative memory, and a recurrent
+long-memory channel. Optional Capacity contributes alongside Read before the
+state-to-output-width projection:
 
-```python
-from dabsn import DABSNSequenceLM
-
-# DABSN[0] -> 20 MLP blocks -> DABSN[1]
-model = DABSNSequenceLM(
-    vocab=50_257,
-    hidden_dim=768,
-    depth=2,
-    layers="seq:768:768,seq:768:768",
-    residual=True,
-    mlp_ratio=4.0,
-    mlp_middle_depth=20,
-    mlp_depth_index=0,
-    tie_embeddings=False,
-)
+```text
+input ──┬── Core ──┬── expressed state ────────────────┐
+        │          └── Read (admitted + long memory) ──┼── sum → projection
+        └── Capacity (dense or sparse) ────────────────┘
 ```
 
-`layers` continues to list DABSN blocks only. With a middle depth of zero
-(the default), the insertion index has no effect and existing behavior is
-unchanged. Carried `.dmem` memory likewise remains one bank per DABSN block;
-the stateless middle MLPs add no per-token memory.
-
-## Model geometry
-
-Each layer owns an output width, recurrent-state width, and read geometry.
-Widths may change across a stack.
-
-| Geometry | Memory eligibility | Typical structure |
+| Geometry | Read eligibility | Intended structure |
 | --- | --- | --- |
-| `seq` | causal prefix | language, events, control streams |
-| `field` | whole object | images, boards, sets, spatial state |
-| `hybrid` | learned sequence/field mixture | structured streams with both relations |
+| `seq` | Causal prefix | Language, events, control streams |
+| `field` | Whole object | Images, boards, sets |
+| `hybrid` | Learned sequence/field mixture | Structured streams |
 
-Layer stacks can be written directly or parsed from compact specifications:
+`DABSNModel` handles continuous features, `DABSNSequenceLM` adds token
+embeddings and a language-model head, and `DABSNTaskModel` uses registered
+application-owned adapters. `residual=True` adds a block residual;
+`mlp_ratio` adds a residual MLP branch. The
+[architecture contract](ARCHITECTURE.md) describes the construction options.
 
-```python
-from dabsn import parse_dabsn_layer_specs
+## Capacity
 
-layers = parse_dabsn_layer_specs(
-    "seq:128:96,hybrid:192:128,field:128:96"
-)
-```
+Capacity expands a block's learned recurrent features while keeping the DABSN
+core width and number of DABSN scans unchanged. Its keys, biases, retention
+parameters, and output values are learned model parameters. Each feature has a
+recurrent value; selected features update from the current input and contribute
+to the block output.
 
-The outer model API is the same for every geometry. Geometry changes memory
-eligibility, not the recurrent block or checkpoint format.
+| Mode | Configuration | Execution |
+| --- | --- | --- |
+| Dense | `CapacityConfig(mode="dense", size=4096)` | Updates and reads every row |
+| Sparse | `CapacityConfig(mode="sparse", size=4096, active_units=64)` | Updates and reads exactly 64 geometrically selected rows per input |
 
-## Task adapters
+`size` controls total Capacity rows; `active_units` controls active rows in
+sparse mode. Fixed geometric addressing selects rows before the native key and
+output projections. Addressing is reproducible through `address_seed`, with
+flat and product addressing available. There is no learned router. Unselected
+features and eligibility rows retain their state.
 
-DABSN owns the recurrent body; applications own the meaning of their data.
-Input adapters transform raw task records into model-width features, and
-output heads transform hidden states into task predictions. Registered
-adapters become construction and checkpoint metadata rather than notebook-only
-glue.
+Total parameter and recurrent-state storage grows with `size`; sparse execution
+uses the selected rows. Output weights start at zero. Capacity is optional and
+works with `seq`, `field`, and `hybrid` Read geometries. Omitting its
+configuration creates no Capacity parameters.
 
-This example handles industrial telemetry with continuous measurements,
-elapsed time, sensor identity, and missingness. Its output jointly predicts an
-event class and a log-normal time-to-event distribution.
+Both BPTT and online temporal credit are supported, with reference, C++ CPU,
+and Triton CUDA paths. Use `build_training_optimizer`: sparse Capacity rows use
+SparseAdam with zero weight decay, while other parameters use AdamW. In custom
+AMP or clipping loops, call `prepare_gradients()` after accumulation and before
+unscaling or clipping. Model checkpoints preserve addressing and parameters;
+online checkpoints also preserve recurrent features and eligibility.
 
-```python
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
+See the [Capacity API and state contract](docs/capacity.md),
+[training example](examples/capacity_train.py), and
+[measured native throughput](#native-execution).
 
-from dabsn import DABSNLayerSpec, DABSNTaskModel
-from dabsn.adapters import register_input_adapter, register_output_head
+## Composition
 
-
-class TelemetryInput(nn.Module):
-    def __init__(self, raw_dim: int, model_dim: int, sensors: int = 32):
-        super().__init__()
-        if raw_dim != 8:
-            raise ValueError("expected five values, elapsed time, sensor ID, and mask")
-        self.output_dim = model_dim
-        self.sensors = sensors
-        self.value_norm = nn.LayerNorm(5)
-        self.sensor = nn.Embedding(sensors, 12)
-        self.missing = nn.Embedding(2, 4)
-        self.register_buffer("frequencies", torch.tensor([1., 2., 4., 8.]))
-        self.fuse = nn.Sequential(
-            nn.Linear(5 + 8 + 12 + 4, model_dim * 2),
-            nn.SiLU(),
-            nn.Linear(model_dim * 2, model_dim),
-            nn.LayerNorm(model_dim),
-        )
-
-    def forward(self, x):
-        values = self.value_norm(torch.nan_to_num(x[..., :5].float()))
-        elapsed = x[..., 5].float().clamp_min(0)
-        sensor = x[..., 6].long().clamp(0, self.sensors - 1)
-        missing = x[..., 7].long().clamp(0, 1)
-        phase = torch.log1p(elapsed).unsqueeze(-1) * self.frequencies
-        time = torch.cat([phase.sin(), phase.cos()], dim=-1)
-        return self.fuse(torch.cat([
-            values, time, self.sensor(sensor), self.missing(missing)
-        ], dim=-1))
-
-
-class EventForecast(nn.Module):
-    def __init__(self, hidden_dim: int, out_dim: int):
-        super().__init__()
-        self.classes = out_dim - 2
-        self.norm = nn.LayerNorm(hidden_dim)
-        self.event_logits = nn.Linear(hidden_dim, self.classes)
-        self.time_parameters = nn.Linear(hidden_dim, 2)
-
-    def forward(self, hidden):
-        hidden = self.norm(hidden)
-        return torch.cat([
-            self.event_logits(hidden), self.time_parameters(hidden)
-        ], dim=-1)
-
-    def unpack(self, output):
-        logits = output[..., :self.classes]
-        log_time_mean = output[..., -2]
-        log_time_scale = F.softplus(output[..., -1]) + 1e-4
-        return logits, log_time_mean, log_time_scale
-
-
-register_input_adapter(
-    "telemetry",
-    lambda raw_dim, model_dim: TelemetryInput(raw_dim, model_dim or raw_dim),
-)
-register_output_head("event_forecast", EventForecast)
-
-model = DABSNTaskModel(
-    raw_input_dim=8,
-    model_input_dim=96,
-    out_dim=6,  # four event classes plus two distribution parameters
-    layers=[
-        DABSNLayerSpec(96, 64, "seq"),
-        DABSNLayerSpec(128, 96, "seq"),
-    ],
-    input_adapter="telemetry",
-    output_adapter="event_forecast",
-)
-```
-
-The [complete telemetry example](https://github.com/BleedingXiko/dabsn/blob/main/examples/custom_adapter.py)
-includes synthetic data, the joint classification/distribution loss, and an
-optimizer step. A separate [local 2D field adapter](https://github.com/BleedingXiko/dabsn/blob/main/examples/field2d_local_adapter.py)
-demonstrates native neighborhood gather/scatter for spatial models.
-
-## Composing architectures
-
-The layer stack above builds "DABSN blocks, optionally with the same dense MLP
-after each one." That is the convenience path. Anything else — a sparse mixture
-of experts, an attention block, a transformer, a CNN, an SSM, several of them
-mixed — is an **ordered graph of components**, and DABSN is one component in it.
-
-Adding an architecture requires no core edit, no DABSN kernel, no `if attention`
-branch in the framework, and no special model loader. Components declare what
-they accept and produce, the graph validates every edge when the model is built,
-and the checkpoint carries enough to rebuild the whole thing.
+For mixed architectures, `DABSNGraph` composes registered components with
+declared input/output contracts. DABSN, MLPs, sparse MoEs, and third-party
+attention, CNN, or SSM components share the same graph and checkpoint path:
 
 ```python
-import torch
-
-from dabsn.checkpoint import save_graph, load_graph
 from dabsn.components import BuildContext, ComponentSpec, component_registry
 from dabsn.graph import DABSNGraph
 
-component_registry.discover()
-context = BuildContext(device=torch.device("cuda"), dtype=torch.bfloat16)
-
-dabsn = component_registry.build(
-    ComponentSpec("dabsn.0", "dabsn:block", {
-        "input_dim": 768, "hidden_dim": 768, "state_dim": 768,
+context = BuildContext(device=device, dtype=torch.float32)
+specs = [
+    ComponentSpec("state", "dabsn:block", {
+        "input_dim": 128, "hidden_dim": 128, "state_dim": 96,
         "read_geometry": "seq", "residual": True,
     }),
-    context,
-)
-experts = component_registry.build(
-    ComponentSpec("moe.0", "dabsn:sparse_moe", {
-        "hidden_dim": 768, "experts": 24, "top_k": 4, "inner_dim": 3072,
+    ComponentSpec("experts", "dabsn:sparse_moe", {
+        "hidden_dim": 128, "experts": 8, "top_k": 2, "inner_dim": 512,
         "router": "switch", "balance_coefficient": 0.01,
     }),
-    context,
+]
+graph = DABSNGraph(
+    [component_registry.build(spec, context) for spec in specs],
+    require_world_builder=True,
 )
-
-graph = DABSNGraph([dabsn, experts], require_world_builder=True)
-save_graph(graph, "arch.safetensors")
-restored = load_graph("arch.safetensors")
 ```
 
-### Mixture of experts
+The built-in MoE is dropless and routes each hidden vector independently:
+`[B,T,H] → [B*T,H]`. Built-in experts are grouped ReLU-squared MLPs;
+registered `expert_specs` may supply other architectures under the
+two-axis routed-item contract. Routing is data-dependent, so whole-body
+compilation and CUDA-graph capture require capabilities explicitly declared by
+the component.
 
-`dabsn:sparse_moe` routes each item to `top_k` of `experts` and is **dropless**:
-exactly `N x K` assignments are produced for `N` items, so the assignment buffer
-is a static shape even though per-expert counts vary. No capacity factor and no
-token dropping on the default path.
+See the [architecture contract](ARCHITECTURE.md),
+[component ABI](docs/dabsn-2.0/component-abi.md),
+[MoE contract](docs/dabsn-2.0/native-moe.md),
+[custom task adapter](examples/custom_adapter.py), and
+[local 2D field adapter](examples/field2d_local_adapter.py).
 
-Two routers are selectable, and neither is imposed: `"switch"` carries an
-explicit load-balance loss, `"aux_loss_free"` updates a per-expert selection
-bias after real optimizer steps. Routing returns expert counts and shares,
-balance entropy, cold-expert count, busiest and quietest share, selected
-confidence, and output-norm differentiation.
+## Memory for an existing host
 
-#### What a routed item is
-
-Read this before sizing anything. The component flattens **every leading axis**
-and routes each hidden vector independently:
-
-```
-value in    [B, T, H]        the world at every position
-flatten     [B*T, H]         N = B*T routed items, one per position
-router      [N, K] indices   each item picks its own top_k experts
-experts     [N, H] -> [N, H] every expert sees items, never a batch or a sequence
-scatter     [B, T, H]        weighted sum back into the original shape
-```
-
-The count that matters is `B * T * top_k`, and it is large: a batch of 8 over a
-512-position window with `top_k=2` is 4,096 routed items and 8,192 expert calls
-in a single forward. An expert whose cost looks fine once is called thousands of
-times. Size experts against `N`, never against the batch.
-
-`H` is the only axis an expert sees. There is no time axis inside an expert and
-there cannot be one: routing is per position, so an item is one complete
-`H`-world, already causal because DABSN built it that way upstream. An expert
-that wants an internal sequence has to make one out of `H` itself.
-
-#### The expert contract
-
-The built-in `inner_dim` experts are grouped ReLU-squared MLPs. **An expert does
-not have to be an MLP.** Replace `inner_dim` with `expert_specs` — one provider
-spec per expert — and an expert becomes any registered component: an attention
-block, a whole transformer, a CNN, another MoE, or your own module.
-
-An expert provider must declare the **routed-item** contract, two axes, not the
-three-axis world contract that graph-level components use:
+`DABSNHostMemory` is the canonical DABSN read behind two projections and four
+scalar tags derived from host latents. It instantiates no DABSN core.
 
 ```python
-from dabsn.components import AxisContract, ComponentContract, ValueContract
+from dabsn import DABSNHostMemory
 
-def routed_item(width: int) -> ValueContract:
-    return ValueContract.tensor(
-        AxisContract("dabsn:routed_item", "N", dynamic=True),
-        AxisContract("world", width),
-    )
-
-class AttentionExpertProvider:
-    provider_key = "yourpkg.attention_expert"
-    component_abi_version = 2
-    config_schema_version = 1
-    capabilities = ComponentCapabilities(eager=True, amp_bf16=True, amp_fp32=True)
-
-    def validate_config(self, config):
-        if int(config["width"]) <= 0:
-            raise ValueError("width must be positive")
-
-    def contract(self, config):
-        item = routed_item(int(config["width"]))
-        return ComponentContract(item, item)     # [N, H] in, [N, H] out
-
-    def build(self, config, context):
-        return AttentionExpert(int(config["width"]), int(config["d_model"]))
-
-    def migrate_config(self, old_version, config):
-        return dict(config)
+h = torch.randn(2, 256, 128)  # [batch, positions, host width]
+norm = torch.nn.LayerNorm(128)
+memory = DABSNHostMemory(dim=128)
+h = h + memory(norm(h))
 ```
 
-**The graph-level built-ins are not usable as experts.** `dabsn:block` and
-`dabsn:residual_mlp` declare `[batch, experience, world]`, three axes, so
-`expert_specs` rejects them:
+The module returns only the memory branch; the host chooses its residual,
+normalization, and placement. Query/write projections start as identity maps,
+and the learned admission window starts at 1.5. The default geometry is causal
+`seq`; `field` and `hybrid` are also supported. The graph provider
+`dabsn:host_memory` adds the residual at the composition boundary.
 
-```
-ValueError: expert 0 contract must preserve routed [N,H] worlds;
-input=('leaf 0 rank expected 2, received 3',)
-```
+Admission depends on content. At fixed width, reading a sequence costs
+`O(T * N)` for `T` positions and `N` admitted entries; querying an existing
+bank costs `O(N)`. The bank can grow with history, and admitting a constant
+fraction of positions makes sequence read work quadratic.
 
-That is the contract system working. A component built to consume a sequence of
-worlds is not a component that consumes one world, and silently reinterpreting
-the axes would be the bug. If you want a ReLU-squared MLP as one entry in a
-mixed matrix, write a routed-item provider for it — `expert_specs` is
-all-or-nothing, so the built-in grouped MLP is unavailable the moment you use it.
+## Online learning and carried state
 
-```python
-attention = {
-    "provider_key": "yourpkg.attention_expert", "provider_distribution": "yourpkg",
-    "provider_version": "1.0.0", "component_abi_version": 2,
-    "config_schema_version": 1,
-    "config": {"width": 768, "d_model": 512},
-}
-mlp = {
-    "provider_key": "yourpkg.mlp_expert", "provider_distribution": "yourpkg",
-    "provider_version": "1.0.0", "component_abi_version": 2,
-    "config_schema_version": 1,
-    "config": {"width": 768, "inner": 3072},
-}
+`temporal_credit="online"` carries architecture-specific eligibility across
+bounded autograd chunks. `"bptt"` is the default. For batch size `B`, input
+width `I`, and state width `S`, the core's carried learning object `E`
+contains exactly `B * (2*S*I + 2*S² + 60*S)` scalars, independent of elapsed
+history. MLPs, MoEs, projections, and heads use ordinary autograd within chunks.
 
-ComponentSpec("moe.0", "dabsn:sparse_moe", {
-    "hidden_dim": 768, "experts": 4, "top_k": 2,
-    "router": "switch", "balance_coefficient": 0.01,
-    "expert_specs": [mlp, attention, mlp, attention],   # heterogeneous
-})
-```
+This structured rule is not generic exact RTRL or full-stack BPTT gradient
+equivalence. Stable stream identities and explicit lane resets are required
+when carrying state between batches. Eligibility defaults to FP32 for
+FP16/BF16 recurrent storage; the separate admitted read bank can still grow.
 
-Those specs are the checkpoint. A model whose experts are half attention and
-half MLP saves and reloads through the ordinary path, because the loader
-rebuilds each expert from its provider key rather than from a hardcoded list of
-architectures DABSN knows about. Loading it requires naming those providers in
-`trusted_providers`, because reconstruction runs their code.
+Prepared inference memory computes historical admission once, then supports
+queries and extensions over exact admitted-event pages. It introduces no
+fixed top-k, eviction, or lossy compression. This `.dmem` path currently
+supports the sequence-geometry, legacy-constructor memory contract.
 
-#### Costs you inherit by mixing kinds
+See [online training, exact resume, and prepared memory](docs/online-temporal-credit-and-prepared-memory.md)
+for executable examples and state ownership.
 
-- **The fused path is gone.** With `inner_dim`, all experts are one
-  `torch._grouped_mm` over stacked weights. One grouped matmul cannot run an MLP
-  and an attention block, so `expert_specs` dispatches with a per-expert loop.
-  Correct, and slower per expert than the homogeneous path.
-- **Output dtype is the group's problem, not yours.** Under autocast an expert
-  returns the autocast dtype while routed items are still the master dtype.
-  `GenericExpertGroup` casts each result to the output buffer before scattering,
-  so an expert may return bf16 from an fp32 input without a dtype error.
-
-#### The balance coefficient is not the Switch paper's
-
-`switch` routing computes `coefficient * E * sum(dispatch_share * prob_share)`,
-where **`dispatch_share` sums to 1** — the one-hot assignments are averaged over
-`N * K`, not over `N`. Many hand-written implementations average over `N`, which
-makes their shares sum to `top_k`.
-
-Same formula, a factor of `top_k` apart, on identical logits:
-
-| | sum of dispatch share | balance term |
-| --- | ---: | ---: |
-| averaged over `N * K` (this component) | 1.0 | `x` |
-| averaged over `N` (common variant) | `top_k` | `top_k * x` |
-
-So a coefficient carried over from an `N`-averaged implementation applies
-`1 / top_k` of the pressure it did there. Multiply by `top_k` when porting one,
-or tune it here directly. The `cold_experts` and `busiest_share` reports are what
-tell you whether the value you chose is doing anything.
-
-#### Do not compile a sparse MoE body
-
-Routing is data-dependent: which expert runs, and on how many items, is known
-only at runtime. Every routed expert is therefore its own graph break. With a
-`expert_specs` matrix the component declares `compile_fullgraph=False` and
-`cuda_graph=False`, and the conformance report says so rather than claiming
-otherwise.
-
-Wrapping such a body in `torch.compile` anyway does not fail — it graph-breaks.
-What it costs is compilation time proportional to the number of experts, spent
-producing graphs that need not be faster than eager. Measure before assuming it
-helps; on a many-expert body it usually does not.
-
-Run the MoE body eager. The DABSN scan keeps its own internal CUDA graphs
-regardless, which is where the recurrence speed comes from — you are not giving
-that up.
-
-Routing granularity is explicit component configuration. The built-in component
-routes individual hidden vectors; structure-native routing belongs to a provider
-that declares that contract rather than being silently assumed.
-
-### Writing a provider
-
-A provider owns config validation, the contract its config implies,
-construction, and config-schema migration. Registering one makes an architecture
-addressable by name, portable in checkpoints, and subject to the same
-conformance matrix as the built-ins:
-
-```python
-from dabsn import check_component
-from dabsn.components import component_registry
-
-component_registry.register(MyProvider(), distribution="mypkg", version="1.0.0")
-report = check_component("mypkg.my_component", config, device="cuda")
-print(report.to_dict())
-```
-
-`check_component` runs the declared capability matrix — build and schema,
-dynamic axes, whole-graph compile, export, AMP, streaming state, determinism,
-FSDP wrapping. A capability the provider does not claim is reported as a skip,
-never as a pass. Loading a checkpoint that names a third-party provider requires
-passing it in `trusted_providers`, because reconstruction runs its code.
-
-The conformance runner derives the shape it expects from your declared contract,
-including `AxisEffect.COLLAPSE`: an axis marked collapsed is expected to come
-back with length one. Declare the effect on any axis your component reduces, or
-the shape checks will expect the input length and fail a component that is
-behaving correctly.
-
-Note that data-dependent dispatch — sparse routing, where per-expert counts are
-known only at runtime — cannot be traced whole-graph or exported. That is a
-declared property of such components, not a defect, and the conformance report
-says so rather than claiming otherwise.
-
-## Native runtimes
+## Native execution
 
 ```python
 from dabsn.kernels import enable, status
 
-enable("cuda", required=True)   # CUDA/Triton + batched-GEMM forward/backward
-# enable("cpu", required=True)  # C++/OpenMP forward and backward
-# enable("reference")           # explicit PyTorch reference runtime
-
+enable("cuda", required=True)   # Triton/CUDA
+# enable("cpu", required=True)  # C++/OpenMP
+# enable("reference")          # PyTorch reference
 print(status())
 ```
 
-Backend activation is process-wide because it installs model dispatch hooks.
-Requested native execution never silently falls back. The status report names
-the active implementation for the core scan, admitted read, permanent memory,
-long-memory recurrence, and local-field gather.
+Backend activation is process-wide. Required native execution raises rather
+than silently switching runtime families. CUDA paths include a persistent
+core scan and BPTT reverse, fused online replay, a fused three-way admitted
+read, coupled long-memory scans, and grouped Capacity GEMMs. Read backward
+recomputes scores without materializing a full `[B,T,N]` score tensor.
 
-CUDA training dispatch is execution-shape aware. Small batches use the
-persistent Triton scan. Batches of 64 or more use the batched recurrent runtime,
-which shares each recurrent-matrix read across the device batch through GEMM;
-this changes neither the DABSN equations nor model depth. For modest training
-score tensors (up to 8,388,608 `[B,T,N]` entries by default), admitted-read
-forward and backward use native BMM instead of pairing a tiled forward with the
-older serial-query backward. The controls are explicit when a benchmark needs
-to pin them:
+On supported configurations, fused kernels use deterministic reductions
+without data atomics and support CUDA-graph capture. BPTT core GEMMs, fused
+reads, and grouped Capacity GEMMs use 16-bit operands under FP16/BF16 autocast
+with FP32 accumulation. The online core retains FP32 operands and tapes.
+FP32 GEMMs follow `torch.get_float32_matmul_precision()`.
 
 ```bash
-export DABSN_CORE_BACKEND=batched       # auto | batched | persistent | batched_fused
-export DABSN_BATCHED_STEP_COMPILE=1     # compile only the pure pointwise step
-export DABSN_TRAIN_DENSE_MAX_SCORES=8388608
+export DABSN_TRAIN_READ_BACKEND=fused    # fused | dense_chunked | dense | flash
+export DABSN_INFER_READ_BACKEND=fused    # fused | auto
+export DABSN_LONG_BACKEND=fused          # fused | linrec
+export DABSN_CORE_PERSISTENT=1           # 0 restores earlier core routes
 ```
 
-The complete DABSN model or backbone is never compiled by this dispatch. The
-batched custom-autograd recurrence has a separately tested explicit backward,
-including every parameter and carried-state gradient.
+Component measurements on an **NVIDIA A40**, forward + backward without an
+optimizer update, under BF16 autocast (online core operands remain FP32):
 
-The release gates cover:
+| Component | Shape | Tokens/s | Reference at the same shape |
+| --- | --- | ---: | ---: |
+| Core, BPTT | H=768, B=16, T=2048 | 800,577 | cuDNN LSTM: 560,831 |
+| Core, online credit | H=768, B=16, T=2048 | 576,030 | — |
+| Core, BPTT | H=256, B=64, T=512 | 4,134,689 | cuDNN LSTM: 1,668,203 |
+| Capacity, BPTT | B=8, T=2048, C=32768, A=1024, D=S=2048 | 919,418 | MLP: 2,811,733 |
+| Capacity, online credit | Same | 476,457 | — |
 
-- `seq`, `field`, and `hybrid` model forward/backward parity;
-- single-block and stacked execution;
-- recurrent execution with and without an explicit initial core state;
-- gradients through inputs, parameters, and carried state;
-- admitted, permanent, long-memory, and local-field primitives;
-- configuration-aware checkpoint reload.
+Here `H` is core width, `B` batch, and `T` sequence length. Capacity has
+`C` rows, `A` active rows, input/output width `D`, and state width `S`;
+the reference MLP is 2048 → 1024 → 2048. The LSTM performs roughly twice the
+recurrent work, so its comparison is per layer, not per FLOP.
 
-The repository does not claim that its fused kernels outperform every existing
-sequence runtime. Their contract is native DABSN execution with explicit
-forward/backward parity and no hidden backend switch.
+At B=1, T=16,384, H=128 in BF16 on the same A40, admitted-read forward takes
+about 4 ms against about 1 ms for PyTorch fused causal attention. The read
+performs three reads with two value tensors. On an AMD EPYC 7713 allocation
+with 8 vCPUs, PyTorch 2.8, and FP32, a full sequence-geometry block reaches
+11,698 tokens/s for inference at H=256, B=1, T=1024, and 9,763 tokens/s for
+forward + backward at H=256, B=8, T=128.
 
-## Performance and scaling
+These are component and block measurements, not full-model training rates.
+The recurrent core advances sequentially; batch supplies device parallelism,
+while admission determines the separate read cost.
 
-Most of the throughput-relevant behavior is automatic once a native runtime is
-enabled; nothing below changes the DABSN equations. All of it is geometry
-agnostic (`seq`, `field`, `hybrid`) because it lives at the core-scan and
-admitted-read level, not in any task head.
-
-**Automatic (no configuration):**
-
-- **Sub-quadratic admitted read.** The read scores each query position against
-  the *admitted* bank, whose width is the data-dependent admitted count, so the
-  cost is `O(T * admitted)` — not `O(T^2)`. The width is sized dynamically from
-  the learned admission; it only approaches `seq_len` (quadratic) if the model
-  genuinely learns to admit almost every position, which is the correct cost for
-  a task that needs it. Inference and ordinary GPU training both use this
-  dynamic width. A static width is used only while a CUDA graph is actively being
-  captured (where a host sync is illegal), and even then the capture path pins a
-  measured, padded, still-sub-quadratic cap.
-- **Work-aware core dispatch.** `select_core_backend` picks the persistent Triton
-  scan for small work and the batched tensor-core GEMM scan once the batch is
-  large enough to fill the device (`B >= 64` or `B*H >=
-  DABSN_BATCHED_CORE_MIN_WORK`, default 4096), so wide/large-batch training uses
-  tensor cores automatically.
-- **Tensor-core compute dtype.** With a BF16/FP16 model the recurrent GEMMs run
-  on tensor cores; pointwise state stays FP32.
-
-**Opt-in:**
-
-- **Fused single-launch core scan** (`DABSN_CORE_BACKEND=batched_fused`, hidden
-  width `<= 256`). Runs the whole `T`-step scan in one Triton launch with state
-  carried in registers, removing the per-step launch overhead. Wider cores use
-  the batched per-step GEMM, which has no such width bound. `auto` never selects
-  the fused backend on its own — request it explicitly.
-- **CUDA-graph training** (`make_graphed_train_callable`, or `cuda_graph=True` in
-  `DABSNPretrainConfig`). Captures the forward+backward once and replays it,
-  removing kernel-launch overhead — the dominant cost of the sequential scan at
-  small microbatches. Single-process CUDA only; pair each replay with
-  `ManualGradientAccumulator` for exact microbatch accumulation. Capture failure
-  raises rather than silently degrading.
-
-```python
-from dabsn.runtime import make_graphed_train_callable, ManualGradientAccumulator
-```
-
-**Batch vs. context.** The core is a *sequential* recurrence: it advances one
-position at a time and cannot parallelize across context the way attention does.
-Its device parallelism therefore comes from the **batch**, not the sequence
-length — a tiny microbatch leaves the GPU idle on every step regardless of
-context. Raise the microbatch as high as memory allows and use gradient
-accumulation for the effective batch. Because the read is sub-quadratic in `T`,
-context length scales close to linearly, so long-context training is bounded by
-the (linear) number of scan steps rather than a quadratic read.
-
-## Gradient preflight
-
-Before a long training run, verify the complete model stack:
-
-```python
-from dabsn.runtime import verify_gradients
-
-rows = verify_gradients(model, sample_input, compile_forward=True)
-print(rows)
-```
-
-This compiles the outer forward boundary, runs one backward pass, and raises if
-any block has missing, zero, or non-finite representative gradients.
-
-## Distributed training
-
-Launch two or more CUDA workers with `torchrun` and select FSDP explicitly:
-
-```bash
-torchrun --standalone --nproc-per-node=2 -m dabsn.cli train \
-  --config model.json \
-  --data batch.pt \
-  --output run/model.safetensors \
-  --device cuda \
-  --backend cuda \
-  --distributed fsdp \
-  --precision bf16 \
-  --grad-checkpoint \
-  --grad-accum-steps 4 \
-  --verify-gradients
-```
-
-Use `--precision fp16` on Turing GPUs such as the T4 or GTX 1660 Ti. The input
-file contains one global batch; its first dimension must be divisible by the
-number of workers. Each rank receives a distinct batch shard. FSDP uses
-`FULL_SHARD`, wraps each `DABSNBlock`, retains original parameters for the
-optimizer, and uses the FSDP-aware gradient scaler and global gradient clip.
-
-Portable mode writes a self-describing SafeTensors model to
-`run/model.safetensors`. Optimizer, AMP scaler, and completed-step state are
-stored in the trusted local sidecar
-`run/model.safetensors.optimizer.pt`. Add `--resume` to continue the same run.
-Resume rejects a missing model or sidecar instead of silently starting over.
-
-For a checkpoint too large to gather on rank zero, use distributed checkpoint
-mode:
-
-```bash
-torchrun --nnodes=2 --nproc-per-node=8 \
-  --rdzv-id=dabsn-pretrain-01 \
-  --rdzv-backend=c10d \
-  --rdzv-endpoint=trainer-0.example:29400 \
-  -m dabsn.cli train \
-  --config model.json \
-  --data batch.pt \
-  --output run/checkpoint \
-  --device cuda --backend cuda --distributed fsdp --precision bf16 \
-  --checkpoint-mode sharded --steps 10000 --resume
-```
-
-The sharded directory contains reshardable model and optimizer files plus
-`dabsn-training.json`. It avoids a full rank-zero state gather. If a complete
-model can fit in rank-zero host memory, add
-`--final-export run/model.safetensors` to consolidate a shareable inference
-file.
-
-FSDP is parameter, gradient, optimizer-state, and batch parallelism. It does not
-split one sequence or one oversized matrix across GPUs.
-
-### Tensor and expert parallelism
-
-Two further kinds ship, for the cases FSDP does not answer.
-
-**Tensor parallelism** splits the recurrent hidden dimension itself, so a core
-wider than one device still runs. Each worker owns a contiguous set of state
-units and the matching rows of the recurrent matrix:
-
-```python
-from dabsn.core import TensorParallelDABSNCore
-
-sharded = TensorParallelDABSNCore(core, group=group, rank=rank, world_size=world)
-```
-
-Because a unit's next state depends on every unit's current state, the
-recurrence exchanges the full activation at every step. That collective is
-required by the recurrence, not an implementation shortcut. It is fused with the
-recurrent matmul into a single autograd node, using a symmetric-memory
-collective where the interconnect supports it and an explicit gather elsewhere;
-both compute the same values. Reassemble per-rank trajectories with
-`reassemble_tensor_parallel_trajectory`.
-
-**Expert parallelism** places MoE experts on different workers and exchanges
-routed assignments by rank:
-
-```python
-from dabsn import ExpertParallelExpertGroup, GenericExpertGroup
-
-group = ExpertParallelExpertGroup(
-    GenericExpertGroup(local_experts),
-    process_group=process_group,
-    world_size=world,
-    rank=rank,
-)
-```
-
-Every assignment returns in its original order, so a sharded expert group is
-numerically indistinguishable from one unsharded model. Its variable all-to-all
-split sizes are incompatible with CUDA-graph capture unless a separately proven
-static communication plan is supplied.
-
-Pipeline and context parallelism do not ship, so this repository does not claim
-that it can train an arbitrary one-trillion-parameter configuration.
-
-Programmatic users can access the same implementation through
-`setup_distributed`, `prepare_distributed_model`, `save_distributed_dabsn`,
-`save_sharded_training_checkpoint`, and their matching load functions from
-`dabsn.runtime`. `clip_grad_norm` from `dabsn.runtime` clips correctly under
-every arrangement above, accumulating the cross-worker sum of squares in FP64
-and returning the norm in the gradients' dtype regardless of topology.
-
-## Checkpoints and export
+## Checkpoints and distributed execution
 
 ```python
 from dabsn import load_dabsn, save_dabsn
-from dabsn.runtime import export_dabsn
 
 save_dabsn(model, "model.safetensors")
 restored = load_dabsn("model.safetensors", map_location="cpu")
-
-export_dabsn(model, "weights.safetensors", format="safetensors")
-export_dabsn(
-    model,
-    "program.pt2",
-    sample_input=sample_input,
-    format="torch-export",
-)
 ```
 
-Model checkpoints are atomic, non-pickle SafeTensors files. Saving validates the
-schema, checks tensor/metadata consistency, writes a temporary file, flushes and
-synchronizes it, and atomically replaces the target. `artifact_digest` returns a
-SHA-256 over the finished file.
+Atomic SafeTensors checkpoints preserve model configuration, component/provider
+identities, contracts, and weights. Raw graphs use `save_graph`/`load_graph`
+from `dabsn.checkpoint`. Third-party providers must be registered and explicitly
+trusted before loading. Optimizer state and carried training state are separate
+from weights-only model files.
 
-An artifact carries the format and schema version, the complete ordered graph
-specification, stable component IDs, provider keys with their distributions,
-versions and configuration, a representation-contract fingerprint, the parameter
-namespace map, the tied/shared tensor map, DABSN memory ownership, and
-construction and framework versions. Metadata is canonical JSON under explicit
-size, nesting, and value limits. `inspect_dabsn` reads all of it without
-allocating a single model tensor.
+Distributed support includes DDP, block-wrapped FSDP, tensor parallelism over
+recurrent state units, and expert parallelism. Tensor parallelism exchanges
+activations at every recurrent step; expert parallelism exchanges routed
+assignments. Pipeline and context parallelism do not ship.
 
-Loading rebuilds the architecture from provider keys and configuration and
-verifies the contract fingerprint before applying any tensor. **The loader
-contains no architecture-specific branch** — that absence is what makes an
-arbitrary composed model portable rather than dependent on the code that
-happened to create it. Use `load_graph` for a raw component graph and
-`load_dabsn` for a model; each rejects the other's artifact kind rather than
-guessing.
+The library supplies runtime helpers for distributed setup, sharded training
+checkpoints, export, gradient verification, and distributed gradient clipping.
+The `train`, `pretrain`, and `finetune` CLI commands are convenience examples
+for dense DABSN models. Composed architectures use application-owned loops.
+See the [runtime and persistence contracts](ARCHITECTURE.md#runtime-contract)
+and `dabsn --help`.
 
-Custom adapters and third-party providers remain application-owned and must be
-registered — and named in `trusted_providers` — before loading a checkpoint that
-references them, because reconstruction executes their construction code.
-Migration is explicit: `migrate_dabsn_checkpoint` converts v1 artifacts to the v2
-graph form, and every existing `0.1.x` checkpoint remains loadable. Optimizer
-sidecars and distributed training directories are trusted run state, not files to
-accept from an untrusted source.
+## Papers
 
-## Train, pretrain, fine-tune, and resume (examples)
+### 3. Attention is My Memory
 
-**Scope.** These are worked examples for the plain dense DABSN path, not a
-training framework. They build a `DABSNSequenceLM` from flat configuration
-fields, so they cannot construct a composed architecture — a mixture of experts,
-attention experts, or anything else assembled as a component graph. For those,
-build the model yourself (see [Composing architectures](#composing-architectures))
-and train it in your own loop; everything the library actually owns —
-checkpoints, distributed execution, kernels, gradient checks — works there
-unchanged.
+**Positional Encoding-free Length Invariance in Transformers**
 
-They are kept because they are tested and genuinely useful for the case they
-cover, and because `--resume` will continue any `DABSNSequenceLM` checkpoint,
-including one you built from a graph. They are not the intended path for a
-serious run.
+One memory branch gives a transformer content-addressed retrieval without
+positional encoding. Main synthetic models use width 128 and four layers; the
+branch adds 82,839 parameters, 2.9% of the base model.
 
-These commands are deliberately separate:
+| MQAR evaluation | NoPE + memory, front | RoPE + YaRN, fine-tuned |
+| --- | ---: | ---: |
+| Distance: 16,384 tokens, 64× training length | 96.9 ± 2.8% | 94.9 ± 5.7% |
+| Load: 512 pairs, 8× largest training load | 100.0 ± 0.0% | 37.9 ± 10.9% |
 
-- `train` creates a new model from `model.json` and prepared input/target
-  tensors. `train --resume` continues that exact run with its optimizer and
-  completed step.
-- `finetune` loads model weights but intentionally creates a new optimizer and
-  starts at step zero. Its output must differ from its input checkpoint.
-- `pretrain` builds a `DABSNSequenceLM` and learns next-token prediction from a
-  token corpus. A binary corpus is memory-mapped: batches are sliced from disk
-  without loading the entire corpus into RAM.
+Results are means ± standard deviations over three seeds. Memory models train
+at 256 tokens; the YaRN baseline receives additional fine-tuning at 1024.
+Extreme passkey evaluation reaches 100%, 96%, and 100% digit accuracy at
+1,048,576 tokens over ten prompts per seed; plain NoPE scores 10% on its
+evaluated seed.
 
-`AMP` means automatic mixed precision (`fp16` or `bf16`). It reduces tensor
-memory and compute cost while the supplied scaler protects fp16 gradients.
-Gradient accumulation divides each update across several smaller batches.
+The 459-run protocol includes learning-rate selection, larger models, and
+enwik8. At the training length, position-free language modelling reaches
+1.444 bits per character (RoPE: 1.450; ALiBi: 1.426); loss rises beyond it.
+Retrieval generalization does not establish general length invariance on
+copying or natural text, or constant compute and memory cost.
 
-A minimal pretraining config is:
+[Paper](https://doi.org/10.5281/zenodo.24268811) · [PDF](paper3/main.pdf) · [Source and results](paper3/) ·
+[Reproduction](paper3/reproduce/README.md)
 
-```json
-{
-  "corpus_bin": "/data/tokens.uint16",
-  "corpus_dtype": "uint16",
-  "vocab": 50257,
-  "hidden_dim": 768,
-  "depth": 12,
-  "layer_geometries": ["seq"],
-  "train_context": 2048,
-  "steps": 16000,
-  "batch_size": 4,
-  "precision": "bf16",
-  "distributed": "fsdp",
-  "grad_checkpoint": true,
-  "grad_accum_steps": 8,
-  "checkpoint_every": 1000
-}
-```
+### 2. Experience as a Persistent Object
 
-Launch it with:
+**Online Temporal Credit in DABSN**
 
-```bash
-torchrun --standalone --nproc-per-node=8 -m dabsn.cli pretrain \
-  --config pretrain.json \
-  --output run/checkpoint \
-  --device cuda --backend cuda \
-  --checkpoint-mode sharded \
-  --final-export run/model.safetensors \
-  --verify-gradients
-```
+The paper specifies `E`, proves partition composition at fixed parameters and
+an exact identity for omitted influence, and constructs histories separating
+`E` from the full terminal state–parameter Jacobian in both directions.
+Experiments test delayed learning, causal edits with forward computation held
+fixed, objectives selected after experience, and direct parameter action.
 
-`steps` counts corpus microsteps, matching the canonical training loop. One
-optimizer update occurs every `grad_accum_steps`; `checkpoint_every` must land
-on an update boundary. The checkpoint records every rank's corpus RNG stream.
-Bitwise data-stream continuation therefore requires the same worker count.
-Changing the worker count may reshard model/optimizer state, but it is a new
-global data trajectory and is not called exact continuation.
+Online credit and full BPTT both reach 100% temporal-order accuracy at lengths
+128, 512, and 2048; at 4096 their means are 84.8% and 85.9%. A core driven by
+`E` for credit, direction, and pace, without core optimizer state, matches the
+AdamW comparisons on copy, MQAR, and key–value recall. Online credit loses
+BPTT's exact A5/60 length generalization, and 64-step truncated BPTT remains
+much stronger on the uninterrupted-stream tasks.
 
-Fine-tuning uses a prepared tensor payload and a fresh output path:
+[Paper](https://doi.org/10.5281/zenodo.24268687) · [PDF](paper2/main.pdf) · [Source, proofs, and results](paper2/) ·
+[Reproduction](paper2/README.md)
 
-```bash
-dabsn finetune \
-  --checkpoint base.safetensors \
-  --data task-batch.pt \
-  --output task-model.safetensors \
-  --device cuda --backend cuda --precision bf16 --steps 2000
-```
+### 1. One Layer, Both Gaps
 
-## Language modeling
+**A Persistent-Modulation Recurrence that Generalizes Copy and Tracks Non-Solvable Group State**
 
-```python
-from dabsn import DABSNSequenceLM
+One architecture, trained separately per task, tests copying and non-solvable
+group-state tracking with causal ablations of its state and read pathways.
 
-model = DABSNSequenceLM(
-    vocab=50_257,
-    hidden_dim=512,
-    depth=4,
-    layers="seq:256:256,seq:768:512,seq:768:512,seq:256:256",
-    tie_embeddings=False,
-)
+| Task | Train length | Evaluation length | Result |
+| --- | ---: | ---: | ---: |
+| Copy, vocabulary 64 | 64 | 3,200 (50×) | 0.961 ± 0.035, three seeds |
+| A5/60 word problem | 256 | 16,384 (64×) | 1.000, two seeds |
 
-logits = model.forward_sequence(token_ids)
-```
-
-## CLI and reproductions
-
-```bash
-dabsn --help
-dabsn kernels --enable cuda --required
-dabsn doctor
-
-dabsn-reproduce-copy --help
-dabsn-reproduce-mqar --help
-dabsn-reproduce-keyvalue --help
-dabsn-reproduce-a5 --help
-```
-
-The full reproduction defaults correspond to the checked-in result tables.
-Reduced settings are available for local execution checks and are not presented
-as replacements for the reported experiments.
-
-## Development
-
-```bash
-git clone https://github.com/BleedingXiko/dabsn.git
-cd dabsn
-pip install -e '.[test]'
-pytest
-```
-
-Native release gates are available for a fresh wheel-installed checkout:
-
-```bash
-bash tools/cpu_check.sh
-bash tools/gpu_check.sh
-bash tools/fsdp_check.sh  # requires two NVIDIA GPUs
-```
+[Paper](paper1/main.pdf) · [Source, results, and reproduction](paper1/)
 
 ## Citation
 
-If DABSN or its native runtimes contribute to your work, cite the paper:
+Cite the papers relevant to the architecture, online credit, or host memory:
 
 ```bibtex
+@misc{rosdahl2026attentionmemory,
+  title  = {Attention is My Memory: Positional Encoding-free Length Invariance
+            in Transformers},
+  author = {Rosdahl, Nicholas},
+  year   = {2026},
+  doi    = {10.5281/zenodo.24268811},
+  url    = {https://doi.org/10.5281/zenodo.24268811}
+}
+
+@misc{rosdahl2026experience,
+  title  = {Experience as a Persistent Object: Online Temporal Credit in DABSN},
+  author = {Rosdahl, Nicholas},
+  year   = {2026},
+  doi    = {10.5281/zenodo.24268687},
+  url    = {https://doi.org/10.5281/zenodo.24268687}
+}
+
 @misc{rosdahl2026onelayer,
-  title     = {One Layer, Both Gaps: A Persistent-Modulation Recurrence that
-               Generalizes Copy and Tracks Non-Solvable Group State},
-  author    = {Rosdahl, Nicholas},
-  year      = {2026},
-  publisher = {Zenodo},
-  doi       = {10.5281/zenodo.21391204},
-  url       = {https://github.com/BleedingXiko/dabsn}
+  title  = {One Layer, Both Gaps: A Persistent-Modulation Recurrence that
+            Generalizes Copy and Tracks Non-Solvable Group State},
+  author = {Rosdahl, Nicholas},
+  year   = {2026},
+  doi    = {10.5281/zenodo.21391204},
+  url    = {https://github.com/BleedingXiko/dabsn}
 }
 ```
 
-[`CITATION.cff`](https://github.com/BleedingXiko/dabsn/blob/main/CITATION.cff)
-carries the same metadata in machine-readable form, and GitHub's "Cite this
-repository" control reads it directly.
-
-## License
-
-DABSN is released under the [Apache License 2.0](https://github.com/BleedingXiko/dabsn/blob/main/LICENSE).
+[CITATION.cff](CITATION.cff) contains software metadata, paper 1's preferred
+citation, and references to papers 2 and 3. DABSN is released under the
+[Apache License 2.0](LICENSE).

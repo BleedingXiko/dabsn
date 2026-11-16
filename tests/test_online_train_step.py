@@ -20,6 +20,20 @@ def _model() -> DABSNModel:
     )
 
 
+def test_single_group_merge_reuses_completed_state_without_allocation() -> None:
+    from dabsn.temporal_credit import _merge_online_temporal_states
+
+    state = initial_online_temporal_state(
+        _model(), 2, device="cpu", dtype=torch.float32,
+        stream_policy="reset_each_batch", stream_ids=(0, 1),
+    )
+    merged = _merge_online_temporal_states((state,))
+    assert merged is state
+    for before, after in zip(state.layers[0].core_eligibility.tensors(),
+                             merged.layers[0].core_eligibility.tensors()):
+        assert before.data_ptr() == after.data_ptr()
+
+
 def test_online_train_step_applies_update_and_returns_completed_state() -> None:
     torch.manual_seed(401)
     model = _model()

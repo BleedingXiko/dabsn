@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import functools
 import math
 from typing import NamedTuple, Sequence, cast
 
@@ -14,6 +15,33 @@ from torch import Tensor
 from .components import ComponentOutput
 from .ops import stable_expert_permutation, weighted_scatter_add
 
+
+@functools.lru_cache(maxsize=None)
+def _has_grouped_mm(device_type: str) -> bool:
+    """Whether this PyTorch build can run eager ``torch._grouped_mm`` on the device.
+
+    CPU support varies by release (torch 2.8 has no CPU kernel; later releases
+    serve CPU through a composite kernel), so CPU is probed once with a tiny
+    call. CUDA asks the dispatcher.
+    """
+    if not hasattr(torch, "_grouped_mm"):
+        return False
+    if device_type == "cpu":
+        try:
+            torch._grouped_mm(
+                torch.zeros(2, 16),
+                torch.zeros(1, 16, 16),
+                offs=torch.tensor([2], dtype=torch.int32),
+            )
+            return True
+        except Exception:
+            return False
+    if device_type == "cuda":
+        try:
+            return bool(torch._C._dispatch_has_kernel_for_dispatch_key("aten::_grouped_mm", "CUDA"))
+        except Exception:
+            return False
+    return False
 
 class RouterOutput(NamedTuple):
     expert_indices: Tensor
@@ -278,6 +306,10 @@ class ReLU2MLPExpertGroup(nn.Module):
         # CUDA grouped GEMM requires its output to match the activation dtype
         # on supported low-precision kernels; keep both GEMMs on that contract.
         output_dtype = inputs.dtype if inputs.is_cuda else self.accumulation_dtype
+        if not _has_grouped_mm(inputs.device.type):
+            # This PyTorch build has no grouped-MM kernel for the device (torch
+            # 2.8 has none on CPU): the same per-expert products, one GEMM each.
+            return self._forward_grouped_loop(inputs, offsets, output_dtype)
         first = torch._grouped_mm(
             inputs,
             self.w1,
@@ -291,6 +323,18 @@ class ReLU2MLPExpertGroup(nn.Module):
             offs=ends,
             out_dtype=output_dtype,
         )
+        return output.to(inputs.dtype)
+
+    def _forward_grouped_loop(self, inputs: Tensor, offsets: Tensor, output_dtype) -> Tensor:
+        bounds = [int(v) for v in offsets.tolist()]
+        output = inputs.new_empty((inputs.shape[0], self.hidden_dim), dtype=output_dtype)
+        for expert in range(self.experts):
+            start, stop = bounds[expert], bounds[expert + 1]
+            if stop <= start:
+                continue
+            rows = inputs[start:stop].to(output_dtype)
+            hidden = F.relu(rows @ self.w1[expert].to(output_dtype)).square()
+            output[start:stop] = hidden @ self.w2[expert].to(output_dtype)
         return output.to(inputs.dtype)
 
     def forward_dispatched(

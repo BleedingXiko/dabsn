@@ -1,0 +1,23 @@
+\begin{table}\centering\small
+\setlength{\tabcolsep}{4pt}
+\begin{adjustbox}{max width=\linewidth}
+\begin{tabular}{lrrrrrrr}
+\toprule
+ & \multicolumn{1}{c}{train} & \multicolumn{4}{c}{distance} & \multicolumn{2}{c}{load} \\
+Model & val & 1$\times$ & 4$\times$ & 16$\times$ & 64$\times$ & 2$\times$ & 8$\times$ \\
+\midrule
+NoPE & 99.7{\scriptsize$\pm$0.1} & 99.6{\scriptsize$\pm$0.0} & 91.5{\scriptsize$\pm$2.3} & 41.2{\scriptsize$\pm$9.5} & 15.7{\scriptsize$\pm$8.2} & 92.2{\scriptsize$\pm$3.5} & 23.5{\scriptsize$\pm$3.9} \\
+RoPE & 99.7{\scriptsize$\pm$0.1} & 99.7{\scriptsize$\pm$0.1} & 0.5{\scriptsize$\pm$0.3} & 0.0{\scriptsize$\pm$0.0} & 0.0{\scriptsize$\pm$0.0} & 56.6{\scriptsize$\pm$8.7} & 0.1{\scriptsize$\pm$0.0} \\
+RoPE + PI & 99.7{\scriptsize$\pm$0.1} & 99.7{\scriptsize$\pm$0.1} & 21.9{\scriptsize$\pm$10.6} & 2.8{\scriptsize$\pm$1.4} & 1.8{\scriptsize$\pm$1.1} & 79.2{\scriptsize$\pm$5.3} & 2.3{\scriptsize$\pm$1.5} \\
+RoPE + YaRN & 99.7{\scriptsize$\pm$0.1} & 99.7{\scriptsize$\pm$0.1} & 89.6{\scriptsize$\pm$7.2} & 51.7{\scriptsize$\pm$9.3} & 38.5{\scriptsize$\pm$5.1} & 92.8{\scriptsize$\pm$2.1} & 47.2{\scriptsize$\pm$14.0} \\
+ALiBi & 99.7{\scriptsize$\pm$0.1} & 99.6{\scriptsize$\pm$0.1} & 58.4{\scriptsize$\pm$4.8} & 0.0{\scriptsize$\pm$0.0} & 0.0{\scriptsize$\pm$0.0} & 98.8{\scriptsize$\pm$0.3} & 53.8{\scriptsize$\pm$3.5} \\
+Sliding window$^\dagger$ & 2.1{\scriptsize$\pm$0.2} & 1.2{\scriptsize$\pm$0.0} & 0.0{\scriptsize$\pm$0.0} & 0.0{\scriptsize$\pm$0.0} & 0.0{\scriptsize$\pm$0.0} & 0.2{\scriptsize$\pm$0.0} & 0.0{\scriptsize$\pm$0.0} \\
+Infini-attention$^\dagger$ & 2.1{\scriptsize$\pm$0.4} & 1.4{\scriptsize$\pm$0.4} & 0.3{\scriptsize$\pm$0.2} & 0.1{\scriptsize$\pm$0.0} & 0.0{\scriptsize$\pm$0.0} & 0.5{\scriptsize$\pm$0.2} & 0.1{\scriptsize$\pm$0.0} \\
+\textbf{NoPE + memory (front)} & 99.9{\scriptsize$\pm$0.0} & \textbf{100.0}{\scriptsize$\pm$0.0} & \textbf{100.0}{\scriptsize$\pm$0.0} & \textbf{99.8}{\scriptsize$\pm$0.1} & 95.6{\scriptsize$\pm$2.6} & \textbf{100.0}{\scriptsize$\pm$0.0} & \textbf{99.9}{\scriptsize$\pm$0.0} \\
+\textbf{Sliding window + memory (front)} & 100.0{\scriptsize$\pm$0.0} & \textbf{100.0}{\scriptsize$\pm$0.0} & \textbf{100.0}{\scriptsize$\pm$0.0} & \textbf{99.8}{\scriptsize$\pm$0.1} & \textbf{96.8}{\scriptsize$\pm$0.5} & \textbf{100.0}{\scriptsize$\pm$0.0} & \textbf{99.9}{\scriptsize$\pm$0.0} \\
+\bottomrule
+\end{tabular}
+\end{adjustbox}
+\caption{MQAR with width 256 and 8 layers, with its own learning-rate sweep and seeds. Accuracy (\%), mean $\pm$ standard deviation over three seeds. Distance: filler between the facts and their use at $k\times$ the training length; load: $k\times$ the largest training load with the filler at its training size. The best model that learned the task is in bold; $^\dagger$ marks models below 90\% at the training length, which are not compared beyond it.}
+\label{tab:scale}
+\end{table}

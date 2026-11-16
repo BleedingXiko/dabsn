@@ -38,3 +38,14 @@ tools/train_scale_gate.py
 tools/build_scale_gate_bundle.py
 tools/memory_gate.py
 tests/test_scale_bench.py
+
+# Keep new top-level clutter local by default (checkpoints, notebooks, zips,
+# research folders). Framework code and tests are NEVER hidden: any new file in
+# src/ or tests/ shows up in Git automatically, so nothing core can be lost.
+/*
+!/src/
+!/tests/
+!/paper3/
+!/paper2/
+/paper3/source/
+

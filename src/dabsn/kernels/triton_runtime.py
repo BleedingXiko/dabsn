@@ -1242,7 +1242,12 @@ def dabsn_core_scan_batched_fused_forward(
     ug_c = Ug.to(Wx.dtype).contiguous()
     a_c = A.to(Wx.dtype).contiguous()
     resource_error = None
-    for block_b in _fused_batch_tiles(B):
+    # Shared memory is dominated by the K-pipelined [Ug;A] tiles, which do not
+    # shrink with the batch tile: on 100 KiB-SMEM parts (A40/A10/L4/RTX) the
+    # default three stages overflow at H=256. Step the pipeline depth down
+    # before the batch tile; both only change resources, never the math.
+    attempts = [(block_b, stages) for stages in (3, 2, 1) for block_b in _fused_batch_tiles(B)]
+    for block_b, stages in attempts:
         grid = (triton.cdiv(B, block_b),)
         try:
             _dabsn_core_scan_batched_fused_fwd[grid](
@@ -1291,6 +1296,7 @@ def dabsn_core_scan_batched_fused_forward(
                 BLOCK_H=block_h,
                 BLOCK_K=block_k,
                 num_warps=_fused_num_warps(block_h),
+                num_stages=stages,
             )
             resource_error = None
             break

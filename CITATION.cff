@@ -1,9 +1,9 @@
 cff-version: 1.2.0
-message: "If you use DABSN or its native runtime, please cite this software and the accompanying paper."
+message: "If you use DABSN, please cite this software and the papers relevant to your use: the architecture, online temporal credit, or host memory."
 title: "DABSN: Persistent-Modulation Sequence and Field Modeling"
 type: software
-version: 0.2.2
-date-released: 2026-09-29
+version: 1.0.0
+date-released: 2026-11-15
 license: Apache-2.0
 url: "https://github.com/BleedingXiko/dabsn"
 repository-code: "https://github.com/BleedingXiko/dabsn"
@@ -18,3 +18,20 @@ preferred-citation:
       given-names: Nicholas
   year: 2026
   doi: "10.5281/zenodo.21391204"
+references:
+  - type: article
+    title: "Experience as a Persistent Object: Online Temporal Credit in DABSN"
+    authors:
+      - family-names: Rosdahl
+        given-names: Nicholas
+    year: 2026
+    doi: "10.5281/zenodo.24268687"
+    url: "https://doi.org/10.5281/zenodo.24268687"
+  - type: article
+    title: "Attention is My Memory: Positional Encoding-free Length Invariance in Transformers"
+    authors:
+      - family-names: Rosdahl
+        given-names: Nicholas
+    year: 2026
+    doi: "10.5281/zenodo.24268811"
+    url: "https://doi.org/10.5281/zenodo.24268811"

@@ -394,13 +394,17 @@ def _model_native_parity(
     traces = native.read_traces()
     for index, block in enumerate(native.backbone.blocks):
         expected_core = "cuda_registered" if backend == "cuda" else "cpu_native_cpp"
-        expected_long = "cuda_triton" if backend == "cuda" else "cpu_native_cpp"
+        expected_long = {"cuda_triton", "cuda_triton_fused"} if backend == "cuda" else {
+            "cpu_native_cpp"
+        }
         if getattr(block.core, "_last_core_backend", None) != expected_core:
             raise AssertionError(f"block {index} core did not route through {expected_core}")
-        if getattr(block.read, "_last_long_backend", None) != expected_long:
+        if getattr(block.read, "_last_long_backend", None) not in expected_long:
             raise AssertionError(f"block {index} long read did not route through {expected_long}")
         read_backend = traces[index]["read_contract"]["kernel_backend"]
         if backend == "cuda" and read_backend not in {
+            "registered_fused_tokens_trainable",
+            "registered_fused_flash_trainable",
             "registered_dense_bmm_trainable",
             "registered_compact_flash_trainable",
             "dense_bmm_trainable",

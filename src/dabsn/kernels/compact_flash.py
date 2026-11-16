@@ -202,7 +202,23 @@ def _compact_flash_backward_op(
     pad_gain: Tensor,
     induct_gain: Tensor,
     cocktail_gain: Tensor,
-) -> CompactGradients:
+) -> tuple[
+    Tensor,
+    Tensor,
+    Tensor,
+    Tensor,
+    Tensor,
+    Tensor,
+    Tensor,
+    Tensor,
+    Tensor,
+    Tensor,
+    Tensor,
+    Tensor,
+    Tensor,
+]:
+    # Spelled out, not ``CompactGradients``: torch 2.6 evaluates custom-op
+    # annotations without this module's globals (the cuda-turing pin).
     return cast(
         CompactGradients,
         _reference_backward(

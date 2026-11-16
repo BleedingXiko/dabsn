@@ -1435,11 +1435,15 @@ def load_sharded_training_checkpoint(
     options = StateDictOptions(full_state_dict=False, cpu_offload=True, strict=False)
     model_state, optimizer_state = get_state_dict(model, optimizer, options=options)
     saved_optimizer_names = manifest.get("optimizer_state_names")
+    unsaved_slots: dict[str, Any] = {}
     if isinstance(saved_optimizer_names, list):
         # DCP initializes destination optimizer slots to discover their shapes.
         # Remove slots absent at save time: retaining a synthetic step/moment
         # would change the first update of a previously unused parameter.
-        optimizer_state["state"] = {name: value for name, value in optimizer_state.get("state", {}).items()
+        live_slots = optimizer_state.get("state", {})
+        unsaved_slots = {name: value for name, value in live_slots.items()
+                         if name not in saved_optimizer_names}
+        optimizer_state["state"] = {name: value for name, value in live_slots.items()
                                     if name in saved_optimizer_names}
     from .capacity_distributed import checkpoint_capacity_state
     checkpoint_capacity_state(model, model_state, optimizer_state)
@@ -1487,6 +1491,21 @@ def load_sharded_training_checkpoint(
         no_dist=not state.enabled,
     )
     checkpoint_capacity_state(model, state_dict["model"], state_dict["optimizer"], restore=True)
+    if unsaved_slots:
+        # torch>=2.8 set_state_dict requires an entry for every trainable
+        # parameter. Pass the destination's own synthetic slots through, then
+        # drop them below so previously unused parameters stay slot-free.
+        state_dict["optimizer"]["state"].update(unsaved_slots)
+    # A parameter that never receives a gradient (e.g. a threshold such as the
+    # admission window) has no slot on either side: DCP's slot initialization
+    # runs a step that skips it. Give it an empty placeholder for the call and
+    # drop it below, exactly like the synthetic slots above.
+    optimizer_slots = state_dict["optimizer"].setdefault("state", {})
+    for group in state_dict["optimizer"].get("param_groups", []):
+        for name in group.get("params", []):
+            if isinstance(name, str) and name not in optimizer_slots:
+                optimizer_slots[name] = {}
+                unsaved_slots[name] = {}
     set_state_dict(
         model,
         optimizer,
@@ -1494,6 +1513,12 @@ def load_sharded_training_checkpoint(
         optim_state_dict=state_dict["optimizer"],
         options=options,
     )
+    if unsaved_slots:
+        parameters = dict(model.named_parameters())
+        for name in unsaved_slots:
+            parameter = parameters.get(name)
+            if parameter is not None:
+                optimizer.state.pop(parameter, None)
     if manifest.get("has_scaler_state"):
         assert scaler is not None
         scaler.load_state_dict(state_dict["scaler"])
@@ -1726,7 +1751,32 @@ def clip_grad_norm(model: nn.Module, max_norm: float) -> Tensor:
             for gradient in values:
                 gradient.mul_(coefficient.to(gradient))
             return norm
-        return torch.nn.utils.clip_grad_norm_(model.parameters(), float(max_norm))
+        parameters = tuple(model.parameters())
+        try:
+            # Reject before mutation: otherwise an overflowing FP32 reduction
+            # multiplies finite gradients by zero and destroys the update.
+            return torch.nn.utils.clip_grad_norm_(
+                parameters, float(max_norm), error_if_nonfinite=True)
+        except RuntimeError as error:
+            if "non-finite" not in str(error):
+                raise
+            gradients = [p.grad for p in parameters if p.grad is not None]
+            if (not gradients or any(g.device.type not in ("cpu", "cuda")
+                    or not bool(torch.isfinite(g).all()) for g in gradients)):
+                raise
+            # Ordinary, unsharded gradients only. FSDP and provider-sharded
+            # models retain their global collective norm paths above/below.
+            wide = [g.detach().to(torch.complex128 if g.is_complex()
+                                    else torch.float64) for g in gradients]
+            device = gradients[0].device
+            norm = torch.stack([g.norm().to(device) for g in wide]).norm()
+            if not bool(torch.isfinite(norm)):
+                raise
+            coefficient = (float(max_norm) / (norm + 1e-6)).clamp(max=1.)
+            with torch.no_grad():
+                for gradient, value in zip(gradients, wide):
+                    gradient.copy_(value * coefficient.to(value.device))
+            return norm
 
     parameter_axes: dict[int, tuple[str, ...]] = {}
     for binding in (() if graph is None else graph.bindings):

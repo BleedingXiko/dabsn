@@ -1,0 +1,25 @@
+\begin{table}\centering\small
+\setlength{\tabcolsep}{4pt}
+\begin{adjustbox}{max width=\linewidth}
+\begin{tabular}{lrrrrrrr}
+\toprule
+ & \multicolumn{1}{c}{train} & \multicolumn{4}{c}{distance} & \multicolumn{2}{c}{load} \\
+Model & val & 1$\times$ & 4$\times$ & 16$\times$ & 64$\times$ & 2$\times$ & 8$\times$ \\
+\midrule
+NoPE$^\dagger$ & 67.9{\scriptsize$\pm$27.4} & 61.9{\scriptsize$\pm$32.6} & 45.9{\scriptsize$\pm$9.0} & 27.0{\scriptsize$\pm$18.7} & 22.1{\scriptsize$\pm$18.9} & 42.7{\scriptsize$\pm$28.0} & 7.6{\scriptsize$\pm$0.3} \\
+RoPE & 99.8{\scriptsize$\pm$0.2} & 99.8{\scriptsize$\pm$0.3} & 5.0{\scriptsize$\pm$1.5} & 0.1{\scriptsize$\pm$0.1} & 0.0{\scriptsize$\pm$0.0} & 78.2{\scriptsize$\pm$16.4} & 0.4{\scriptsize$\pm$0.3} \\
+RoPE + PI & 99.8{\scriptsize$\pm$0.2} & 99.8{\scriptsize$\pm$0.3} & 4.4{\scriptsize$\pm$5.3} & 1.4{\scriptsize$\pm$0.5} & 1.4{\scriptsize$\pm$0.6} & 37.2{\scriptsize$\pm$33.8} & 0.5{\scriptsize$\pm$0.4} \\
+RoPE + YaRN & 99.8{\scriptsize$\pm$0.2} & 99.8{\scriptsize$\pm$0.3} & 95.2{\scriptsize$\pm$5.1} & 90.6{\scriptsize$\pm$1.9} & 74.3{\scriptsize$\pm$2.1} & 81.4{\scriptsize$\pm$29.8} & 83.6{\scriptsize$\pm$13.0} \\
+RoPE + YaRN (fine-tuned) & 99.6{\scriptsize$\pm$0.5} & 99.5{\scriptsize$\pm$0.7} & 99.6{\scriptsize$\pm$0.5} & 97.8{\scriptsize$\pm$2.6} & 94.9{\scriptsize$\pm$5.7} & 73.0{\scriptsize$\pm$8.2} & 37.9{\scriptsize$\pm$10.9} \\
+ALiBi & 99.6{\scriptsize$\pm$0.0} & 99.6{\scriptsize$\pm$0.2} & 64.8{\scriptsize$\pm$13.1} & 0.4{\scriptsize$\pm$0.2} & 0.0{\scriptsize$\pm$0.0} & 94.1{\scriptsize$\pm$8.4} & 38.0{\scriptsize$\pm$23.7} \\
+Sliding window$^\dagger$ & 1.4{\scriptsize$\pm$0.1} & 1.0{\scriptsize$\pm$0.0} & 0.0{\scriptsize$\pm$0.0} & 0.0{\scriptsize$\pm$0.0} & 0.0{\scriptsize$\pm$0.0} & 0.2{\scriptsize$\pm$0.1} & 0.0{\scriptsize$\pm$0.0} \\
+Infini-attention$^\dagger$ & 1.3{\scriptsize$\pm$0.4} & 0.8{\scriptsize$\pm$0.3} & 0.3{\scriptsize$\pm$0.1} & 0.1{\scriptsize$\pm$0.0} & 0.0{\scriptsize$\pm$0.0} & 0.3{\scriptsize$\pm$0.1} & 0.1{\scriptsize$\pm$0.0} \\
+NoPE + matched MLP (front)$^\dagger$ & 60.7{\scriptsize$\pm$6.4} & 50.6{\scriptsize$\pm$8.7} & 48.6{\scriptsize$\pm$8.6} & 48.9{\scriptsize$\pm$8.3} & 47.8{\scriptsize$\pm$8.2} & 32.5{\scriptsize$\pm$8.5} & 9.3{\scriptsize$\pm$3.4} \\
+\textbf{NoPE + memory (front)} & 100.0{\scriptsize$\pm$0.0} & \textbf{100.0}{\scriptsize$\pm$0.0} & \textbf{100.0}{\scriptsize$\pm$0.0} & \textbf{99.9}{\scriptsize$\pm$0.2} & \textbf{96.9}{\scriptsize$\pm$2.8} & \textbf{100.0}{\scriptsize$\pm$0.0} & \textbf{100.0}{\scriptsize$\pm$0.0} \\
+\textbf{Sliding window + memory (front)} & 100.0{\scriptsize$\pm$0.0} & \textbf{100.0}{\scriptsize$\pm$0.0} & \textbf{100.0}{\scriptsize$\pm$0.0} & \textbf{99.9}{\scriptsize$\pm$0.1} & \textbf{96.9}{\scriptsize$\pm$2.4} & \textbf{100.0}{\scriptsize$\pm$0.0} & \textbf{100.0}{\scriptsize$\pm$0.0} \\
+\bottomrule
+\end{tabular}
+\end{adjustbox}
+\caption{MQAR~\citep{arora2024zoology}, trained at 256 tokens. Accuracy (\%), mean $\pm$ standard deviation over three seeds. Distance: filler between the facts and their use at $k\times$ the training length; load: $k\times$ the largest training load with the filler at its training size. The best model that learned the task is in bold; $^\dagger$ marks models below 90\% at the training length, which are not compared beyond it.}
+\label{tab:mqar}
+\end{table}

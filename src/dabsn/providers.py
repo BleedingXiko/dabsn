@@ -21,6 +21,7 @@ from .components import (
     component_registry,
 )
 from .core import TensorParallelDABSNCore
+from .host_memory import HostMemoryComponent
 from .model import DABSNBlock, MLPRMSNorm, ResidualMLPComponent
 from .moe import (
     ROUTER_REPORT_NAMES,
@@ -357,6 +358,58 @@ class ResidualMLPProvider:
     def migrate_config(self, old_version: int, config: Mapping[str, object]):
         if old_version != self.config_schema_version:
             raise ValueError(f"no dabsn:residual_mlp migration from schema {old_version}")
+        return dict(config)
+
+
+class HostMemoryProvider:
+    """DABSN memory sidecar on a host-created world stream (no DABSN core)."""
+
+    provider_key = "dabsn:host_memory"
+    component_abi_version = 2
+    config_schema_version = 1
+    # Declares only what check_component exercises on the eager path. The
+    # admitted read sizes its bank with a host sync and the CUDA compact read
+    # has no determinism evidence, so neither is claimed.
+    capabilities = ComponentCapabilities(
+        eager=True,
+        dynamic_shapes=True,
+        amp_fp32=True,
+        deterministic=False,
+        temporal_credit="unsupported",
+    )
+    _FIELDS = {"dim", "read_geometry", "admit_window", "use_long", "kernels"}
+
+    def validate_config(self, config: Mapping[str, object]) -> None:
+        unknown = set(config) - self._FIELDS
+        if unknown:
+            raise ValueError(f"unknown dabsn:host_memory configuration fields: {sorted(unknown)}")
+        if _int(config["dim"]) <= 0:
+            raise ValueError("dim must be positive")
+        if config.get("read_geometry", "seq") not in {"seq", "field", "hybrid"}:
+            raise ValueError("read_geometry must be seq, field, or hybrid")
+        if not _float(config.get("admit_window", 1.5)) > 0:
+            raise ValueError("admit_window must be > 0")
+        if not isinstance(config.get("use_long", True), bool):
+            raise ValueError("use_long must be a bool")
+        if config.get("kernels", "auto") not in {"auto", "reference"}:
+            raise ValueError("kernels must be auto or reference")
+
+    def contract(self, config: Mapping[str, object]) -> ComponentContract:
+        contract = _world(_int(config["dim"]))
+        return ComponentContract(contract, contract)
+
+    def build(self, config: Mapping[str, object], context: BuildContext):
+        return HostMemoryComponent(
+            _int(config["dim"]),
+            read_geometry=cast(Any, config.get("read_geometry", "seq")),
+            admit_window=_float(config.get("admit_window", 1.5)),
+            use_long=bool(config.get("use_long", True)),
+            kernels=cast(Any, config.get("kernels", "auto")),
+        )
+
+    def migrate_config(self, old_version: int, config: Mapping[str, object]):
+        if old_version != self.config_schema_version:
+            raise ValueError(f"no dabsn:host_memory migration from schema {old_version}")
         return dict(config)
 
 
@@ -748,6 +801,7 @@ def register_builtin_components() -> None:
         DABSNBlockProvider(),
         ResidualMLPProvider(),
         SparseMoEProvider(),
+        HostMemoryProvider(),
     ):
         if provider.provider_key not in component_registry.keys():
             component_registry.register(
@@ -760,6 +814,7 @@ def register_builtin_components() -> None:
 
 __all__ = [
     "DABSNBlockProvider",
+    "HostMemoryProvider",
     "ResidualMLPProvider",
     "SparseMoEProvider",
     "register_builtin_components",

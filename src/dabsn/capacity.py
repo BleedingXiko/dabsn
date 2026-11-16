@@ -407,7 +407,8 @@ class DABSNCapacitySubsystem(nn.Module):
         if self._last_capacity_backend != "reference":
             out, final = capacity_scan(x, self.key, self.bias, self.retention_logit, self.value,
                                        self.gain, features, indices, sparse=self.mode == "sparse",
-                                       stable_slots=self.mode == "sparse")
+                                       stable_slots=self.mode == "sparse",
+                                       bucketed=self.mode == "sparse")
             if self.mode == "sparse":
                 out, final = _TrackCapacityRows.apply(out, final, indices, self._touched_rows)
             return (out, final) if return_state else out
@@ -463,7 +464,8 @@ class DABSNCapacitySubsystem(nn.Module):
             out, final = capacity_scan(x, self.key, self.bias, self.retention_logit, self.value,
                                        self.gain, features, indices,
                                        eligibility=(key_e, bias_e, retention_e), sparse=self.mode == "sparse",
-                                       stable_slots=self.mode == "sparse")
+                                       stable_slots=self.mode == "sparse",
+                                       bucketed=self.mode == "sparse")
         else:
             calc_x = x.to(torch.promote_types(x.dtype, torch.float32))
             with torch.autocast(device_type=x.device.type, enabled=False):

@@ -291,7 +291,31 @@ def cuda_core_online_forward(core, inputs, initial_state, eligibility_state):
         requested=os.environ.get("DABSN_CORE_BACKEND", "auto"),
         grad_enabled=False,
     )
-    if selected != "persistent":
+    from .core_persistent import persistent_core_supported, persistent_forward_tapes
+
+    if persistent_core_supported(projected):
+        # One-launch scan with FP32 operands and FP32 tapes: online replay
+        # differentiates these values, so autocast must not round y or the
+        # recurrent product. FP32 GEMMs follow the matmul precision policy.
+        with torch.no_grad():
+            recurrent = torch.cat((core.Ug.weight, core.A.weight), dim=0).float()
+            outputs = persistent_forward_tapes(
+                projected,
+                gate_projected,
+                recurrent,
+                (
+                    core.beta, core.log_kappa, core.logit_recover,
+                    core.k_s, core.k_y, core.k_b, core.k_n, core.k_bias,
+                    core.r_s, core.r_y, core.r_b, core.r_n, core.r_bias,
+                    core.logit_saturation_decay, core.k_saturation, core.r_saturation,
+                    core.logit_alpha, core.log_lambda, core.logit_saturation_suppress,
+                ),
+                initial_state,
+                tape_dtype=compute_dtype,
+                online_extras=True,
+            )
+        selected = "persistent_single_launch"
+    elif selected != "persistent":
         from .online_forward import batched_online_forward_tapes
 
         outputs = batched_online_forward_tapes(core, projected, gate_projected, initial_state)
@@ -329,6 +353,51 @@ def cuda_core_online_forward(core, inputs, initial_state, eligibility_state):
     state = int(core.hidden_dim)
     y = trajectory[..., :state]
     next_budget = trajectory[..., state:]
+    if selected == "persistent_single_launch":
+        # The scan already wrote every replay value; no full-tape glue below.
+        (budget, saturation, gate_preactivation, novelty_effective, write_cost,
+         recovery) = outputs[11:17]
+    else:
+        (budget, saturation, gate_preactivation, novelty_effective, write_cost,
+         recovery) = _online_tape_values(
+            core, initial_state, inputs, y, next_budget, novelty, next_saturation, gate
+        )
+    tape = CoreOnlineTape(
+        inputs=inputs.detach(),
+        budget=budget.detach(),
+        energy=energy.detach(),
+        saturation=saturation.detach(),
+        y=y.detach(),
+        expression=expression.detach(),
+        gate_preactivation=gate_preactivation.detach(),
+        gate=gate.detach(),
+        novelty=novelty.detach(),
+        next_saturation=next_saturation.detach(),
+        novelty_effective=novelty_effective.detach(),
+        write_cost=write_cost.detach(),
+        recovery=recovery.detach(),
+        plasticity=plasticity.detach(),
+    )
+    result = CoreForwardResult(
+        trajectory=trajectory.to(inputs.dtype),
+        novelty=novelty.to(inputs.dtype),
+        plasticity=plasticity.to(inputs.dtype),
+        expression=expression.to(inputs.dtype),
+        write=write.to(inputs.dtype),
+        energy=energy.to(inputs.dtype),
+        saturation=next_saturation.to(inputs.dtype),
+        final_state=tuple(value.to(inputs.dtype) for value in final_state),
+    )
+    core._last_core_online_backend = {
+        "persistent": "cuda_triton_forward",
+        "persistent_single_launch": "cuda_persistent_fp32_forward",
+    }.get(selected, "cuda_batched_fp32_forward")
+    return result, tape
+
+
+def _online_tape_values(core, initial_state, inputs, y, next_budget, novelty, next_saturation, gate):
+    """Replay values the stepwise scans do not write, rebuilt from their tapes."""
+    compute_dtype = torch.float32
     initial_budget, _initial_energy, initial_saturation = (
         value.to(device=inputs.device, dtype=compute_dtype) for value in initial_state
     )
@@ -363,36 +432,7 @@ def cuda_core_online_forward(core, inputs, initial_state, eligibility_state):
         0.0,
         1.0,
     )
-    tape = CoreOnlineTape(
-        inputs=inputs.detach(),
-        budget=budget.detach(),
-        energy=energy.detach(),
-        saturation=saturation.detach(),
-        y=y.detach(),
-        expression=expression.detach(),
-        gate_preactivation=gate_preactivation.detach(),
-        gate=gate.detach(),
-        novelty=novelty.detach(),
-        next_saturation=next_saturation.detach(),
-        novelty_effective=novelty_effective.detach(),
-        write_cost=write_cost.detach(),
-        recovery=recovery.detach(),
-        plasticity=plasticity.detach(),
-    )
-    result = CoreForwardResult(
-        trajectory=trajectory.to(inputs.dtype),
-        novelty=novelty.to(inputs.dtype),
-        plasticity=plasticity.to(inputs.dtype),
-        expression=expression.to(inputs.dtype),
-        write=write.to(inputs.dtype),
-        energy=energy.to(inputs.dtype),
-        saturation=next_saturation.to(inputs.dtype),
-        final_state=tuple(value.to(inputs.dtype) for value in final_state),
-    )
-    core._last_core_online_backend = (
-        "cuda_triton_forward" if selected == "persistent" else "cuda_batched_fp32_forward"
-    )
-    return result, tape
+    return budget, saturation, gate_preactivation, novelty_effective, write_cost, recovery
 
 
 def cuda_core_online_replay(core, tape, signals, eligibility_state):
@@ -403,6 +443,14 @@ def cuda_core_online_replay(core, tape, signals, eligibility_state):
     from dabsn.temporal_credit import core_online_replay_contracted
     if eligibility_state.dtype != torch.float32:
         raise TypeError("native CUDA online replay requires FP32 eligibility")
+    from .core_persistent import persistent_core_supported
+
+    if persistent_core_supported(tape.y) and tape.y.dtype == torch.float32:
+        from .core_online_replay import core_online_replay_fused
+
+        result = core_online_replay_fused(core, tape, signals, eligibility_state)
+        core._last_core_online_backend = "cuda_persistent_forward_fused_replay"
+        return result
     result = core_online_replay_contracted(core, tape, signals, eligibility_state)
     core._last_core_online_backend = "cuda_native_forward_contracted_replay"
     return result
@@ -438,6 +486,17 @@ def _registered_cuda_core_scan(*inputs: Tensor) -> tuple[Tensor, ...]:
     # whose zero stride must be materialized before the Triton launch.
     inputs = tuple(value.contiguous() for value in inputs)
     wx = inputs[0]
+    from .core_persistent import persistent_core_supported, persistent_forward_tapes
+
+    if persistent_core_supported(wx):
+        # One launch for the whole scan (see core_persistent). Same tapes and
+        # dtypes as `_batched_forward_tapes`: activation-dtype tapes, GEMM in
+        # the activation dtype, FP32 state chain.
+        recurrent = torch.cat((inputs[2], inputs[3]), dim=0).to(wx.dtype)
+        outputs = persistent_forward_tapes(
+            wx, inputs[1], recurrent, inputs[4:23], inputs[23:26], tape_dtype=wx.dtype
+        )
+        return (*outputs[:8], *(value.to(wx.dtype) for value in outputs[8:]))
     requested = os.environ.get("DABSN_CORE_BACKEND", "auto").lower()
     selected = select_core_backend(
         int(wx.shape[0]),
@@ -495,6 +554,7 @@ def cuda_compact_three_way_read(
         raise ValueError("compact CUDA admitted-read mode must be seq or field")
     runtime = _runtime()
     from .compact_admitted import admitted_three_way_read_compact_dense_bmm
+    from .read_flash import admitted_three_way_read_flash, flash_read_supported
 
     gains = {
         "short_gain": read.short_gain,
@@ -517,12 +577,32 @@ def cuda_compact_three_way_read(
         # context length, and per-tile activations shrink (lower peak memory,
         # so batch can stay larger). Query rows are independent given the bank,
         # so this is bit-identical to the untiled read.
-        requested = os.environ.get("DABSN_TRAIN_READ_BACKEND", "dense_chunked").lower()
-        if requested not in {"dense_chunked", "dense", "flash"}:
+        requested = os.environ.get("DABSN_TRAIN_READ_BACKEND", "fused").lower()
+        if requested not in {"fused", "dense_chunked", "dense", "flash"}:
             raise ValueError(
-                "DABSN_TRAIN_READ_BACKEND must be dense_chunked, dense, or flash; "
+                "DABSN_TRAIN_READ_BACKEND must be fused, dense_chunked, dense, or flash; "
                 f"got {requested!r}"
             )
+        if requested == "fused" and flash_read_supported(query, bank_keys, cocktail):
+            output = admitted_three_way_read_flash(
+                query,
+                bank_keys,
+                bank_writes,
+                next_writes,
+                cocktail,
+                bank_cocktail,
+                bank_key_bias,
+                bank_admission,
+                scale,
+                bank_idx,
+                bank_valid,
+                mode=mode,
+                **gains,
+            )
+            read._last_three_way_backend = "registered_fused_flash_trainable"
+            return output
+        if requested == "fused":
+            requested = "dense_chunked"
         if requested == "flash":
             from .compact_flash import admitted_three_way_read_compact_flash
 
@@ -576,6 +656,27 @@ def cuda_compact_three_way_read(
     # given the bank, so apply the same score budget here: bit-identical
     # output, bounded peak, and inference inherits the long-context headroom
     # training already had.
+    inference = os.environ.get("DABSN_INFER_READ_BACKEND", "fused").lower()
+    if inference not in {"fused", "auto"}:
+        raise ValueError(f"DABSN_INFER_READ_BACKEND must be fused or auto; got {inference!r}")
+    if inference == "fused" and flash_read_supported(query, bank_keys, cocktail):
+        output = admitted_three_way_read_flash(
+            query,
+            bank_keys,
+            bank_writes,
+            next_writes,
+            cocktail,
+            bank_cocktail,
+            bank_key_bias,
+            bank_admission,
+            scale,
+            bank_idx,
+            bank_valid,
+            mode=mode,
+            **gains,
+        )
+        read._last_three_way_backend = "registered_fused_flash_infer"
+        return output
     if B * T * N > dense_limit:
         output = admitted_three_way_read_compact_dense_bmm(
             query,
@@ -686,7 +787,9 @@ def triton_status() -> dict[str, object]:
         "fused_core_max_h": _fused_max_h_status(),
         "batched_step_compile": os.environ.get("DABSN_BATCHED_STEP_COMPILE", "1") == "1",
         "train_dense_max_scores": int(os.environ.get("DABSN_TRAIN_DENSE_MAX_SCORES", "8388608")),
-        "train_read_backend": os.environ.get("DABSN_TRAIN_READ_BACKEND", "dense_chunked"),
+        "train_read_backend": os.environ.get("DABSN_TRAIN_READ_BACKEND", "fused"),
+        "infer_read_backend": os.environ.get("DABSN_INFER_READ_BACKEND", "fused"),
+        "long_backend": os.environ.get("DABSN_LONG_BACKEND", "fused"),
         "core_scan_enabled": bool(getattr(DABSNCore, "_cuda_native_enabled", False)),
         "core_online_enabled": bool(getattr(DABSNCore, "_cuda_online_enabled", False)),
         "admitted_three_way_read_enabled": bool(getattr(DABSNRead, "_cuda_native_enabled", False)),

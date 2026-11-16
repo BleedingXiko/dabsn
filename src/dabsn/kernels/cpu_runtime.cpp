@@ -185,6 +185,35 @@ inline bool use_local_field_blas_shape(int64_t B, int64_t T) {
   return B >= 256 && T <= 16;
 }
 
+// Dot product with eight fixed partial sums (combined in a fixed tree), so the
+// compiler vectorizes it while the result stays deterministic.
+inline float dot8(const float* __restrict__ a, const float* __restrict__ b, int64_t n) {
+  float acc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+  int64_t j = 0;
+  for (; j + 8 <= n; j += 8) {
+    for (int k = 0; k < 8; ++k) acc[k] += a[j + k] * b[j + k];
+  }
+  float sum = ((acc[0] + acc[1]) + (acc[2] + acc[3])) + ((acc[4] + acc[5]) + (acc[6] + acc[7]));
+  for (; j < n; ++j) sum += a[j] * b[j];
+  return sum;
+}
+
+// [ug; ay] = [Ug; A] @ y, reading GAT = [Ug; A]^T stored row-major (H, 2H).
+// Every output accumulates its terms in the same j order, as a product then an
+// add, exactly as the row dot product it replaces (bitwise identical under
+// -ffp-contract=off). The inner loops run across independent outputs instead
+// of reducing across j, so the compiler vectorizes them.
+inline void recurrent_matvec(const float* __restrict__ GAT, const float* __restrict__ y,
+                             float* __restrict__ ug, float* __restrict__ ay, int64_t H) {
+  for (int64_t i = 0; i < H; ++i) { ug[i] = 0.0f; ay[i] = 0.0f; }
+  for (int64_t j = 0; j < H; ++j) {
+    const float yj = y[j];
+    const float* __restrict__ row = GAT + j * 2 * H;
+    for (int64_t i = 0; i < H; ++i) ug[i] += row[i] * yj;
+    for (int64_t i = 0; i < H; ++i) ay[i] += row[H + i] * yj;
+  }
+}
+
 template <typename scalar_t>
 void linrec_forward_impl(
     const scalar_t* ap, const scalar_t* gp, const scalar_t* yp, scalar_t* op,
@@ -270,6 +299,8 @@ std::vector<torch::Tensor> dabsn_core_scan_cpu(
   const float* Wxp  = Wx.data_ptr<float>();
   const float* Wgxp = Wgx.data_ptr<float>();
   const float* GA   = GA_w.data_ptr<float>();      // row-major (2H, H)
+  torch::Tensor GAT_tensor = GA_w.transpose(0, 1).contiguous();
+  const float* GAT = GAT_tensor.data_ptr<float>();   // (H, 2H) for recurrent_matvec
   const float* betap = beta.data_ptr<float>();
   const float* logk  = log_kappa.data_ptr<float>();
   const float* logr  = logit_recover.data_ptr<float>();
@@ -349,6 +380,84 @@ std::vector<torch::Tensor> dabsn_core_scan_cpu(
     return {U, novel, pout, ayout, wout, eout, cout, b, e, c};
   }
 
+  // Loop-invariant per-unit transforms (same function of the same input every
+  // step, so hoisting them leaves every value bit-identical).
+  std::vector<float> c_decay_v(H), kappa_v(H), recover_v(H);
+  for (int64_t i = 0; i < H; ++i) {
+    c_decay_v[i] = sigmoidf(lcd[i]);
+    kappa_v[i] = softplusf(logk[i]);
+    recover_v[i] = sigmoidf(logr[i]);
+  }
+  // One unit's step. Shared by the per-sequence path and the threaded
+  // single-sequence path below, so both compute identical values.
+  auto unit_step = [&](int64_t i, const float* wgx, const float* y, const float* ug,
+                       const float* ay, float* b, float* e, float* c, float* up, float* np,
+                       float* pp, float* ap, float* wp, float* eg, float* cg) {
+    float s = hardsigmoidf(wgx[i] + ug[i]);
+    float novelty = std::tanh(std::fabs(ay[i] - b[i]));
+    float c_decay = c_decay_v[i];
+    float stress = novelty * (1.0f - e[i]);
+    c[i] = c_decay * c[i] + (1.0f - c_decay) * stress;
+    float novelty_eff = novelty * (1.0f - c_suppress * c[i]);
+    float energy_nov = novelty_eff;
+    float tb = std::tanh(b[i]);
+    float k_sig = ks[i] * s + ky[i] * y[i] + kb[i] * tb + kn[i] * energy_nov + kbias[i];
+    float r_sig = rs[i] * s + ry[i] * y[i] + rb[i] * tb + rn[i] * energy_nov + rbias[i];
+    k_sig += kcp[i] * c[i]; r_sig += rcp[i] * c[i];
+    float kappa = kappa_v[i];
+    float recover = recover_v[i];
+    float k_t = kappa * std::exp(0.5f * std::tanh(k_sig));
+    float r_t = std::min(std::max(recover * std::exp(0.5f * std::tanh(r_sig)), 0.0f), 1.0f);
+    float p = s * e[i];                                 // uses OLD e
+    float write = p * ay[i];
+    float bn = (1.0f - gate_alpha) * b[i] + betap[i] + lam * (p * ay[i]);
+    float en = std::min(std::max(e[i] + r_t * (1.0f - e[i]) - k_t * p, 0.0f), 1.0f);
+    // outputs (U = cat[y, b_new]); cocktail: energy = OLD e (pre-update), saturation = c
+    up[i] = y[i]; up[H + i] = bn;
+    np[i] = novelty; pp[i] = p; ap[i] = ay[i]; wp[i] = write;
+    eg[i] = e[i]; cg[i] = c[i];
+    b[i] = bn; e[i] = en;
+  };
+
+#ifdef _OPENMP
+  if (B == 1 && H >= 128 && omp_get_max_threads() > 1) {
+    // Single sequence (edge inference): split the hidden units across threads
+    // inside each step. One barrier per step; y is double-buffered so no
+    // thread overwrites a y another thread is still reading.
+    std::vector<float> b(H), e(H), c(H), ybuf(2 * H), ug(H), ay(H);
+    for (int64_t i = 0; i < H; ++i) { b[i] = Binit[i]; e[i] = Einit[i]; c[i] = Cinit[i]; }
+    #pragma omp parallel
+    {
+      const int64_t nth = omp_get_num_threads();
+      const int64_t tid = omp_get_thread_num();
+      const int64_t chunk = (H + nth - 1) / nth;
+      const int64_t lo = std::min<int64_t>(H, tid * chunk);
+      const int64_t hi = std::min<int64_t>(H, lo + chunk);
+      for (int64_t t = 0; t < T; ++t) {
+        float* y = ybuf.data() + (t & 1) * H;
+        const float* wx = Wxp + t * H;
+        const float* wgx = Wgxp + t * H;
+        for (int64_t i = lo; i < hi; ++i) y[i] = std::tanh(wx[i] + b[i]);
+        #pragma omp barrier
+        for (int64_t i = lo; i < hi; ++i) { ug[i] = 0.0f; ay[i] = 0.0f; }
+        for (int64_t j = 0; j < H; ++j) {
+          const float yj = y[j];
+          const float* row = GAT + j * 2 * H;
+          for (int64_t i = lo; i < hi; ++i) ug[i] += row[i] * yj;
+          for (int64_t i = lo; i < hi; ++i) ay[i] += row[H + i] * yj;
+        }
+        float* up = Up + t * 2 * H;
+        for (int64_t i = lo; i < hi; ++i) {
+          unit_step(i, wgx, y, ug.data(), ay.data(), b.data(), e.data(), c.data(), up,
+                    Np + t * H, Pp + t * H, Ap + t * H, Wp + t * H, Ep + t * H, Cp + t * H);
+        }
+      }
+    }
+    for (int64_t i = 0; i < H; ++i) { Bfinal[i] = b[i]; Efinal[i] = e[i]; Cfinal[i] = c[i]; }
+    return {U, novel, pout, ayout, wout, eout, cout, bfinal, efinal, cfinal};
+  }
+#endif
+
   #pragma omp parallel for schedule(static) if (B > 1)
   for (int64_t bi = 0; bi < B; ++bi) {
     std::vector<float> b(H), e(H), c(H);
@@ -364,13 +473,7 @@ std::vector<torch::Tensor> dabsn_core_scan_cpu(
       // y = tanh(Wx + b)
       for (int64_t i = 0; i < H; ++i) y[i] = std::tanh(wx[i] + b[i]);
       // [ug; ay] = GA_w @ y   (GA_w rows 0..H-1 = Ug, rows H..2H-1 = A)
-      for (int64_t i = 0; i < H; ++i) {
-        const float* gu = GA + i * H;
-        const float* ga = GA + (H + i) * H;
-        float su = 0.0f, sa = 0.0f;
-        for (int64_t j = 0; j < H; ++j) { su += gu[j] * y[j]; sa += ga[j] * y[j]; }
-        ug[i] = su; ay[i] = sa;
-      }
+      recurrent_matvec(GAT, y.data(), ug.data(), ay.data(), H);
       float* up = Up + (bi * T + t) * 2 * H;
       float* np = Np + (bi * T + t) * H;
       float* pp = Pp + (bi * T + t) * H;
@@ -379,30 +482,8 @@ std::vector<torch::Tensor> dabsn_core_scan_cpu(
       float* eg = Ep + (bi * T + t) * H;
       float* cg = Cp + (bi * T + t) * H;
       for (int64_t i = 0; i < H; ++i) {
-        float s = hardsigmoidf(wgx[i] + ug[i]);
-        float novelty = std::tanh(std::fabs(ay[i] - b[i]));
-        float c_decay = sigmoidf(lcd[i]);
-        float stress = novelty * (1.0f - e[i]);
-        c[i] = c_decay * c[i] + (1.0f - c_decay) * stress;
-        float novelty_eff = novelty * (1.0f - c_suppress * c[i]);
-        float energy_nov = novelty_eff;
-        float tb = std::tanh(b[i]);
-        float k_sig = ks[i] * s + ky[i] * y[i] + kb[i] * tb + kn[i] * energy_nov + kbias[i];
-        float r_sig = rs[i] * s + ry[i] * y[i] + rb[i] * tb + rn[i] * energy_nov + rbias[i];
-        k_sig += kcp[i] * c[i]; r_sig += rcp[i] * c[i];
-        float kappa = softplusf(logk[i]);
-        float recover = sigmoidf(logr[i]);
-        float k_t = kappa * std::exp(0.5f * std::tanh(k_sig));
-        float r_t = std::min(std::max(recover * std::exp(0.5f * std::tanh(r_sig)), 0.0f), 1.0f);
-        float p = s * e[i];                                 // uses OLD e
-        float write = p * ay[i];
-        float bn = (1.0f - gate_alpha) * b[i] + betap[i] + lam * (p * ay[i]);
-        float en = std::min(std::max(e[i] + r_t * (1.0f - e[i]) - k_t * p, 0.0f), 1.0f);
-        // outputs (U = cat[y, b_new]); cocktail: energy = OLD e (pre-update), saturation = c
-        up[i] = y[i]; up[H + i] = bn;
-        np[i] = novelty; pp[i] = p; ap[i] = ay[i]; wp[i] = write;
-        eg[i] = e[i]; cg[i] = c[i];
-        b[i] = bn; e[i] = en;
+        unit_step(i, wgx, y.data(), ug.data(), ay.data(), b.data(), e.data(), c.data(),
+                  up, np, pp, ap, wp, eg, cg);
       }
     }
     for (int64_t i = 0; i < H; ++i) {
@@ -473,61 +554,54 @@ torch::Tensor three_way_read_cpu(
       const float* cbt = cp + (bi * T + ti) * C;
       float* obt = op + (bi * T + ti) * H;
 
-      auto do_read = [&](bool perm, const float* values, const bool* mask, bool eligible, float gain) {
-        if (!eligible || gain == 0.0f) return;
-        float max_score = neg_inf;
-        for (int64_t ni = 0; ni < N; ++ni) {
-          if (!mask[(bi * T + ti) * N + ni]) continue;
-          const float* kbv = kbp + (bi * N + ni) * H;
-          float dot = 0.0f;
-          for (int64_t hi = 0; hi < H; ++hi) dot += qbt[hi] * kbv[hi];
-          float score = dot * scale + kbg[bi * N + ni] + adm[bi * N + ni];
-          if (perm) {
-            const float* cbv = cbp + (bi * N + ni) * C;
-            float cdot = 0.0f;
-            for (int64_t ci = 0; ci < C; ++ci) cdot += cbt[ci] * cbv[ci];
-            score += cdot * cocktail_gain;
-          }
-          max_score = std::max(max_score, score);
+      // One score per (query, bank entry) feeds all three reads: short and
+      // permanent share the allow mask (permanent adds the cocktail term),
+      // induction uses the strictly-earlier mask on the short score.
+      const int64_t row = (bi * T + ti) * N;
+      const bool* am = allowp + row;
+      const bool* im = iallowp + row;
+      const bool use_s = eligp[bi * T + ti] && short_gain != 0.0f;
+      const bool use_p = eligp[bi * T + ti] && pad_gain != 0.0f;
+      const bool use_i = ieligp[bi * T + ti] && induct_gain != 0.0f;
+      if (!use_s && !use_p && !use_i) continue;
+      std::vector<float> sc(N), pc(N);
+      float ms = neg_inf, mp = neg_inf, mi = neg_inf;
+      for (int64_t ni = 0; ni < N; ++ni) {
+        const bool a = am[ni], in = im[ni];
+        if (!a && !in) continue;
+        const float score = dot8(qbt, kbp + (bi * N + ni) * H, H) * scale
+                            + kbg[bi * N + ni] + adm[bi * N + ni];
+        sc[ni] = score;
+        if (a) {
+          const float* cbv = cbp + (bi * N + ni) * C;
+          float cdot = 0.0f;
+          for (int64_t ci = 0; ci < C; ++ci) cdot += cbt[ci] * cbv[ci];
+          pc[ni] = score + cdot * cocktail_gain;
+          ms = std::max(ms, score);
+          mp = std::max(mp, pc[ni]);
         }
-        if (max_score == neg_inf) return;
-        float denom = 0.0f;
-        for (int64_t ni = 0; ni < N; ++ni) {
-          if (!mask[(bi * T + ti) * N + ni]) continue;
-          const float* kbv = kbp + (bi * N + ni) * H;
-          float dot = 0.0f;
-          for (int64_t hi = 0; hi < H; ++hi) dot += qbt[hi] * kbv[hi];
-          float score = dot * scale + kbg[bi * N + ni] + adm[bi * N + ni];
-          if (perm) {
-            const float* cbv = cbp + (bi * N + ni) * C;
-            float cdot = 0.0f;
-            for (int64_t ci = 0; ci < C; ++ci) cdot += cbt[ci] * cbv[ci];
-            score += cdot * cocktail_gain;
-          }
-          denom += std::exp(score - max_score);
-        }
-        if (denom <= 0.0f) return;
-        for (int64_t ni = 0; ni < N; ++ni) {
-          if (!mask[(bi * T + ti) * N + ni]) continue;
-          const float* kbv = kbp + (bi * N + ni) * H;
-          float dot = 0.0f;
-          for (int64_t hi = 0; hi < H; ++hi) dot += qbt[hi] * kbv[hi];
-          float score = dot * scale + kbg[bi * N + ni] + adm[bi * N + ni];
-          if (perm) {
-            const float* cbv = cbp + (bi * N + ni) * C;
-            float cdot = 0.0f;
-            for (int64_t ci = 0; ci < C; ++ci) cdot += cbt[ci] * cbv[ci];
-            score += cdot * cocktail_gain;
-          }
-          const float weight = gain * std::exp(score - max_score) / denom;
-          const float* val = values + (bi * N + ni) * H;
+        if (in) mi = std::max(mi, score);
+      }
+      float ds = 0.0f, dp = 0.0f, di = 0.0f;
+      for (int64_t ni = 0; ni < N; ++ni) {
+        if (am[ni]) { ds += std::exp(sc[ni] - ms); dp += std::exp(pc[ni] - mp); }
+        if (im[ni]) di += std::exp(sc[ni] - mi);
+      }
+      const float ws = (use_s && ms != neg_inf && ds > 0.0f) ? short_gain / ds : 0.0f;
+      const float wp = (use_p && mp != neg_inf && dp > 0.0f) ? pad_gain / dp : 0.0f;
+      const float wi = (use_i && mi != neg_inf && di > 0.0f) ? induct_gain / di : 0.0f;
+      for (int64_t ni = 0; ni < N; ++ni) {
+        if (am[ni] && (ws != 0.0f || wp != 0.0f)) {
+          const float weight = ws * std::exp(sc[ni] - ms) + wp * std::exp(pc[ni] - mp);
+          const float* val = wbp + (bi * N + ni) * H;
           for (int64_t hi = 0; hi < H; ++hi) obt[hi] += weight * val[hi];
         }
-      };
-
-      do_read(false, wbp, allowp, eligp[bi * T + ti], short_gain);
-      do_read(true, wbp, allowp, eligp[bi * T + ti], pad_gain);
-      do_read(false, wnp, iallowp, ieligp[bi * T + ti], induct_gain);
+        if (im[ni] && wi != 0.0f) {
+          const float weight = wi * std::exp(sc[ni] - mi);
+          const float* val = wnp + (bi * N + ni) * H;
+          for (int64_t hi = 0; hi < H; ++hi) obt[hi] += weight * val[hi];
+        }
+      }
     }
   }
   return out;
@@ -795,6 +869,8 @@ std::vector<torch::Tensor> dabsn_core_scan_fwd_train(
   const float* Wxp  = Wx.data_ptr<float>();
   const float* Wgxp = Wgx.data_ptr<float>();
   const float* GA   = GA_w.data_ptr<float>();
+  torch::Tensor GAT_tensor = GA_w.transpose(0, 1).contiguous();
+  const float* GAT = GAT_tensor.data_ptr<float>();   // (H, 2H) for recurrent_matvec
   const float* betap = beta.data_ptr<float>();
   const float* logk  = log_kappa.data_ptr<float>();
   const float* logr  = logit_recover.data_ptr<float>();
@@ -890,13 +966,7 @@ std::vector<torch::Tensor> dabsn_core_scan_fwd_train(
       const float* wx  = Wxp  + (bi * T + t) * H;
       const float* wgx = Wgxp + (bi * T + t) * H;
       for (int64_t i = 0; i < H; ++i) y[i] = std::tanh(wx[i] + b[i]);
-      for (int64_t i = 0; i < H; ++i) {
-        const float* gu = GA + i * H;
-        const float* ga = GA + (H + i) * H;
-        float su = 0.0f, sa = 0.0f;
-        for (int64_t j = 0; j < H; ++j) { su += gu[j] * y[j]; sa += ga[j] * y[j]; }
-        ug[i] = su; ay[i] = sa;
-      }
+      recurrent_matvec(GAT, y.data(), ug.data(), ay.data(), H);
       float* up = Up + (bi * T + t) * 2 * H;
       int64_t off = (bi * T + t) * H;
       for (int64_t i = 0; i < H; ++i) {
@@ -977,6 +1047,8 @@ std::vector<torch::Tensor> dabsn_core_scan_bwd(
 
   const float* Wxp = Wx.data_ptr<float>(); const float* Wgxp = Wgx.data_ptr<float>();
   const float* GA = GA_w.data_ptr<float>();
+  torch::Tensor GAT_tensor = GA_w.transpose(0, 1).contiguous();
+  const float* GAT = GAT_tensor.data_ptr<float>();   // (H, 2H) for recurrent_matvec
   const float* logk = log_kappa.data_ptr<float>(); const float* logr = logit_recover.data_ptr<float>();
   const float* ks = k_s.data_ptr<float>(); const float* ky = k_y.data_ptr<float>();
   const float* kb = k_b.data_ptr<float>(); const float* kn = k_n.data_ptr<float>();
@@ -1022,12 +1094,7 @@ std::vector<torch::Tensor> dabsn_core_scan_bwd(
       int64_t off = (bi * T + t) * H;
       // recompute y, ug, ay for this step
       for (int64_t i = 0; i < H; ++i) y[i] = std::tanh(wx[i] + Bpre[off + i]);
-      for (int64_t i = 0; i < H; ++i) {
-        const float* gu = GA + i * H; const float* ga = GA + (H + i) * H;
-        float su = 0.0f, sa = 0.0f;
-        for (int64_t j = 0; j < H; ++j) { su += gu[j] * y[j]; sa += ga[j] * y[j]; }
-        ug[i] = su; ay[i] = sa;
-      }
+      recurrent_matvec(GAT, y.data(), ug.data(), ay.data(), H);
       for (int64_t i = 0; i < H; ++i) {
         float b0 = Bpre[off + i], e0 = Epre[off + i], c0 = Cpre[off + i];
         // ---- recompute forward locals ----

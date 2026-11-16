@@ -118,6 +118,7 @@ from .ops import stable_expert_permutation, weighted_scatter_add
 from .pretrain import pretrain_next_token
 from .providers import register_builtin_components
 from .read import DABSNRead
+from .host_memory import DABSNHostMemory
 from .temporal_credit import (
     CoreEligibilityState,
     LongReadEligibilityState,
@@ -183,6 +184,7 @@ __all__ = [
     "CapacityAddressMode",
     "DABSNPretrainConfig",
     "DABSNRead",
+    "DABSNHostMemory",
     "DABSNModel",
     "DABSNGraph",
     "DABSNSequenceLM",
@@ -293,6 +295,6 @@ __all__ = [
     "verify_gradients",
 ]
 
-__version__ = "0.2.2"
+__version__ = "1.0.0"
 
 register_builtin_components()

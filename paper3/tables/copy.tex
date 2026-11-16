@@ -1,0 +1,25 @@
+\begin{table}\centering\small
+\setlength{\tabcolsep}{4pt}
+\begin{adjustbox}{max width=\linewidth}
+\begin{tabular}{lrrrrrrrr}
+\toprule
+ & \multicolumn{1}{c}{train} & \multicolumn{5}{c}{distance} & \multicolumn{2}{c}{load} \\
+Model & val & 1$\times$ & 2$\times$ & 4$\times$ & 16$\times$ & 64$\times$ & 2$\times$ & 8$\times$ \\
+\midrule
+NoPE & 99.8{\scriptsize$\pm$0.2} & 99.6{\scriptsize$\pm$0.4} & 30.1{\scriptsize$\pm$5.9} & 22.1{\scriptsize$\pm$0.6} & 13.9{\scriptsize$\pm$2.4} & 11.5{\scriptsize$\pm$4.2} & 27.2{\scriptsize$\pm$9.0} & 12.4{\scriptsize$\pm$0.2} \\
+RoPE & 100.0{\scriptsize$\pm$0.0} & \textbf{100.0}{\scriptsize$\pm$0.0} & 12.2{\scriptsize$\pm$0.5} & 11.8{\scriptsize$\pm$1.0} & 12.3{\scriptsize$\pm$1.0} & 12.4{\scriptsize$\pm$0.3} & 12.3{\scriptsize$\pm$0.2} & 12.5{\scriptsize$\pm$0.2} \\
+RoPE + PI & 100.0{\scriptsize$\pm$0.0} & \textbf{100.0}{\scriptsize$\pm$0.0} & 12.9{\scriptsize$\pm$0.4} & 11.9{\scriptsize$\pm$0.9} & 12.9{\scriptsize$\pm$1.4} & 12.1{\scriptsize$\pm$1.1} & 12.6{\scriptsize$\pm$0.3} & 12.2{\scriptsize$\pm$0.3} \\
+RoPE + YaRN & 100.0{\scriptsize$\pm$0.0} & \textbf{100.0}{\scriptsize$\pm$0.0} & 11.1{\scriptsize$\pm$0.3} & 11.7{\scriptsize$\pm$0.8} & 12.5{\scriptsize$\pm$0.3} & 12.8{\scriptsize$\pm$1.2} & 13.2{\scriptsize$\pm$0.2} & 12.6{\scriptsize$\pm$0.1} \\
+RoPE + YaRN (fine-tuned)$^\dagger$ & 11.6{\scriptsize$\pm$0.1} & 11.9{\scriptsize$\pm$0.3} & 12.9{\scriptsize$\pm$0.4} & 100.0{\scriptsize$\pm$0.0} & 12.2{\scriptsize$\pm$0.4} & 12.4{\scriptsize$\pm$0.5} & 13.0{\scriptsize$\pm$0.3} & 14.4{\scriptsize$\pm$0.3} \\
+ALiBi & 100.0{\scriptsize$\pm$0.0} & 99.9{\scriptsize$\pm$0.0} & 76.4{\scriptsize$\pm$19.5} & 46.7{\scriptsize$\pm$34.3} & 27.0{\scriptsize$\pm$12.6} & 12.9{\scriptsize$\pm$0.2} & 13.3{\scriptsize$\pm$1.7} & 2.4{\scriptsize$\pm$0.2} \\
+Sliding window$^\dagger$ & 12.6{\scriptsize$\pm$0.6} & 11.7{\scriptsize$\pm$0.3} & 12.3{\scriptsize$\pm$0.9} & 12.1{\scriptsize$\pm$1.3} & 13.3{\scriptsize$\pm$0.8} & 11.9{\scriptsize$\pm$0.9} & 12.4{\scriptsize$\pm$0.1} & 12.8{\scriptsize$\pm$0.2} \\
+Infini-attention & 99.9{\scriptsize$\pm$0.1} & 99.9{\scriptsize$\pm$0.1} & \textbf{98.4}{\scriptsize$\pm$1.1} & \textbf{84.3}{\scriptsize$\pm$6.6} & \textbf{37.7}{\scriptsize$\pm$10.0} & \textbf{24.2}{\scriptsize$\pm$2.9} & 10.6{\scriptsize$\pm$5.7} & \textbf{14.3}{\scriptsize$\pm$0.8} \\
+NoPE + matched MLP (front) & 99.9{\scriptsize$\pm$0.1} & 99.7{\scriptsize$\pm$0.2} & 20.9{\scriptsize$\pm$1.2} & 17.4{\scriptsize$\pm$3.2} & 17.6{\scriptsize$\pm$4.6} & 17.1{\scriptsize$\pm$3.6} & 16.1{\scriptsize$\pm$3.4} & 4.6{\scriptsize$\pm$1.8} \\
+\textbf{NoPE + memory (front)} & 99.7{\scriptsize$\pm$0.5} & 99.6{\scriptsize$\pm$0.7} & 61.0{\scriptsize$\pm$29.0} & 30.6{\scriptsize$\pm$8.9} & 19.5{\scriptsize$\pm$6.3} & 15.5{\scriptsize$\pm$4.0} & \textbf{30.6}{\scriptsize$\pm$12.8} & 10.0{\scriptsize$\pm$7.4} \\
+\textbf{Sliding window + memory (front)$^\dagger$} & 48.6{\scriptsize$\pm$1.0} & 48.6{\scriptsize$\pm$1.2} & 42.6{\scriptsize$\pm$2.8} & 40.2{\scriptsize$\pm$3.0} & 29.8{\scriptsize$\pm$9.2} & 26.8{\scriptsize$\pm$13.8} & 18.4{\scriptsize$\pm$0.2} & 11.6{\scriptsize$\pm$2.9} \\
+\bottomrule
+\end{tabular}
+\end{adjustbox}
+\caption{Copying~\citep{arjovsky2016unitary}, trained at 256 tokens. Accuracy (\%), mean $\pm$ standard deviation over three seeds. Distance: filler between the facts and their use at $k\times$ the training length; load: $k\times$ the largest training load with the filler at its training size. The best model that learned the task is in bold; $^\dagger$ marks models below 90\% at the training length, which are not compared beyond it.}
+\label{tab:copy}
+\end{table}

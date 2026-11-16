@@ -1,0 +1,18 @@
+\begin{table}\centering\small
+\begin{tabular}{llrrrr}
+\toprule
+Task & Model & $1\times$ & $4\times$ & $16\times$ & $64\times$ \\
+\midrule
+MQAR & NoPE + memory (front) & 1.00 & 1.00 & 1.00 & 1.00 \\
+MQAR & Sliding window + memory (front) & 1.00 & 1.00 & 1.00 & 1.00 \\
+Passkey & NoPE + memory (front) & 0.85 & 0.85 & 0.85 & 0.85 \\
+Passkey & Sliding window + memory (front) & 0.77 & 0.77 & 0.75 & 0.74 \\
+Copying & NoPE + memory (front) & 1.00 & 1.00 & 1.00 & 1.00 \\
+Copying & Sliding window + memory (front) & 0.68 & 0.67 & 0.67 & 0.67 \\
+Selective copying & NoPE + memory (front) & 1.00 & 1.00 & 1.00 & 1.00 \\
+Selective copying & Sliding window + memory (front) & 0.72 & 0.69 & 0.69 & 0.68 \\
+\bottomrule
+\end{tabular}
+\caption{Admitted bank as a fraction of the sequence length, at $k\times$ the training length (8 sequences per point, read one at a time; mean over seeds).}
+\label{tab:bank}
+\end{table}

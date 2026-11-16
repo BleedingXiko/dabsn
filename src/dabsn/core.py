@@ -245,6 +245,26 @@ class DABSNCore(nn.Module):
             return result, (budget, energy, saturation)
         return result
 
+    def _native_cpu_training(self, inputs: Tensor) -> bool:
+        """Whether a BPTT call takes the native C++ CPU training scan."""
+        if (
+            inputs.device.type != "cpu"
+            or inputs.dtype != torch.float32
+            or not bool(getattr(type(self), "_cpu_native_enabled", False))
+            or not torch.is_grad_enabled()
+            or torch.compiler.is_compiling()
+        ):
+            return False
+        if torch.is_autocast_enabled("cpu") and torch.get_autocast_dtype("cpu") != torch.float32:
+            # Low-precision projections: keep the registered op's explicit
+            # low-precision routing (and its fallback event) unchanged.
+            return False
+        from torch._subclasses.fake_tensor import is_fake
+
+        if is_fake(inputs):
+            return False
+        return inputs.requires_grad or any(p.requires_grad for p in self.parameters())
+
     def forward_from_state(
         self,
         inputs: Tensor,
@@ -300,6 +320,15 @@ class DABSNCore(nn.Module):
                 raise ValueError("BPTT mode does not accept online eligibility state")
             from .kernels.batched_runtime import dabsn_core_scan_batched
 
+        if not online and self._native_cpu_training(inputs):
+            # CPU FP32 training: the native C++ forward with its C++ reverse
+            # scan (exact against the reference). The registered op's generic
+            # reverse issues ~90 PyTorch ops per timestep on CPU.
+            from .kernels.cpu import native_core_forward_train
+
+            full = native_core_forward_train(self, inputs, initial_state=initial_state)
+            outputs = full if return_cocktail else (*full[:5], *full[7:10])
+        elif not online:
             outputs = dabsn_core_scan_batched(
                 self.W(inputs),
                 self.Wg(inputs),

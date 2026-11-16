@@ -98,9 +98,13 @@ def test_cuda_online_forward_and_replay_match_reference() -> None:
             atol=3e-6,
         )
     torch.testing.assert_close(actual_input, expected_input, rtol=3e-5, atol=3e-6)
-    assert (
-        core._last_core_online_backend
-        == "cuda_native_forward_contracted_replay"
+    from dabsn.kernels.core_persistent import persistent_core_supported
+
+    fused = persistent_core_supported(actual_tape.y) and actual_tape.y.dtype == torch.float32
+    assert core._last_core_online_backend == (
+        "cuda_persistent_forward_fused_replay"
+        if fused
+        else "cuda_native_forward_contracted_replay"
     )
 
 

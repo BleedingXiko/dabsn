@@ -1,0 +1,25 @@
+\begin{table}\centering\small
+\setlength{\tabcolsep}{4pt}
+\begin{adjustbox}{max width=\linewidth}
+\begin{tabular}{lrrrrrrr}
+\toprule
+ & \multicolumn{1}{c}{train} & \multicolumn{4}{c}{distance} & \multicolumn{2}{c}{load} \\
+Model & val & 1$\times$ & 4$\times$ & 16$\times$ & 64$\times$ & 2$\times$ & 8$\times$ \\
+\midrule
+NoPE & 99.8{\scriptsize$\pm$0.2} & 99.9{\scriptsize$\pm$0.1} & 98.3{\scriptsize$\pm$1.9} & 78.0{\scriptsize$\pm$13.3} & 43.3{\scriptsize$\pm$11.5} & 50.0{\scriptsize$\pm$13.0} & 8.8{\scriptsize$\pm$7.3} \\
+RoPE & 100.0{\scriptsize$\pm$0.0} & \textbf{100.0}{\scriptsize$\pm$0.0} & 62.4{\scriptsize$\pm$21.7} & 16.2{\scriptsize$\pm$10.7} & 8.3{\scriptsize$\pm$0.6} & 54.1{\scriptsize$\pm$7.0} & 20.7{\scriptsize$\pm$3.3} \\
+RoPE + PI & 100.0{\scriptsize$\pm$0.0} & \textbf{100.0}{\scriptsize$\pm$0.0} & 33.8{\scriptsize$\pm$2.8} & 21.1{\scriptsize$\pm$2.8} & 15.0{\scriptsize$\pm$3.2} & 53.5{\scriptsize$\pm$10.4} & 18.2{\scriptsize$\pm$3.0} \\
+RoPE + YaRN & 100.0{\scriptsize$\pm$0.0} & \textbf{100.0}{\scriptsize$\pm$0.0} & 79.1{\scriptsize$\pm$17.9} & 70.8{\scriptsize$\pm$27.0} & 68.6{\scriptsize$\pm$35.6} & 53.3{\scriptsize$\pm$6.8} & 21.4{\scriptsize$\pm$2.3} \\
+RoPE + YaRN (fine-tuned) & 99.3{\scriptsize$\pm$1.2} & 99.8{\scriptsize$\pm$0.3} & \textbf{99.9}{\scriptsize$\pm$0.1} & 98.7{\scriptsize$\pm$2.2} & 96.0{\scriptsize$\pm$5.3} & 58.3{\scriptsize$\pm$4.2} & 23.0{\scriptsize$\pm$2.7} \\
+ALiBi & 100.0{\scriptsize$\pm$0.0} & 99.9{\scriptsize$\pm$0.1} & 89.3{\scriptsize$\pm$14.3} & 34.0{\scriptsize$\pm$5.8} & 16.6{\scriptsize$\pm$4.6} & 64.1{\scriptsize$\pm$8.3} & 20.8{\scriptsize$\pm$4.9} \\
+Sliding window & 98.9{\scriptsize$\pm$0.1} & 99.2{\scriptsize$\pm$0.4} & 28.7{\scriptsize$\pm$2.3} & 17.3{\scriptsize$\pm$1.1} & 12.1{\scriptsize$\pm$2.6} & 29.1{\scriptsize$\pm$7.7} & 10.4{\scriptsize$\pm$0.4} \\
+Infini-attention & 100.0{\scriptsize$\pm$0.0} & 99.7{\scriptsize$\pm$0.6} & 93.9{\scriptsize$\pm$7.1} & 64.2{\scriptsize$\pm$10.6} & 25.2{\scriptsize$\pm$7.8} & 20.0{\scriptsize$\pm$2.3} & 7.6{\scriptsize$\pm$2.9} \\
+NoPE + matched MLP (front) & 99.7{\scriptsize$\pm$0.4} & 99.7{\scriptsize$\pm$0.5} & 99.1{\scriptsize$\pm$0.4} & 78.6{\scriptsize$\pm$6.5} & 48.6{\scriptsize$\pm$15.2} & 48.6{\scriptsize$\pm$27.7} & 14.4{\scriptsize$\pm$1.2} \\
+\textbf{NoPE + memory (front)} & 100.0{\scriptsize$\pm$0.0} & \textbf{100.0}{\scriptsize$\pm$0.0} & \textbf{99.9}{\scriptsize$\pm$0.1} & \textbf{100.0}{\scriptsize$\pm$0.0} & \textbf{100.0}{\scriptsize$\pm$0.0} & 74.8{\scriptsize$\pm$10.4} & 26.0{\scriptsize$\pm$3.5} \\
+\textbf{Sliding window + memory (front)} & 99.8{\scriptsize$\pm$0.0} & 99.6{\scriptsize$\pm$0.2} & 79.6{\scriptsize$\pm$4.0} & 75.1{\scriptsize$\pm$5.1} & 73.9{\scriptsize$\pm$6.7} & \textbf{84.4}{\scriptsize$\pm$2.3} & \textbf{32.1}{\scriptsize$\pm$1.1} \\
+\bottomrule
+\end{tabular}
+\end{adjustbox}
+\caption{Passkey retrieval~\citep{mohtashami2023landmark}, trained at 256 tokens. Accuracy (\%), mean $\pm$ standard deviation over three seeds. Distance: filler between the facts and their use at $k\times$ the training length; load: $k\times$ the largest training load with the filler at its training size. The best model that learned the task is in bold; $^\dagger$ marks models below 90\% at the training length, which are not compared beyond it.}
+\label{tab:passkey}
+\end{table}

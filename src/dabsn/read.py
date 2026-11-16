@@ -11,6 +11,16 @@ from torch import Tensor
 from torch._subclasses.fake_tensor import is_fake
 
 
+def _token_read_selected(expression: Tensor, write: Tensor) -> bool:
+    """Whether the CUDA read takes the fused per-token path (bank addressed in-kernel)."""
+    env = "DABSN_TRAIN_READ_BACKEND" if torch.is_grad_enabled() else "DABSN_INFER_READ_BACKEND"
+    if os.environ.get(env, "fused").lower() != "fused":
+        return False
+    from .kernels.read_flash import token_read_supported
+
+    return token_read_supported(expression, write)
+
+
 def _parameter(value: float) -> nn.Parameter:
     return nn.Parameter(torch.full((1,), float(value)))
 
@@ -63,11 +73,26 @@ class _AdmittedReadParameters(nn.Module):
         saturation: Tensor,
     ) -> Tensor:
         hidden = plasticity.shape[-1]
+        return self.admission_from_means(
+            torch.log1p(plasticity.mean(dim=-1) * hidden),
+            novelty.mean(dim=-1),
+            energy.mean(dim=-1),
+            saturation.mean(dim=-1),
+        )
+
+    def admission_from_means(
+        self,
+        log_plasticity: Tensor,
+        novelty_mean: Tensor,
+        energy_mean: Tensor,
+        saturation_mean: Tensor,
+    ) -> Tensor:
+        """``admission`` from precomputed tag means (same terms, same order)."""
         return (
-            self.adm_p_gain * torch.log1p(plasticity.mean(dim=-1) * hidden)
-            + self.adm_novelty_gain * novelty.mean(dim=-1)
-            + self.adm_saturation_gain * saturation.mean(dim=-1)
-            + self.adm_energy_gain * energy.mean(dim=-1)
+            self.adm_p_gain * log_plasticity
+            + self.adm_novelty_gain * novelty_mean
+            + self.adm_saturation_gain * saturation_mean
+            + self.adm_energy_gain * energy_mean
             + self.adm_bias
         )
 
@@ -168,32 +193,41 @@ class DABSNRead(nn.Module):
         del field_shape
         read_parameters = self.short_read
         batch, seq_len, hidden = expression.shape
-        query = F.normalize(expression, dim=-1)
+        compact_cuda = expression.is_cuda and bool(
+            getattr(type(self), "_cuda_native_enabled", False)
+        )
+        # The fused CUDA read normalizes query and key rows and gathers the
+        # admitted bank inside its kernels; every other path gathers here.
+        token_path = compact_cuda and _token_read_selected(expression, write)
+        query = None if token_path else F.normalize(expression, dim=-1)
         # Keys are normalized AFTER the admitted-bank gather (see gather_bank):
         # F.normalize is row-wise and the gather selects whole rows, so
         # normalize(gather(write)) == gather(normalize(write)) exactly, but the
         # backward now only pins the [B, n_max, H] gathered keys instead of a
         # full [B, T, H] normalized-write tape.
         scale = (F.softplus(read_parameters.log_temp) + 1.0) * (hidden**0.5)
+        # Each tag enters only through its mean over the hidden width; compute
+        # the four means once (the reference read reduced each tag up to three
+        # times). Same terms in the same order, so the values are unchanged.
+        novelty_mean = novelty.mean(dim=-1)
+        plasticity_mean = plasticity.mean(dim=-1)
+        energy_mean = energy.mean(dim=-1)
+        saturation_mean = saturation.mean(dim=-1)
+        log_plasticity = torch.log1p(plasticity_mean * hidden)
         key_bias = (
-            read_parameters.p_gain * torch.log1p(plasticity.mean(dim=-1) * hidden)
-            + read_parameters.novelty_gain * novelty.mean(dim=-1)
+            read_parameters.p_gain * log_plasticity
+            + read_parameters.novelty_gain * novelty_mean
             + read_parameters.null_bias
         )
-        admission = read_parameters.admission(
-            novelty,
-            plasticity,
-            energy,
-            saturation,
+        admission = read_parameters.admission_from_means(
+            log_plasticity,
+            novelty_mean,
+            energy_mean,
+            saturation_mean,
         )
         cocktail = F.normalize(
             torch.stack(
-                [
-                    energy.mean(dim=-1),
-                    saturation.mean(dim=-1),
-                    novelty.mean(dim=-1),
-                    plasticity.mean(dim=-1),
-                ],
+                [energy_mean, saturation_mean, novelty_mean, plasticity_mean],
                 dim=-1,
             ),
             dim=-1,
@@ -213,7 +247,7 @@ class DABSNRead(nn.Module):
 
         counts = member.sum(dim=1)
         order = torch.argsort(
-            member.to(query.dtype),
+            member.to(expression.dtype if query is None else query.dtype),
             dim=1,
             descending=True,
             stable=True,
@@ -273,11 +307,12 @@ class DABSNRead(nn.Module):
             bank_admission = torch.gather(admission, 1, index)
             return bank_keys, bank_writes, bank_cocktail, bank_key_bias, bank_admission
 
-        seq_keys, seq_writes, seq_cocktail, seq_bias, seq_admission = gather_bank(seq_idx)
         field_idx = seq_idx
         field_valid = seq_valid
-        field_keys, field_writes, field_cocktail = seq_keys, seq_writes, seq_cocktail
-        field_bias, field_admission = seq_bias, seq_admission
+        if not token_path:
+            seq_keys, seq_writes, seq_cocktail, seq_bias, seq_admission = gather_bank(seq_idx)
+            field_keys, field_writes, field_cocktail = seq_keys, seq_writes, seq_cocktail
+            field_bias, field_admission = seq_bias, seq_admission
         read_paths = 2 if self.read_geometry == "hybrid" else 1
         if not compiling:
             self.last_read_contract = {
@@ -294,9 +329,6 @@ class DABSNRead(nn.Module):
                 "kernel_backend": "eager_reference",
             }
 
-        compact_cuda = expression.is_cuda and bool(
-            getattr(type(self), "_cuda_native_enabled", False)
-        )
         if compact_cuda:
             query_pos = None
             seq_allow = seq_eligible = None
@@ -315,12 +347,13 @@ class DABSNRead(nn.Module):
         elif self.read_geometry != "seq":
             self.last_field_neighbors = None
 
-        next_idx = (seq_idx + 1).clamp(max=seq_len - 1)
-        next_writes = torch.gather(
-            write,
-            1,
-            next_idx.unsqueeze(-1).expand(-1, -1, hidden),
-        )
+        if not token_path:
+            next_idx = (seq_idx + 1).clamp(max=seq_len - 1)
+            next_writes = torch.gather(
+                write,
+                1,
+                next_idx.unsqueeze(-1).expand(-1, -1, hidden),
+            )
         if compact_cuda:
             seq_induct_allow = seq_induct_eligible = None
             field_induct_allow = field_induct_eligible = None
@@ -333,14 +366,49 @@ class DABSNRead(nn.Module):
             seq_induct_eligible = seq_induct_allow.any(dim=-1)
             field_induct_eligible = field_induct_allow.any(dim=-1)
         next_field_writes = None
-        if self.read_geometry != "seq":
+        if self.read_geometry != "seq" and not token_path:
             next_field_writes = torch.gather(
                 write,
                 1,
                 (field_idx + 1).clamp(max=seq_len - 1).unsqueeze(-1).expand(-1, -1, hidden),
             )
 
-        if self.read_geometry == "seq":
+        if token_path:
+            from .kernels.read_flash import admitted_three_way_read_tokens
+
+            key_admission = key_bias + admission
+
+            def token_read(mode: str) -> Tensor:
+                return admitted_three_way_read_tokens(
+                    expression,
+                    write,
+                    cocktail,
+                    key_admission,
+                    scale,
+                    seq_idx,
+                    seq_valid,
+                    mode=mode,
+                    short_gain=self.short_gain,
+                    pad_gain=self.pad_gain,
+                    induct_gain=self.induct_gain,
+                    cocktail_gain=self.cocktail_gain,
+                )
+
+            if not compiling:
+                self._last_three_way_backend = (
+                    "registered_fused_tokens_trainable"
+                    if torch.is_grad_enabled()
+                    else "registered_fused_tokens_infer"
+                )
+        if token_path and self.read_geometry != "hybrid":
+            retrieved = token_read(self.read_geometry)
+            self.last_hybrid_gate = None
+            norm = float(retrieved.detach().norm().cpu()) if trace_enabled else None
+            self.last_seq_norm = norm if self.read_geometry == "seq" else None
+            self.last_field_norm = norm if self.read_geometry == "field" else None
+            if self.read_geometry == "seq":
+                self.last_field_neighbors = None
+        elif self.read_geometry == "seq":
             retrieved = self._admitted_read(
                 query,
                 seq_keys,
@@ -386,49 +454,53 @@ class DABSNRead(nn.Module):
             self.last_seq_norm = None
             self.last_field_norm = float(retrieved.detach().norm().cpu()) if trace_enabled else None
         else:
-            seq_retrieved = self._admitted_read(
-                query,
-                seq_keys,
-                seq_writes,
-                next_writes,
-                cocktail,
-                seq_cocktail,
-                seq_bias,
-                seq_admission,
-                scale,
-                seq_allow,
-                seq_induct_allow,
-                seq_eligible,
-                seq_induct_eligible,
-                bank_idx=seq_idx,
-                bank_valid=seq_valid,
-                mode="seq",
-            )
-            field_retrieved = self._admitted_read(
-                query,
-                field_keys,
-                field_writes,
-                next_field_writes,
-                cocktail,
-                field_cocktail,
-                field_bias,
-                field_admission,
-                scale,
-                field_allow,
-                field_induct_allow,
-                field_eligible,
-                field_induct_eligible,
-                bank_idx=field_idx,
-                bank_valid=field_valid,
-                mode="field",
-            )
+            if token_path:
+                seq_retrieved = token_read("seq")
+                field_retrieved = token_read("field")
+            else:
+                seq_retrieved = self._admitted_read(
+                    query,
+                    seq_keys,
+                    seq_writes,
+                    next_writes,
+                    cocktail,
+                    seq_cocktail,
+                    seq_bias,
+                    seq_admission,
+                    scale,
+                    seq_allow,
+                    seq_induct_allow,
+                    seq_eligible,
+                    seq_induct_eligible,
+                    bank_idx=seq_idx,
+                    bank_valid=seq_valid,
+                    mode="seq",
+                )
+                field_retrieved = self._admitted_read(
+                    query,
+                    field_keys,
+                    field_writes,
+                    next_field_writes,
+                    cocktail,
+                    field_cocktail,
+                    field_bias,
+                    field_admission,
+                    scale,
+                    field_allow,
+                    field_induct_allow,
+                    field_eligible,
+                    field_induct_eligible,
+                    bank_idx=field_idx,
+                    bank_valid=field_valid,
+                    mode="field",
+                )
             if self.hybrid_gate_override is None:
                 gate = torch.sigmoid(self.hybrid_gate)
             else:
                 gate = torch.as_tensor(
                     float(self.hybrid_gate_override),
-                    device=query.device,
-                    dtype=query.dtype,
+                    device=expression.device,
+                    dtype=expression.dtype if query is None else query.dtype,
                 )
             self.last_hybrid_gate = float(gate.detach().cpu()) if trace_enabled else None
             seq_contribution = (1.0 - gate) * seq_retrieved

@@ -408,7 +408,7 @@ def _linear_recurrence_setup(ctx, inputs, output) -> None:
 
 
 @torch.library.custom_op("dabsn::_linrec_backward", mutates_args=())
-def _linrec_bwd_op(a: Tensor, g: Tensor, y_init: Tensor, grad_out: Tensor) -> list[Tensor]:
+def _linrec_bwd_op(a: Tensor, g: Tensor, y_init: Tensor, grad_out: Tensor) -> List[Tensor]:
     """Opaque backward boundary so torch.compile/AOT-autograd never traces into Triton."""
     if a.is_cuda:
         da, dg, dy = _triton_linrec_backward(a, g, y_init, grad_out)
@@ -418,7 +418,7 @@ def _linrec_bwd_op(a: Tensor, g: Tensor, y_init: Tensor, grad_out: Tensor) -> li
 
 
 @_linrec_bwd_op.register_fake
-def _linrec_bwd_op_fake(a: Tensor, g: Tensor, y_init: Tensor, grad_out: Tensor) -> list[Tensor]:
+def _linrec_bwd_op_fake(a: Tensor, g: Tensor, y_init: Tensor, grad_out: Tensor) -> List[Tensor]:
     return [torch.empty_like(a), torch.empty_like(g), torch.empty_like(y_init)]
 
 
@@ -503,6 +503,11 @@ def fused_long_scan_from_state(
         raise RuntimeError(
             "Triton/CUDA long-memory recurrence was required, but received a CPU tensor"
         )
+    if write.is_cuda and _os.environ.get("DABSN_LONG_BACKEND", "fused").lower() != "linrec":
+        from .long_fused import fused_long_memory, fused_long_memory_supported
+
+        if fused_long_memory_supported(write):
+            return fused_long_memory(read, write, plasticity, initial_state, return_final_state)
     batch, _seq_len, hidden = write.shape
     state_dtype = (
         torch.float32
