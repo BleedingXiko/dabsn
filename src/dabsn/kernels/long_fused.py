@@ -27,6 +27,7 @@ from typing import List, Optional
 
 import torch
 from torch import Tensor
+from ._arch import on_tensor_device
 
 try:
     import triton
@@ -292,6 +293,7 @@ def _long_op(w: Tensor, p: Tensor, l0: Optional[Tensor], e0: Optional[Tensor],
     return out, lf, ef, rf, eprev, rseq
 
 
+@on_tensor_device
 def _chunked_forward(w, p, l0, e0, r0, lr, le, ld, ls, out, eprev, rseq, lf, ef, rf, save):
     """Long sequences: chunks run in parallel, exact affine carries between them."""
     B, T, H = w.shape
@@ -375,6 +377,7 @@ def _long_setup(ctx, inputs, output) -> None:
     ctx.save_for_backward(w, p, lr, le, ld, ls, output[0], output[4], output[5], *states)
 
 
+@on_tensor_device
 def _long_backward(ctx, gout, glf, gef, grf, _ge, _gr):
     w, p, lr, le, ld, ls, out, eprev, rseq, *states = ctx.saved_tensors
     l0, e0, r0 = states if ctx.init else (None, None, None)
@@ -411,6 +414,7 @@ def fused_long_memory_supported(write: Tensor) -> bool:
     )
 
 
+@on_tensor_device
 def fused_long_memory(read, write: Tensor, plasticity: Tensor, initial_state, return_final_state):
     """Drop-in for the CUDA branch of ``fused_long_scan_from_state``."""
     B, _T, H = write.shape

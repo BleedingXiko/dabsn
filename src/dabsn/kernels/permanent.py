@@ -6,6 +6,7 @@ from typing import List, Tuple
 
 import torch
 from torch import Tensor
+from ._arch import on_tensor_device
 
 try:
     import triton
@@ -257,6 +258,7 @@ if _HAS_TRITON:
             adjoint = gi[:, None] * ki[None, :] + adjoint - bi * adjoint_key[:, None] * ki[None, :]
 
 
+@on_tensor_device
 def _triton_forward(k: Tensor, v: Tensor, beta: Tensor) -> Tensor:
     b, t, h = k.shape
     out = torch.empty_like(v)
@@ -282,6 +284,7 @@ def _triton_forward(k: Tensor, v: Tensor, beta: Tensor) -> Tensor:
     return out
 
 
+@on_tensor_device
 def _triton_backward(
     k: Tensor, v: Tensor, beta: Tensor, grad_out: Tensor
 ) -> Tuple[Tensor, Tensor, Tensor]:

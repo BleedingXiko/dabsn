@@ -7,6 +7,7 @@ from typing import List, Tuple
 
 import torch
 from torch import Tensor
+from ._arch import on_tensor_device
 
 try:
     import triton
@@ -212,6 +213,7 @@ if _HAS_TRITON:
         tl.store(DYINIT + pid_b * stride_ib + h_off * stride_ih, a0 * carry, mask=h_mask)
 
 
+@on_tensor_device
 def _triton_linrec_backward_once(a: Tensor, g: Tensor, y_init: Tensor, gy: Tensor):
     """Compute ``da``, ``dg``, and ``dy_init`` in one Triton reverse scan."""
     b, t, h = a.shape
@@ -283,6 +285,7 @@ def _triton_linrec_backward(a: Tensor, g: Tensor, y_init: Tensor, gy: Tensor):
     return da, dg, carry_grad
 
 
+@on_tensor_device
 def _triton_linrec_once_with_final(a: Tensor, g: Tensor, y_init: Tensor) -> tuple[Tensor, Tensor]:
     b, t, h = a.shape
     out = torch.empty((b, t, h), device=a.device, dtype=a.dtype)

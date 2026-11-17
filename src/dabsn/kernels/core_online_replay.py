@@ -35,6 +35,7 @@ from ..temporal_credit import (
     _budget_trace_weights,
     _contract_budget_trace,
 )
+from ._arch import on_tensor_device
 
 _ROWS = 32
 _COLS = 64
@@ -409,6 +410,7 @@ def _trace_scan_lanes(
     tl.store(gg + 0, g19, sv); tl.store(gg + 1, g20, sv); tl.store(gg + 2, g21, sv); tl.store(gg + 3, g22, sv)
 
 
+@on_tensor_device
 def core_trace_scan_analytic(core, tape, incoming, eligibility):
     """Drop-in for ``online_trace.core_trace_scan`` (same outputs, same order)."""
     batch, steps, state, _ = incoming.shape
@@ -450,6 +452,7 @@ def _rows(value: Tensor, R: int, H: int):
 
 @torch.no_grad()
 @torch.autocast(device_type="cuda", enabled=False)
+@on_tensor_device
 def core_online_replay_fused(core, tape, signal_grads: CoreSignalGrads, eligibility_state: CoreEligibilityState):
     """CUDA replacement for ``core_online_replay_contracted`` (same contract, same values)."""
     batch, steps, state = tape.batch_size, tape.steps, tape.state_dim

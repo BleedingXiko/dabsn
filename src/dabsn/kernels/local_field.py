@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import torch
 from torch import Tensor
+from ._arch import on_tensor_device
 
 try:
     import triton
@@ -113,6 +114,7 @@ if _HAS_TRITON:
 
 class _LocalFieldGather(torch.autograd.Function):
     @staticmethod
+    @on_tensor_device
     def forward(ctx, inputs: Tensor, patch: Tensor) -> Tensor:
         if not (_HAS_TRITON and inputs.is_cuda and patch.is_cuda):
             raise RuntimeError("local-field Triton gather requires CUDA tensors")
@@ -153,6 +155,7 @@ class _LocalFieldGather(torch.autograd.Function):
         return output
 
     @staticmethod
+    @on_tensor_device
     def backward(ctx, grad_out: Tensor):
         (patch,) = ctx.saved_tensors
         batch, cells, dim, neighbors = ctx.shape

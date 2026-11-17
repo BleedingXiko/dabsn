@@ -7,6 +7,7 @@ Eligibility is FP32; recurrent state and input gradients retain storage dtype.
 import torch
 import triton
 import triton.language as tl
+from ._arch import on_tensor_device
 
 
 @triton.jit
@@ -138,6 +139,7 @@ def _long_replay_kernel(W, P, LT, ET, RT, Rates, InputRates, G, Initial, Final,
         carry_retention = (gradient_retention * c).to(W.dtype.element_ty).to(tl.float32)
 
 
+@on_tensor_device
 def launch_long_forward(write, plasticity, rates, state, output, saved, final):
     batch, steps, hidden = write.shape
     _long_forward_kernel[(triton.cdiv(batch * hidden, 128),)](
@@ -146,6 +148,7 @@ def launch_long_forward(write, plasticity, rates, state, output, saved, final):
     )
 
 
+@on_tensor_device
 def launch_long_replay(tape, rates, input_rates, gradient, initial, final, partials, write_gradient, plasticity_gradient):
     batch, steps, hidden = tape.write.shape
     _long_replay_kernel[(triton.cdiv(batch * hidden, 64),)](

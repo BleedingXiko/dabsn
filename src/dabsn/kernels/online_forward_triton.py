@@ -3,6 +3,7 @@
 import torch
 import triton
 import triton.language as tl
+from ._arch import on_tensor_device
 
 
 @triton.jit
@@ -122,6 +123,7 @@ def _finish_step(
     tl.store(Saturation + index, next_saturation, mask)
 
 
+@on_tensor_device
 def scan_batched_online_cuda(projected, gate_projected, recurrent, params, state, outputs):
     """Two pointwise launches and one batched FP32 GEMM per recurrent step."""
     batch, steps, hidden = projected.shape

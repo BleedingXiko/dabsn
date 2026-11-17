@@ -43,6 +43,7 @@ from typing import List
 
 import torch
 from torch import Tensor
+from ._arch import on_tensor_device
 
 try:
     import triton
@@ -558,6 +559,7 @@ def _bank_limits(pos: Tensor, T: int, BM: int, mode: int) -> Tensor:
     return torch.searchsorted(suffix, last.expand(B, nm).contiguous(), right=True).to(torch.int32)
 
 
+@on_tensor_device
 def _launch_forward(q, qn, k, kn, v, vn, krow, nrow, cq, ck, kb, pos, scal, mode, ip, save,
                     gather):
     B, T, H = q.shape
@@ -583,6 +585,7 @@ def _launch_forward(q, qn, k, kn, v, vn, krow, nrow, cq, ck, kb, pos, scal, mode
     return out, lse, reads
 
 
+@on_tensor_device
 def _launch_backward(do, q, qn, k, kn, v, vn, krow, nrow, cq, ck, kb, pos, scal, lse, reads,
                      mode, ip, gather):
     """Per-entry gradients: dq (normalized query), dk (normalized key), dv, dnext,
@@ -806,6 +809,7 @@ def _tokens_setup(ctx, inputs, output) -> None:
     ctx.mode, ctx.ip = int(inputs[8]), int(inputs[9])
 
 
+@on_tensor_device
 def _tokens_backward(ctx, grad_out: Tensor, *_unused):
     x, w, cock, kba, krow, nrow, pos, scal, lse, reads, xn, wn = ctx.saved_tensors
     dx, dw, dcock, dkba, dscal = _tokens_backward_op(

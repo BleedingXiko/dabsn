@@ -8,6 +8,7 @@ registers; sparse execution loads only routed rows, including eligibility.
 from __future__ import annotations
 
 import torch
+from ._arch import on_tensor_device
 
 try:
     import triton
@@ -323,6 +324,7 @@ if triton is not None:
             tl.store(OUT+row[:,None]*D+d[None,:],total,head[:,None]&(d[None,:]<D))
 
 
+@on_tensor_device
 def row_outer_reduce(indices, credit, x, row_count):
     """Key gradient per Capacity row from the selected-event credit tape.
 
@@ -341,6 +343,7 @@ def row_outer_reduce(indices, credit, x, row_count):
     return out
 
 
+@on_tensor_device
 def address(x, projection, active):
     b,t,d = x.shape
     levels = projection.shape[0] if projection.ndim == 3 else 1
@@ -353,6 +356,7 @@ def address(x, projection, active):
     return out
 
 
+@on_tensor_device
 def forward(x,key,bias,logit,value,gain,features,indices,sparse,stable_slots=False,operand_mode=0):
     b,t,d = x.shape
     c,s = value.shape
@@ -371,6 +375,7 @@ def forward(x,key,bias,logit,value,gain,features,indices,sparse,stable_slots=Fal
     return [out,acts,old,states]
 
 
+@on_tensor_device
 def backward(x,key,logit,value,gain,indices,local,rows,acts,old,states,gout,gfinal,
              ek,eb,er,sparse,online,stable_slots=False,operand_mode=0):
     b,t,d = x.shape
@@ -426,6 +431,7 @@ def backward(x,key,logit,value,gain,indices,local,rows,acts,old,states,gout,gfin
     return [gx,gk,gb,gr,gv,gg,gp]
 
 
+@on_tensor_device
 def row_reduce(indices, values, row_count):
     """Reduce selected event gradients in a fixed order without float atomics.
 
@@ -777,6 +783,7 @@ def _input_precision():
     return "ieee" if torch.get_float32_matmul_precision() == "highest" else "tf32"
 
 
+@on_tensor_device
 def _nt(inp, weight, grp, n_out, scale=None, mode_w=0, lowp=0):
     width = inp.shape[2]
     out = inp.new_empty((*inp.shape[:2], n_out))
@@ -790,6 +797,7 @@ def _nt(inp, weight, grp, n_out, scale=None, mode_w=0, lowp=0):
     return out
 
 
+@on_tensor_device
 def _nn(p, weight, grp, n_out, scale=None, mode_p=0, mode_w=0, lowp=0):
     a = p.shape[2]
     out = p.new_empty((*p.shape[:2], n_out))
@@ -803,6 +811,7 @@ def _nn(p, weight, grp, n_out, scale=None, mode_p=0, mode_w=0, lowp=0):
     return out
 
 
+@on_tensor_device
 def _tn(p, inp, grp, scale=None, mode_p=0, carry=None, trace=None, lowp=0):
     a, width = p.shape[2], inp.shape[2]
     rows = grp["groups"]*a
@@ -826,6 +835,7 @@ def _low(tensor, operand_mode):
     return tensor.to(_LOW[operand_mode]) if operand_mode else tensor
 
 
+@on_tensor_device
 def grouped_forward(x, key, bias, logit, value, gain, features, indices, sparse, operand_mode=0):
     """Ordinary-BPTT forward. ``features`` is updated in place to the final carry."""
     b, t, d = x.shape
@@ -846,6 +856,7 @@ def grouped_forward(x, key, bias, logit, value, gain, features, indices, sparse,
     return [out, acts, old, states]
 
 
+@on_tensor_device
 def grouped_backward(x, key, logit, value, gain, indices, acts, old, states, gout, gfinal,
                      sparse, operand_mode=0):
     """Ordinary-BPTT backward: dense parameter gradients summed over every event."""
@@ -881,6 +892,7 @@ def grouped_backward(x, key, logit, value, gain, indices, acts, old, states, gou
     return [gx, gk, gb, gr, gv, gg, gp]
 
 
+@on_tensor_device
 def grouped_online_backward(x, key, logit, value, gain, indices, acts, old, states, gout,
                             ek, eb, er, sparse, operand_mode=0):
     """Online credit for one call; eligibility traces ``ek, eb, er`` advance in place.

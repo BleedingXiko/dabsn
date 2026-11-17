@@ -8,6 +8,7 @@ BLAS; they are never loaded or advanced here.
 from __future__ import annotations
 
 import torch
+from ._arch import on_tensor_device
 
 try:
     import triton
@@ -175,6 +176,7 @@ def _require_cuda_fp32(value, name):
         raise TypeError(f'{name} requires FP32 eligibility arithmetic')
 
 
+@on_tensor_device
 def core_trace_scan(core, tape, incoming, eligibility):
     """Return final local/global traces, their gradients, and budget Jacobians."""
     _require_cuda_fp32(eligibility.local, 'core_trace_scan')
@@ -207,6 +209,7 @@ def core_trace_scan(core, tape, incoming, eligibility):
     return next_local, next_global, local_grad.sum(0), global_grad.sum((0, 1)), jbb
 
 
+@on_tensor_device
 def budget_trace_weights(jbb, incoming_budget):
     """Reverse scalar scan for exact chunk contractions of matrix traces."""
     _require_cuda_fp32(jbb, 'budget_trace_weights')

@@ -12,6 +12,7 @@ import triton.language as tl
 from torch import Tensor
 
 from .admitted import _frontpack_admitted_bank, _read_crossover_should_measure
+from ._arch import on_tensor_device
 
 
 def _device_default_chunk_config() -> dict:
@@ -529,6 +530,7 @@ def _block_h(hidden_dim: int) -> int:
     return 1 << (hidden_dim - 1).bit_length()
 
 
+@on_tensor_device
 def _launch_fwd_scan(
     Wx,
     Wgx,
@@ -1168,6 +1170,7 @@ def is_triton_out_of_resources(exc: BaseException) -> bool:
     return isinstance(exc, triton.runtime.errors.OutOfResources)
 
 
+@on_tensor_device
 def dabsn_core_scan_batched_fused_forward(
     Wx,
     Wgx,
@@ -1945,6 +1948,7 @@ def _dabsn_core_scan_bwd_chunked(
     tl.store(gscal_p + bidx * 3 + 2, a_csup)
 
 
+@on_tensor_device
 def _dabsn_core_fused_backward(
     U,
     p,
@@ -3334,6 +3338,7 @@ def _admitted_three_way_eager(
 
 class AdmittedThreeWayReadTritonFunction(torch.autograd.Function):
     @staticmethod
+    @on_tensor_device
     def forward(
         ctx,
         read_state: Tensor,
@@ -3410,6 +3415,7 @@ class AdmittedThreeWayReadTritonFunction(torch.autograd.Function):
         return out
 
     @staticmethod
+    @on_tensor_device
     def backward(ctx, grad_out):
         saved = ctx.saved_tensors
         (
@@ -3527,6 +3533,7 @@ class AdmittedThreeWayReadTritonFunction(torch.autograd.Function):
 
 class CompactAdmittedThreeWayReadTritonFunction(torch.autograd.Function):
     @staticmethod
+    @on_tensor_device
     def forward(
         ctx,
         read_state: Tensor,
@@ -3606,6 +3613,7 @@ class CompactAdmittedThreeWayReadTritonFunction(torch.autograd.Function):
         return out
 
     @staticmethod
+    @on_tensor_device
     def backward(ctx, grad_out):
         saved = ctx.saved_tensors
         (
@@ -3723,6 +3731,7 @@ class CompactAdmittedThreeWayReadTritonFunction(torch.autograd.Function):
 
 class CompactFlashAdmittedThreeWayReadTritonFunction(torch.autograd.Function):
     @staticmethod
+    @on_tensor_device
     def forward(
         ctx,
         read_state: Tensor,
@@ -3818,6 +3827,7 @@ class CompactFlashAdmittedThreeWayReadTritonFunction(torch.autograd.Function):
         return out
 
     @staticmethod
+    @on_tensor_device
     def backward(ctx, grad_out):
         saved = ctx.saved_tensors
         (
@@ -4101,6 +4111,7 @@ def admitted_three_way_read_compact_flash_trainable(
     )
 
 
+@on_tensor_device
 def admitted_three_way_read_compact_infer(
     read_state: Tensor,
     memory_key: Tensor,

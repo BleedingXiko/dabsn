@@ -36,6 +36,7 @@ import os
 
 import torch
 from torch import Tensor
+from ._arch import on_tensor_device
 
 try:
     import triton
@@ -735,6 +736,7 @@ def pack_core_params(params) -> Tensor:
     ).contiguous()
 
 
+@on_tensor_device
 def persistent_forward_tapes(
     Wx: Tensor,
     Wgx: Tensor,
@@ -790,6 +792,7 @@ def persistent_forward_tapes(
     return (U, *tapes, *final)
 
 
+@on_tensor_device
 def persistent_backward(
     *,
     reads,

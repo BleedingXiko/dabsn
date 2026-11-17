@@ -852,9 +852,10 @@ class DABSNModel(nn.Module):
     def forward_sequence(self, inputs: Tensor) -> Tensor:
         return self.project_sequence(self.forward_hidden(inputs))
 
-    def forward_sequence_online(self, inputs: Tensor, temporal_state):
+    def forward_sequence_online(self, inputs: Tensor, temporal_state, *, with_terms: bool = False):
         hidden, pending = self.forward_hidden_online(inputs, temporal_state)
-        return self.project_sequence(hidden), pending
+        output = self.project_sequence(hidden)
+        return (ComponentOutput(output) if with_terms else output), pending
 
     def forward_with_terms(self, inputs: Tensor) -> ComponentOutput:
         result = self.backbone.forward_with_terms(inputs)
@@ -957,9 +958,10 @@ class DABSNTaskModel(nn.Module):
     def forward_sequence(self, inputs: Tensor) -> Tensor:
         return self.project_sequence(self.forward_hidden(inputs))
 
-    def forward_sequence_online(self, inputs: Tensor, temporal_state):
+    def forward_sequence_online(self, inputs: Tensor, temporal_state, *, with_terms: bool = False):
         hidden, pending = self.forward_hidden_online(inputs, temporal_state)
-        return self.project_sequence(hidden), pending
+        output = self.project_sequence(hidden)
+        return (ComponentOutput(output) if with_terms else output), pending
 
     def forward_with_terms(self, inputs: Tensor) -> ComponentOutput:
         result = self.body.forward_with_terms(self.input_adapter(inputs))
